@@ -181,7 +181,10 @@ mod tests {
         assert!(content.contains("demo"), "{content}");
         // No Block Kit and no entity escaping: the variable renders verbatim.
         assert!(payload.get("blocks").is_none(), "{payload}");
-        assert!(!content.contains("&amp;"), "escaped a plain variable: {content}");
+        assert!(
+            !content.contains("&amp;"),
+            "escaped a plain variable: {content}"
+        );
     }
 
     #[test]
@@ -210,7 +213,9 @@ mod tests {
     #[test]
     fn context_block_carries_kind_and_details() {
         let payload = sample().blocks_payload();
-        let context = payload["blocks"][2]["elements"][0]["text"].as_str().unwrap();
+        let context = payload["blocks"][2]["elements"][0]["text"]
+            .as_str()
+            .unwrap();
         assert!(context.contains("demo"));
         assert!(context.contains("2 files"));
     }

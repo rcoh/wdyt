@@ -5,6 +5,7 @@
 //! closer to what actually runs.
 
 use std::net::{IpAddr, TcpListener};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use showme::config::Config;
@@ -19,19 +20,26 @@ struct Daemon {
 
 impl Daemon {
     async fn start() -> Self {
-        // Ask the OS for a free port, then hand that number to the daemon.
-        // A tiny race remains between close and rebind, which is acceptable in
-        // a test and avoids a fixed port colliding with the developer's own
-        // servers.
-        let port = TcpListener::bind("127.0.0.1:0")
-            .expect("a free port")
-            .local_addr()
-            .expect("addr")
-            .port();
+        // Each test's daemon needs a port no other test's daemon will take. Asking
+        // the OS for a free one and handing the number over is not enough: the
+        // listener has to close before the daemon rebinds it, and two tests handed
+        // the same port in that gap both "come up" on it, so one reads the other's
+        // store. That made the suite fail intermittently.
+        //
+        // So: a window of ports per test, keyed by the process id as well as a
+        // counter. The counter alone would collide under nextest, which runs every
+        // test in a fresh process where the counter restarts at zero.
+        const WINDOW: u16 = 8;
+        static NEXT: AtomicU16 = AtomicU16::new(0);
+        // 20000-60000, well clear of the 3000-3010 range showme itself defaults to.
+        let spread = (std::process::id() as u16).wrapping_mul(WINDOW) % 40_000;
+        let base_port = 20_000 + spread.wrapping_add(NEXT.fetch_add(WINDOW, Ordering::Relaxed));
 
         let config = Config {
-            port_low: port,
-            port_high: port,
+            port_low: base_port,
+            // The daemon walks upwards from `port_low`, so the window gives it room
+            // to step over anything already held.
+            port_high: base_port.saturating_add(WINDOW - 1),
             bind: IpAddr::from([127, 0, 0, 1]),
             webhook_url: None,
             ..Config::default()
@@ -39,16 +47,35 @@ impl Daemon {
         let store = Store::new(None);
 
         let serving = store.clone();
+        let serve_config = config.clone();
         tokio::spawn(async move {
-            let _ = showme::server::serve(&config, serving).await;
+            let _ = showme::server::serve(&serve_config, serving).await;
         });
 
+        // Which port it actually took is discovered rather than assumed, since it
+        // steps over anything already held in its window.
+        let port = Self::find_port(&config).await;
         let daemon = Self {
             base: format!("http://127.0.0.1:{port}"),
             store,
         };
         daemon.wait_until_up().await;
         daemon
+    }
+
+    /// The port this test's daemon landed on, within its own window.
+    async fn find_port(config: &Config) -> u16 {
+        let client = showme::client::Client::new(config);
+        for _ in 0..200 {
+            if let Some(port) = client.daemon_port().await {
+                return port;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "no daemon came up in {}-{}",
+            config.port_low, config.port_high
+        );
     }
 
     async fn wait_until_up(&self) {
@@ -131,7 +158,10 @@ async fn a_session_page_offers_a_reply_form() {
 
     let (status, body) = daemon.get(&format!("/s/{id}")).await;
     assert_eq!(status, 200);
-    assert!(body.contains(&format!("action=\"/s/{id}/reply\"")), "{body}");
+    assert!(
+        body.contains(&format!("action=\"/s/{id}/reply\"")),
+        "{body}"
+    );
     assert!(body.contains("<textarea"), "{body}");
     // The overlay must be fixed so it cannot reflow what is being reviewed.
     assert!(body.contains("position: fixed"), "{body}");
@@ -165,14 +195,18 @@ async fn framed_modes_keep_the_header_visible() {
     // `.framewrap` is absolutely positioned; without `body.framed main` being
     // its positioned ancestor it paints over the header.
     assert!(body.contains("class=\"framed\""), "{body}");
-    assert!(body.contains("body.framed main { position: relative; }"), "{body}");
+    assert!(
+        body.contains("body.framed main { position: relative; }"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
 async fn a_static_session_is_framed_too() {
     let daemon = Daemon::start().await;
+    let dir = tempfile::tempdir().expect("a temp directory");
     let id = daemon.insert(Content::Static {
-        root: std::env::temp_dir(),
+        root: dir.path().to_path_buf(),
         entry: "index.html".to_owned(),
     });
 
@@ -238,12 +272,13 @@ async fn an_empty_reply_is_rejected() {
 #[tokio::test]
 async fn assets_cannot_escape_the_session_root() {
     let daemon = Daemon::start().await;
-    let root = std::env::temp_dir().join("showme-traversal-test");
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("index.html"), "<p>inside</p>").unwrap();
+    // A real temp directory: unique per test and cleaned up on drop, so
+    // concurrent runs cannot clear it out from under each other.
+    let dir = tempfile::tempdir().expect("a temp directory");
+    std::fs::write(dir.path().join("index.html"), "<p>inside</p>").unwrap();
 
     let id = daemon.insert(Content::Static {
-        root,
+        root: dir.path().to_path_buf(),
         entry: "index.html".to_owned(),
     });
 
@@ -279,7 +314,10 @@ async fn theme_colors_reach_the_page() {
     let daemon = Daemon::start().await;
     let id = code_session(&daemon);
     let (_, body) = daemon.get(&format!("/s/{id}")).await;
-    assert!(body.contains(&theme_colors(theme("Nord")).background), "{body}");
+    assert!(
+        body.contains(&theme_colors(theme("Nord")).background),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -322,8 +360,84 @@ async fn a_comment_is_saved_and_shown_on_reload() {
     assert!(body.contains("let x = 2;"), "{body}");
 
     let (_, page) = daemon.get(&format!("/s/{id}")).await;
-    assert!(page.contains("why 2?"), "comment did not survive a reload: {page}");
+    assert!(
+        page.contains("why 2?"),
+        "comment did not survive a reload: {page}"
+    );
     assert!(page.contains("class=\"notes\""), "{page}");
+}
+
+#[tokio::test]
+async fn a_comment_can_cover_a_range_of_lines() {
+    let daemon = Daemon::start().await;
+    let id = diff_session(&daemon);
+
+    // Lines 1-3 on the new side: context, the added line, and the closing brace.
+    let (status, body) = daemon
+        .post_json(
+            &format!("/s/{id}/comments"),
+            serde_json::json!({
+                "file": "src/lib.rs", "line": 1, "end_line": 3,
+                "side": "new", "text": "this whole block"
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let comment: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(comment["line"], 1);
+    assert_eq!(comment["end_line"], 3);
+    // The snippet quotes every covered line, from the server's own copy.
+    let snippet = comment["snippet"].as_str().unwrap();
+    assert!(snippet.contains("fn main() {"), "{snippet}");
+    assert!(snippet.contains("let x = 2;"), "{snippet}");
+    assert_eq!(snippet.lines().count(), 3, "{snippet}");
+
+    // The page marks the covered rows and says what the note is about.
+    let (_, page) = daemon.get(&format!("/s/{id}")).await;
+    assert!(page.contains("inrange"), "covered rows not marked: {page}");
+    assert!(page.contains("L1–L3"), "no span label: {page}");
+}
+
+#[tokio::test]
+async fn a_backwards_range_is_normalised_rather_than_rejected() {
+    // Dragging upwards is as natural as downwards, so the ends arrive reversed.
+    let daemon = Daemon::start().await;
+    let id = diff_session(&daemon);
+
+    let (status, body) = daemon
+        .post_json(
+            &format!("/s/{id}/comments"),
+            serde_json::json!({
+                "file": "src/lib.rs", "line": 3, "end_line": 1,
+                "side": "new", "text": "dragged upwards"
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let comment: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(comment["line"], 1, "ends not swapped: {body}");
+    assert_eq!(comment["end_line"], 3);
+}
+
+#[tokio::test]
+async fn a_single_line_comment_reports_no_range() {
+    // The common case keeps its old shape, so `end_line` is absent rather than
+    // echoing the start.
+    let daemon = Daemon::start().await;
+    let id = diff_session(&daemon);
+    let (_, body) = daemon
+        .post_json(
+            &format!("/s/{id}/comments"),
+            serde_json::json!({"file": "src/lib.rs", "line": 2, "side": "new", "text": "why 2?"}),
+        )
+        .await;
+    let comment: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(comment["end_line"].is_null(), "{body}");
+    let (_, page) = daemon.get(&format!("/s/{id}")).await;
+    assert!(
+        !page.contains("class=\"span\""),
+        "a lone line claimed a span: {page}"
+    );
 }
 
 #[tokio::test]
@@ -340,14 +454,19 @@ async fn a_comment_on_a_line_that_does_not_exist_is_rejected() {
         serde_json::json!({"file": "src/lib.rs", "line": 1, "side": "sideways", "text": "x"}),
         serde_json::json!({"file": "src/lib.rs", "line": 1, "side": "new", "text": "  "}),
     ] {
-        let (status, body) = daemon.post_json(&format!("/s/{id}/comments"), bad.clone()).await;
+        let (status, body) = daemon
+            .post_json(&format!("/s/{id}/comments"), bad.clone())
+            .await;
         assert_eq!(status, 400, "accepted {bad}: {body}");
     }
     assert!(daemon.store.comments(&id).unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn the_page_can_see_that_the_agent_read_the_reply() {
+async fn the_page_distinguishes_a_collected_reply_from_a_read_one() {
+    // Three stages, not two. Collecting a reply moves bytes to a process;
+    // reading it is a claim only a live model can make. An agent that collects
+    // and then dies must not show as read, or the receipt is worthless.
     let daemon = Daemon::start().await;
     let id = code_session(&daemon);
     daemon.store.reply(&id, "have a look".to_owned()).unwrap();
@@ -361,28 +480,88 @@ async fn the_page_can_see_that_the_agent_read_the_reply() {
     assert_eq!(status, 200);
     let json: serde_json::Value = serde_json::from_str(&status_body).unwrap();
     assert_eq!(json["replied"], true);
-    assert_eq!(json["read"], false);
+    assert_eq!(json["delivered"], false);
+    assert!(json["ack"].is_null());
 
-    // Polling the status must not itself mark the reply read: otherwise the
-    // page would be reporting its own visit as the agent's receipt.
+    // Polling the status must not itself mark anything: otherwise the page
+    // would be reporting its own visit as the agent's receipt.
     assert!(
         daemon
             .store
-            .with(&id, |s| s.reply.as_ref().unwrap().read_at.is_none())
+            .with(&id, |s| s.reply.as_ref().unwrap().delivered_at.is_none())
             .unwrap(),
-        "the status route marked the reply read"
+        "the status route marked the reply delivered"
     );
 
+    // Collected: picked up, but nothing has claimed to read it.
     let (status, _) = daemon.post(&format!("/api/sessions/{id}/collect")).await;
     assert_eq!(status, 200);
 
     let (_, status_body) = daemon.get(&format!("/api/sessions/{id}/status")).await;
     let json: serde_json::Value = serde_json::from_str(&status_body).unwrap();
-    assert_eq!(json["read"], true);
+    assert_eq!(json["delivered"], true);
+    assert!(
+        json["ack"].is_null(),
+        "collecting invented an ack: {status_body}"
+    );
+
+    let (_, body) = daemon.get(&format!("/s/{id}")).await;
+    assert!(body.contains("receipt delivered"), "{body}");
+    assert!(body.contains("not yet acknowledged"), "{body}");
+
+    // Acked: an agent has said what it is doing, and the page quotes it.
+    let (status, _) = daemon
+        .post_json(
+            &format!("/api/sessions/{id}/ack"),
+            serde_json::json!({ "note": "rerunning the build with your flag" }),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    let (_, status_body) = daemon.get(&format!("/api/sessions/{id}/status")).await;
+    let json: serde_json::Value = serde_json::from_str(&status_body).unwrap();
+    assert_eq!(json["ack"]["note"], "rerunning the build with your flag");
 
     let (_, body) = daemon.get(&format!("/s/{id}")).await;
     assert!(body.contains("receipt read"), "{body}");
-    assert!(body.contains("The agent has read this"), "{body}");
+    assert!(
+        body.contains("rerunning the build with your flag"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn an_ack_needs_a_reply_and_a_note() {
+    let daemon = Daemon::start().await;
+    let id = code_session(&daemon);
+
+    // Nothing to acknowledge yet.
+    let (status, _) = daemon
+        .post_json(
+            &format!("/api/sessions/{id}/ack"),
+            serde_json::json!({ "note": "on it" }),
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    daemon.store.reply(&id, "look".to_owned()).unwrap();
+
+    // An empty note is not an acknowledgement: the note is the whole signal.
+    let (status, _) = daemon
+        .post_json(
+            &format!("/api/sessions/{id}/ack"),
+            serde_json::json!({ "note": "   " }),
+        )
+        .await;
+    assert_eq!(status, 400);
+
+    let (status, _) = daemon
+        .post_json(
+            "/api/sessions/nosuch/ack",
+            serde_json::json!({ "note": "on it" }),
+        )
+        .await;
+    assert_eq!(status, 404);
 }
 
 #[tokio::test]
@@ -402,19 +581,155 @@ async fn a_timed_out_wait_leaves_the_reply_in_the_inbox() {
         false
     );
 
-    daemon.store.reply(&id, "sent much later".to_owned()).unwrap();
+    daemon
+        .store
+        .reply(&id, "sent much later".to_owned())
+        .unwrap();
 
     let (status, body) = daemon.get("/api/inbox?unread=1").await;
     assert_eq!(status, 200);
     assert!(body.contains("sent much later"), "{body}");
     assert!(body.contains(&format!("/s/{id}")), "no link back: {body}");
 
-    // Collecting it takes it out of the unread inbox.
+    // Collecting it does NOT take it out of the unread inbox: a process that
+    // fetched the bytes and then died is exactly the case still needing
+    // attention, and filtering on delivery would hide it.
     daemon.post(&format!("/api/sessions/{id}/collect")).await;
+    let (_, body) = daemon.get("/api/inbox?unread=1").await;
+    assert!(
+        body.contains("sent much later"),
+        "collecting hid an unacknowledged reply: {body}"
+    );
+
+    // Acking is what clears it, since only that says something read it.
+    daemon
+        .post_json(
+            &format!("/api/sessions/{id}/ack"),
+            serde_json::json!({ "note": "got it" }),
+        )
+        .await;
     let (_, body) = daemon.get("/api/inbox?unread=1").await;
     assert!(!body.contains("sent much later"), "still unread: {body}");
     let (_, body) = daemon.get("/api/inbox").await;
-    assert!(body.contains("sent much later"), "dropped from the inbox: {body}");
+    assert!(
+        body.contains("sent much later"),
+        "dropped from the inbox: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_page_says_which_agent_and_directory_it_came_from() {
+    // With several agents running at once the title alone does not say which one
+    // is asking, and the pane name is where you go to talk to it.
+    let daemon = Daemon::start().await;
+    let id = daemon.store.insert_new(showme::session::NewSession {
+        origin: showme::origin::Origin {
+            cwd: Some("/local/home/rcoh/code/showme".to_owned()),
+            session: Some("dd-2".to_owned()),
+            tab: Some("showme cli".to_owned()),
+            pane: Some("Build showme CLI tool".to_owned()),
+        },
+        ..showme::session::NewSession::new("a title".to_owned(), Content::Code { files: vec![] })
+    });
+
+    let (status, body) = daemon.get(&format!("/s/{id}")).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("dd-2"), "no session name: {body}");
+    assert!(body.contains("showme cli"), "no tab name: {body}");
+    assert!(
+        body.contains("/local/home/rcoh/code/showme"),
+        "no cwd: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_guided_review_renders_above_the_content_with_working_anchors() {
+    // The agent's own tour of the work. Its links have to resolve to the file
+    // sections on the same page, or the tour points at nothing.
+    let daemon = Daemon::start().await;
+    let files = showme::diff::parse(PATCH, theme("Nord")).unwrap();
+    let brief = showme::render::markdown(
+        "brief",
+        "Start with [the library](#f-src-lib-rs).\n",
+        "Nord",
+    );
+    let id = daemon.store.insert_new(showme::session::NewSession {
+        brief: Some(brief.html),
+        ..showme::session::NewSession::new("a title".to_owned(), Content::Diff { files })
+    });
+
+    let (status, body) = daemon.get(&format!("/s/{id}")).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("class=\"brief doc\""), "{body}");
+    assert!(body.contains("Start with"), "{body}");
+    // The anchor the brief links to must be a real id on the page.
+    assert!(body.contains("href=\"#f-src-lib-rs\""), "{body}");
+    assert!(
+        body.contains("id=\"f-src-lib-rs\""),
+        "the anchor does not exist: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_session_without_a_brief_renders_no_empty_section() {
+    let daemon = Daemon::start().await;
+    let id = diff_session(&daemon);
+    let (_, body) = daemon.get(&format!("/s/{id}")).await;
+    assert!(!body.contains("class=\"brief"), "{body}");
+    // And the file nav is still there: the brief must not have displaced it.
+    assert!(body.contains("class=\"files\""), "{body}");
+}
+
+#[tokio::test]
+async fn a_sessions_own_theme_colours_its_page() {
+    // Highlighting happens in the CLI but the page's colours are chosen by the
+    // daemon, so a per-session theme has to reach the stylesheet — otherwise a
+    // light theme's code lands on the default's dark card.
+    let daemon = Daemon::start().await;
+    let file = showme::render::highlight("x.rs", "fn main() {}\n", theme("GitHub")).unwrap();
+    let id = daemon.store.insert_new(showme::session::NewSession {
+        theme: Some("GitHub".to_owned()),
+        ..showme::session::NewSession::new(
+            "a title".to_owned(),
+            Content::Code { files: vec![file] },
+        )
+    });
+
+    let (_, body) = daemon.get(&format!("/s/{id}")).await;
+    let github = theme_colors(theme("GitHub")).background;
+    assert!(
+        body.contains(&github),
+        "the session's theme did not reach the page"
+    );
+    // And the daemon's own default must not also be in there fighting it.
+    let default = theme_colors(theme("Nord")).background;
+    assert!(
+        !body.contains(&default) || github == default,
+        "the default theme's background leaked in too"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_session_theme_falls_back_rather_than_failing() {
+    // A theme name from a newer CLI, or a typo that got past the daemon: the page
+    // must still render.
+    let daemon = Daemon::start().await;
+    let id = daemon.store.insert_new(showme::session::NewSession {
+        theme: Some("No Such Theme".to_owned()),
+        ..showme::session::NewSession::new("a title".to_owned(), Content::Code { files: vec![] })
+    });
+    let (status, _) = daemon.get(&format!("/s/{id}")).await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn a_session_from_a_plain_shell_shows_no_empty_origin() {
+    // Nothing detected must render nothing, not an empty widget with stray
+    // separators in it.
+    let daemon = Daemon::start().await;
+    let id = code_session(&daemon);
+    let (_, body) = daemon.get(&format!("/s/{id}")).await;
+    assert!(!body.contains("class=\"origin\""), "{body}");
 }
 
 #[tokio::test]
@@ -426,7 +741,10 @@ async fn the_top_bar_can_be_hidden_on_a_framed_page() {
     });
 
     let (_, body) = daemon.get(&format!("/s/{id}")).await;
-    assert!(body.contains("id=\"chrome-toggle\""), "no hide control: {body}");
+    assert!(
+        body.contains("id=\"chrome-toggle\""),
+        "no hide control: {body}"
+    );
     // And a way back, or the page needs a reload to escape.
     assert!(body.contains("id=\"chrome-show\""), "{body}");
 }
@@ -526,5 +844,8 @@ async fn a_plain_server_in_the_range_is_not_mistaken_for_the_daemon() {
         ..Config::default()
     };
     let client = showme::client::Client::new(&config);
-    assert!(!client.is_up().await, "an unrelated server passed as showme");
+    assert!(
+        !client.is_up().await,
+        "an unrelated server passed as showme"
+    );
 }

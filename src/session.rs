@@ -113,10 +113,36 @@ pub struct Reply {
     pub text: String,
     #[serde(with = "unix_seconds")]
     pub at: SystemTime,
-    /// When the agent first collected this reply, so the page can say that it
-    /// landed. `None` means it is still sitting in the daemon unread.
-    #[serde(default, with = "unix_seconds_opt", skip_serializing_if = "Option::is_none")]
-    pub read_at: Option<SystemTime>,
+    /// When the reply was handed to an agent process, so the page can say it
+    /// left the daemon. `None` means it is still sitting here uncollected.
+    ///
+    /// Delivery is not reading. The bytes reaching a CLI process says nothing
+    /// about whether a model ever looked at them: an agent that collects a reply
+    /// and then dies needing credentials has been delivered to and has read
+    /// nothing.
+    #[serde(
+        default,
+        with = "unix_seconds_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub delivered_at: Option<SystemTime>,
+    /// When an agent explicitly acknowledged the reply, saying what it is doing
+    /// about it. This is the only evidence that anything is actually working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack: Option<Ack>,
+}
+
+/// An agent's acknowledgement that it read a reply and is acting on it.
+///
+/// Deliberately carries a message rather than being a bare flag: "I am working
+/// on it" from a live model is the signal, and a flag could be set by the same
+/// transport that merely delivered the bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ack {
+    /// What the agent says it is doing about the reply.
+    pub note: String,
+    #[serde(with = "unix_seconds")]
+    pub at: SystemTime,
 }
 
 /// Which side of a diff a comment is anchored to.
@@ -157,6 +183,57 @@ pub fn side_of(kind: LineKind) -> Side {
     }
 }
 
+/// Where a comment attaches: a file, a line or range of lines, and a side.
+///
+/// The four travel together everywhere — the page sends them as a unit, the
+/// server validates them as a unit, the store records them as a unit — so they
+/// are one value rather than four parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Anchor {
+    /// The file the lines belong to, as it appears in the diff.
+    pub file: String,
+    /// The first line covered, on `side`.
+    pub line: usize,
+    /// The last line covered, or `None` for a single line.
+    pub end_line: Option<usize>,
+    pub side: Side,
+}
+
+impl Anchor {
+    /// An anchor on one line.
+    pub fn line(file: String, line: usize, side: Side) -> Self {
+        Self {
+            file,
+            line,
+            end_line: None,
+            side,
+        }
+    }
+
+    /// An anchor over a range, with the ends put in order.
+    ///
+    /// A drag upwards arrives reversed, and the page should not have to normalise
+    /// what the model can.
+    pub fn range(file: String, from: usize, to: usize, side: Side) -> Self {
+        Self {
+            file,
+            line: from.min(to),
+            end_line: Some(from.max(to)),
+            side,
+        }
+    }
+
+    /// The last line covered, which is `line` unless there is a range.
+    pub fn last(&self) -> usize {
+        self.end_line.unwrap_or(self.line).max(self.line)
+    }
+
+    /// How many lines the anchor spans.
+    pub fn span(&self) -> usize {
+        self.last() - self.line + 1
+    }
+}
+
 /// A comment on one line of a diff.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Comment {
@@ -164,15 +241,54 @@ pub struct Comment {
     pub id: u64,
     /// The file the line belongs to, as it appears in the diff.
     pub file: String,
-    /// The line number on `side`.
+    /// The first line the comment covers, on `side`.
     pub line: usize,
+    /// The last line covered, for a comment dragged across a range.
+    ///
+    /// Equal to `line` for a single-line comment, which is the common case — so
+    /// it is skipped in JSON when there is nothing extra to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
     pub side: Side,
-    /// The line's own text, so the agent has the context without re-reading
-    /// the diff it sent.
+    /// The commented lines' own text, so the agent has the context without
+    /// re-reading the diff it sent.
     pub snippet: String,
     pub text: String,
     #[serde(with = "unix_seconds")]
     pub at: SystemTime,
+}
+
+/// Everything needed to create a session.
+///
+/// A struct rather than a growing list of positional arguments: the title and
+/// content are always known, and the rest is optional context that most callers
+/// leave empty. There is no `Default` because a session with no content is not a
+/// meaningful thing to ask for — use [`NewSession::new`] and fill in the rest.
+#[derive(Debug, Clone)]
+pub struct NewSession {
+    pub title: String,
+    pub content: Content,
+    pub note: Option<String>,
+    /// Where the creating agent is running.
+    pub origin: crate::origin::Origin,
+    /// The syntax theme the content was highlighted with.
+    pub theme: Option<String>,
+    /// A guided tour of the work, as rendered HTML.
+    pub brief: Option<String>,
+}
+
+impl NewSession {
+    /// The two things a session cannot do without.
+    pub fn new(title: String, content: Content) -> Self {
+        Self {
+            title,
+            content,
+            note: None,
+            origin: crate::origin::Origin::default(),
+            theme: None,
+            brief: None,
+        }
+    }
 }
 
 pub struct Session {
@@ -181,6 +297,22 @@ pub struct Session {
     /// Optional longer note from the agent, shown under the title.
     pub note: Option<String>,
     pub content: Content,
+    /// Where the agent that created this session is running, so a notification
+    /// says which of several agents is asking.
+    pub origin: crate::origin::Origin,
+    /// A guided tour of the work, written by the agent and rendered above the
+    /// content: what changed, why, and what to look at first.
+    ///
+    /// Stored as rendered HTML because the markdown is turned into it by the CLI,
+    /// which is where the syntax theme for fenced code is known.
+    pub brief: Option<String>,
+    /// The syntax theme this session's content was highlighted with, when it
+    /// differs from the daemon's default.
+    ///
+    /// Highlighting happens in the CLI but the page's own colours are chosen by
+    /// the daemon, so the name has to travel with the session or the two would
+    /// disagree — light code in a dark card, or the reverse.
+    pub theme: Option<String>,
     pub created: SystemTime,
     /// The reply, once the user sends one. A session accepts a single reply;
     /// the sender is consumed on first use.
@@ -194,8 +326,7 @@ pub struct Session {
 
 impl Session {
     fn expired(&self, ttl: Duration, now: SystemTime) -> bool {
-        now.duration_since(self.created)
-            .is_ok_and(|age| age > ttl)
+        now.duration_since(self.created).is_ok_and(|age| age > ttl)
     }
 }
 
@@ -223,6 +354,25 @@ impl Store {
     /// enough to eyeball in a URL and unguessable enough for a loopback-only
     /// server.
     pub fn insert(&self, title: String, note: Option<String>, content: Content) -> String {
+        self.insert_new(NewSession {
+            note,
+            ..NewSession::new(title, content)
+        })
+    }
+
+    /// Inserts a session described in full.
+    ///
+    /// Takes a struct rather than a growing list of positional arguments: most
+    /// callers care about two or three of these and the rest are `None`.
+    pub fn insert_new(&self, new: NewSession) -> String {
+        let NewSession {
+            title,
+            note,
+            content,
+            origin,
+            theme,
+            brief,
+        } = new;
         let now = SystemTime::now();
         let seq = self.counter.fetch_add(1, Ordering::Relaxed);
         let stamp = now
@@ -236,6 +386,9 @@ impl Store {
             title,
             note,
             content,
+            origin,
+            theme,
+            brief,
             created: now,
             reply: None,
             comments: Vec::new(),
@@ -272,7 +425,8 @@ impl Store {
         let reply = Reply {
             text,
             at: SystemTime::now(),
-            read_at: None,
+            delivered_at: None,
+            ack: None,
         };
         session.reply = Some(reply.clone());
         for waiter in session.waiters.drain(..) {
@@ -282,30 +436,56 @@ impl Store {
         Ok(true)
     }
 
-    /// Marks a session's reply as collected by the agent, returning it.
+    /// Marks a session's reply as delivered to an agent process, returning it.
     ///
-    /// The first call stamps `read_at`; later ones return the reply with the
-    /// original stamp, so a re-read does not look like a fresh one.
-    pub fn mark_read(&self, id: &str) -> Result<Option<Reply>, UnknownSession> {
+    /// The first call stamps `delivered_at`; later ones return the reply with the
+    /// original stamp, so a re-fetch does not look like a fresh delivery. This
+    /// claims only that the bytes left the daemon — see [`Store::ack`] for the
+    /// claim that something read them.
+    pub fn mark_delivered(&self, id: &str) -> Result<Option<Reply>, UnknownSession> {
         let mut sessions = self.lock();
         let session = sessions.get_mut(id).ok_or(UnknownSession)?;
         let Some(reply) = session.reply.as_mut() else {
             return Ok(None);
         };
-        reply.read_at.get_or_insert_with(SystemTime::now);
+        reply.delivered_at.get_or_insert_with(SystemTime::now);
         Ok(Some(reply.clone()))
     }
 
-    /// Adds a line comment, returning its assigned id.
+    /// Records an agent's acknowledgement that it read the reply.
+    ///
+    /// Returns `Ok(false)` when there is no reply to acknowledge: an ack without
+    /// one is a bug in the agent, not something to record. A later ack replaces
+    /// an earlier one, so an agent can report progress more than once.
+    pub fn ack(&self, id: &str, note: String) -> Result<bool, UnknownSession> {
+        let mut sessions = self.lock();
+        let session = sessions.get_mut(id).ok_or(UnknownSession)?;
+        let Some(reply) = session.reply.as_mut() else {
+            return Ok(false);
+        };
+        // An ack implies delivery even if the agent got the text some other way.
+        reply.delivered_at.get_or_insert_with(SystemTime::now);
+        reply.ack = Some(Ack {
+            note,
+            at: SystemTime::now(),
+        });
+        Ok(true)
+    }
+
+    /// Adds a line comment, returning it with its assigned id.
     pub fn comment(
         &self,
         id: &str,
-        file: String,
-        line: usize,
-        side: Side,
+        anchor: Anchor,
         snippet: String,
         text: String,
     ) -> Result<Comment, UnknownSession> {
+        let Anchor {
+            file,
+            line,
+            end_line,
+            side,
+        } = anchor;
         let mut sessions = self.lock();
         let session = sessions.get_mut(id).ok_or(UnknownSession)?;
         // Ids are per session and monotonic, so a page can address the comment
@@ -315,6 +495,9 @@ impl Store {
             id: next,
             file,
             line,
+            // A range that covers one line is not a range: normalised away so
+            // the common case has one representation.
+            end_line: end_line.filter(|end| *end > line),
             side,
             snippet,
             text,
@@ -354,12 +537,7 @@ impl Store {
 
     /// A session's comments, oldest first.
     pub fn comments(&self, id: &str) -> Result<Vec<Comment>, UnknownSession> {
-        Ok(self
-            .lock()
-            .get(id)
-            .ok_or(UnknownSession)?
-            .comments
-            .clone())
+        Ok(self.lock().get(id).ok_or(UnknownSession)?.comments.clone())
     }
 
     /// Registers interest in a session's reply.
@@ -505,8 +683,9 @@ mod tests {
     #[test]
     fn ids_are_unique() {
         let store = Store::new(None);
-        let ids: std::collections::HashSet<_> =
-            (0..500).map(|_| store.insert("t".into(), None, demo())).collect();
+        let ids: std::collections::HashSet<_> = (0..500)
+            .map(|_| store.insert("t".into(), None, demo()))
+            .collect();
         assert_eq!(ids.len(), 500, "ids collided");
     }
 
@@ -551,11 +730,8 @@ mod tests {
         let store = Store::new(Some(Duration::from_secs(60)));
         let stale = store.insert("stale".into(), None, demo());
         // Backdate past the TTL.
-        store
-            .lock()
-            .get_mut(&stale)
-            .unwrap()
-            .created = SystemTime::now() - Duration::from_secs(3600);
+        store.lock().get_mut(&stale).unwrap().created =
+            SystemTime::now() - Duration::from_secs(3600);
 
         let fresh = store.insert("fresh".into(), None, demo());
         assert!(!store.exists(&stale), "stale session survived");
@@ -563,29 +739,81 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_is_unread_until_collected() {
+    fn a_reply_is_undelivered_until_collected() {
         let store = Store::new(None);
         let id = store.insert("t".into(), None, demo());
         store.reply(&id, "hi".into()).unwrap();
 
-        let unread = store.with(&id, |s| s.reply.clone()).unwrap().unwrap();
-        assert!(unread.read_at.is_none(), "a fresh reply looked read");
+        let fresh = store.with(&id, |s| s.reply.clone()).unwrap().unwrap();
+        assert!(
+            fresh.delivered_at.is_none(),
+            "a fresh reply looked delivered"
+        );
 
-        let first = store.mark_read(&id).unwrap().unwrap();
-        let stamp = first.read_at.expect("collecting stamps read_at");
+        let first = store.mark_delivered(&id).unwrap().unwrap();
+        let stamp = first.delivered_at.expect("collecting stamps delivered_at");
 
-        // A second collection is a re-read, not a fresh one: the page would
+        // A second collection is a re-fetch, not a fresh delivery: the page would
         // otherwise show the receipt moving.
-        let again = store.mark_read(&id).unwrap().unwrap();
-        assert_eq!(again.read_at, Some(stamp));
+        let again = store.mark_delivered(&id).unwrap().unwrap();
+        assert_eq!(again.delivered_at, Some(stamp));
     }
 
     #[test]
-    fn marking_read_with_no_reply_is_not_an_error() {
+    fn delivery_is_not_a_claim_that_anything_read_the_reply() {
+        // The distinction the whole ack flow exists for: an agent that collects a
+        // reply and then dies — needing credentials, say — has been delivered to
+        // and has read nothing. Reporting that as "read" is a lie the user cannot
+        // check, and it hides exactly the failure worth seeing.
         let store = Store::new(None);
         let id = store.insert("t".into(), None, demo());
-        assert!(store.mark_read(&id).unwrap().is_none());
-        assert!(store.mark_read("nope").is_err());
+        store.reply(&id, "have a look".into()).unwrap();
+
+        let delivered = store.mark_delivered(&id).unwrap().unwrap();
+        assert!(delivered.delivered_at.is_some());
+        assert!(delivered.ack.is_none(), "delivery invented an ack");
+
+        assert!(store.ack(&id, "on it: rerunning the build".into()).unwrap());
+        let acked = store.with(&id, |s| s.reply.clone()).unwrap().unwrap();
+        let ack = acked.ack.expect("the ack was recorded");
+        assert_eq!(ack.note, "on it: rerunning the build");
+    }
+
+    #[test]
+    fn an_ack_can_be_replaced_so_an_agent_can_report_progress() {
+        let store = Store::new(None);
+        let id = store.insert("t".into(), None, demo());
+        store.reply(&id, "hi".into()).unwrap();
+
+        store.ack(&id, "starting".into()).unwrap();
+        store.ack(&id, "done, pushed".into()).unwrap();
+        let reply = store.with(&id, |s| s.reply.clone()).unwrap().unwrap();
+        assert_eq!(reply.ack.unwrap().note, "done, pushed");
+    }
+
+    #[test]
+    fn an_ack_implies_delivery() {
+        // An agent may have been handed the text some other way — an inbox dump
+        // pasted into a prompt. Acking is the stronger claim, so it covers both.
+        let store = Store::new(None);
+        let id = store.insert("t".into(), None, demo());
+        store.reply(&id, "hi".into()).unwrap();
+
+        store.ack(&id, "read it".into()).unwrap();
+        let reply = store.with(&id, |s| s.reply.clone()).unwrap().unwrap();
+        assert!(reply.delivered_at.is_some(), "an ack left it undelivered");
+    }
+
+    #[test]
+    fn acking_or_collecting_with_no_reply_is_not_an_error() {
+        let store = Store::new(None);
+        let id = store.insert("t".into(), None, demo());
+        assert!(store.mark_delivered(&id).unwrap().is_none());
+        assert!(store.mark_delivered("nope").is_err());
+        // Nothing to acknowledge is a `false`, not a panic; but an unknown
+        // session is still a hard error.
+        assert!(!store.ack(&id, "hi".into()).unwrap());
+        assert!(store.ack("nope", "hi".into()).is_err());
     }
 
     #[test]
@@ -599,7 +827,7 @@ mod tests {
 
         store.reply(&seen, "one".into()).unwrap();
         store.reply(&missed, "two".into()).unwrap();
-        store.mark_read(&seen).unwrap();
+        store.ack(&seen, "read it".into()).unwrap();
 
         let ids: Vec<_> = store.replied().into_iter().map(|item| item.0).collect();
         assert!(ids.contains(&seen) && ids.contains(&missed));
@@ -608,10 +836,29 @@ mod tests {
         let unread: Vec<_> = store
             .replied()
             .into_iter()
-            .filter(|(_, _, reply, _)| reply.read_at.is_none())
+            .filter(|(_, _, reply, _)| reply.ack.is_none())
             .map(|item| item.0)
             .collect();
         assert_eq!(unread, vec![missed]);
+    }
+
+    #[test]
+    fn a_collected_but_unacked_reply_stays_in_the_unread_inbox() {
+        // The dropped-agent case. If "unread" filtered on delivery, the reply a
+        // dead process collected would vanish from the inbox and never be acted
+        // on — the one thing the inbox exists to prevent.
+        let store = Store::new(None);
+        let id = store.insert("t".into(), None, demo());
+        store.reply(&id, "did you get this?".into()).unwrap();
+        store.mark_delivered(&id).unwrap();
+
+        let unread: Vec<_> = store
+            .replied()
+            .into_iter()
+            .filter(|(_, _, reply, _)| reply.ack.is_none())
+            .map(|item| item.0)
+            .collect();
+        assert_eq!(unread, vec![id], "a collected reply fell out of the inbox");
     }
 
     #[test]
@@ -621,14 +868,79 @@ mod tests {
         let store = Store::new(None);
         let id = store.insert("t".into(), None, demo());
         let first = store
-            .comment(&id, "a.rs".into(), 3, Side::New, "let x = 1;".into(), "why?".into())
+            .comment(
+                &id,
+                Anchor::line("a.rs".into(), 3, Side::New),
+                "let x = 1;".into(),
+                "why?".into(),
+            )
             .unwrap();
         let second = store
-            .comment(&id, "a.rs".into(), 9, Side::Old, "gone".into(), "keep this".into())
+            .comment(
+                &id,
+                Anchor::line("a.rs".into(), 9, Side::Old),
+                "gone".into(),
+                "keep this".into(),
+            )
             .unwrap();
         assert!(second.id > first.id, "ids did not rise");
         assert_eq!(store.comments(&id).unwrap().len(), 2);
-        assert!(store.comment("nope", "a".into(), 1, Side::New, String::new(), "x".into()).is_err());
+        assert!(
+            store
+                .comment(
+                    "nope",
+                    Anchor::line("a".into(), 1, Side::New),
+                    String::new(),
+                    "x".into(),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_range_that_covers_one_line_is_not_a_range() {
+        // Normalised on the way in, so the common case has one representation and
+        // the page does not have to render "L4–L4".
+        let store = Store::new(None);
+        let id = store.insert("t".into(), None, demo());
+
+        let single = store
+            .comment(
+                &id,
+                Anchor::range("a.rs".into(), 4, 4, Side::New),
+                "x".into(),
+                "hm".into(),
+            )
+            .unwrap();
+        assert_eq!(single.end_line, None, "a one-line range was kept");
+
+        let ranged = store
+            .comment(
+                &id,
+                Anchor::range("a.rs".into(), 4, 8, Side::New),
+                "x".into(),
+                "hm".into(),
+            )
+            .unwrap();
+        assert_eq!(ranged.end_line, Some(8));
+    }
+
+    #[test]
+    fn an_anchor_puts_a_dragged_range_in_order() {
+        // Dragging upwards is as natural as downwards, so the ends arrive
+        // reversed. Normalising here means no caller has to think about it.
+        let up = Anchor::range("a.rs".into(), 9, 2, Side::New);
+        assert_eq!((up.line, up.end_line), (2, Some(9)));
+        assert_eq!(up.last(), 9);
+        assert_eq!(up.span(), 8);
+
+        let down = Anchor::range("a.rs".into(), 2, 9, Side::New);
+        assert_eq!(up, down, "direction changed the anchor");
+
+        // A single line spans itself, so a length check needs no special case.
+        let one = Anchor::line("a.rs".into(), 5, Side::Old);
+        assert_eq!(one.last(), 5);
+        assert_eq!(one.span(), 1);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! The `showme` command.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -45,7 +45,13 @@ A reply outlives the wait. If --wait times out the session is still open, so a
 later turn can pick the reply up:
 
   showme inbox              # replies waiting, as JSON
-  showme collect <id>       # take one reply and its line comments"
+  showme collect <id>       # take one reply and its line comments
+
+Collecting a reply only moves it to you. Once you have actually read it, say so —
+this is what tells the user a model is really working on it rather than that a
+process fetched some bytes and died:
+
+  showme ack <id> \"rerunning the build with your flag\""
 )]
 struct Cli {
     #[command(subcommand)]
@@ -131,6 +137,18 @@ enum Command {
         id: String,
     },
 
+    /// Tell the user you read their reply and what you are doing about it.
+    ///
+    /// Collecting a reply only moves bytes. This is what lights up the receipt on
+    /// their page, so send it once you have actually read the reply.
+    Ack {
+        /// Session id.
+        id: String,
+        /// What you are doing about the reply, in a sentence.
+        #[arg(required = true)]
+        note: Vec<String>,
+    },
+
     /// Run the daemon in the foreground.
     Serve,
 
@@ -182,6 +200,62 @@ struct ShowArgs {
     /// Print the link instead of sending a notification.
     #[arg(long)]
     no_notify: bool,
+
+    /// Syntax theme for this session only. See `showme themes`.
+    ///
+    /// The page's own colours follow the theme, so a light theme gives a light
+    /// page. Set a lasting default with `showme config --theme`.
+    #[arg(long)]
+    theme: Option<String>,
+
+    /// A guided review, as markdown, shown above the content.
+    ///
+    /// Explain what changed and what to look at first. A link to `#f-<path>`
+    /// jumps to that file, with non-alphanumerics replaced by dashes: `src/a.rs`
+    /// is `#f-src-a-rs`. Pass `-` to read the markdown from stdin.
+    #[arg(long, short = 'b')]
+    brief: Option<String>,
+
+    /// Read the guided review from a markdown file.
+    #[arg(long, conflicts_with = "brief")]
+    brief_file: Option<PathBuf>,
+}
+
+impl ShowArgs {
+    /// The theme to highlight with: this invocation's, or the configured default.
+    fn theme<'a>(&'a self, config: &'a Config) -> Result<&'a str> {
+        let name = self.theme.as_deref().unwrap_or(&config.theme);
+        anyhow::ensure!(
+            render::theme_names().contains(&name),
+            "unknown theme {name:?}. See `showme themes`"
+        );
+        Ok(name)
+    }
+
+    /// The guided review, rendered to HTML.
+    ///
+    /// Rendered here rather than in the daemon because this is where the syntax
+    /// theme for fenced code blocks is known.
+    fn brief(&self, config: &Config) -> Result<Option<String>> {
+        let source = match (&self.brief, &self.brief_file) {
+            (Some(text), _) if text == "-" => {
+                use std::io::Read as _;
+                let mut buffer = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buffer)
+                    .context("reading the brief from stdin")?;
+                buffer
+            }
+            (Some(text), _) => text.clone(),
+            (None, Some(path)) => read_text(path)?,
+            (None, None) => return Ok(None),
+        };
+        if source.trim().is_empty() {
+            return Ok(None);
+        }
+        let theme = self.theme(config)?;
+        Ok(Some(render::markdown("brief", &source, theme).html))
+    }
 }
 
 #[tokio::main]
@@ -199,7 +273,9 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Command::Serve => {
-            let ttl = config.session_ttl_hours.map(|h| Duration::from_secs(h * 3600));
+            let ttl = config
+                .session_ttl_hours
+                .map(|h| Duration::from_secs(h * 3600));
             showme::server::serve(&config, Store::new(ttl)).await
         }
 
@@ -229,7 +305,7 @@ async fn run() -> Result<()> {
         }
 
         Command::Code { files, show } => {
-            let theme = render::theme(&config.theme);
+            let theme = render::theme(show.theme(&config)?);
             let mut rendered = Vec::with_capacity(files.len());
             for path in &files {
                 let source = read_text(path)?;
@@ -240,12 +316,26 @@ async fn run() -> Result<()> {
                 .title
                 .clone()
                 .unwrap_or_else(|| default_title(&files, "code"));
-            show_content(&config, title, show, Content::Code { files: rendered }, details).await
+            show_content(
+                &config,
+                title,
+                show,
+                Content::Code { files: rendered },
+                details,
+            )
+            .await
         }
 
         Command::Diff { patch, show } => {
+            // Both cannot come from stdin: whichever read first would consume the
+            // other's input, and the diff is the one that is usually piped.
+            anyhow::ensure!(
+                !(patch == *"-" && show.brief.as_deref() == Some("-")),
+                "the diff and the brief cannot both come from stdin. \
+                 Use `--brief-file <PATH>`, or pass the patch as a file"
+            );
             // Reading from stdin is the common case: `git diff | showme diff`.
-            let source = if patch == PathBuf::from("-") {
+            let source = if patch == *"-" {
                 use std::io::Read as _;
                 let mut buffer = String::new();
                 std::io::stdin()
@@ -261,13 +351,16 @@ async fn run() -> Result<()> {
                 read_text(&patch)?
             };
 
-            let files = showme::diff::parse(&source, render::theme(&config.theme))?;
+            let files = showme::diff::parse(&source, render::theme(show.theme(&config)?))?;
             let added: usize = files.iter().map(|f| f.added).sum();
             let removed: usize = files.iter().map(|f| f.removed).sum();
-            let title = show.title.clone().unwrap_or_else(|| match files.as_slice() {
-                [one] => one.label.clone(),
-                many => format!("{} changed files", many.len()),
-            });
+            let title = show
+                .title
+                .clone()
+                .unwrap_or_else(|| match files.as_slice() {
+                    [one] => one.label.clone(),
+                    many => format!("{} changed files", many.len()),
+                });
             let details = vec![
                 summarize(files.len(), "file"),
                 format!("+{added} −{removed}"),
@@ -279,14 +372,25 @@ async fn run() -> Result<()> {
             let mut rendered = Vec::with_capacity(files.len());
             for path in &files {
                 let source = read_text(path)?;
-                rendered.push(render::markdown(&label(path), &source, &config.theme));
+                rendered.push(render::markdown(
+                    &label(path),
+                    &source,
+                    show.theme(&config)?,
+                ));
             }
             let details = vec![summarize(files.len(), "doc")];
             let title = show
                 .title
                 .clone()
                 .unwrap_or_else(|| default_title(&files, "docs"));
-            show_content(&config, title, show, Content::Docs { files: rendered }, details).await
+            show_content(
+                &config,
+                title,
+                show,
+                Content::Docs { files: rendered },
+                details,
+            )
+            .await
         }
 
         Command::Dir { root, entry, show } => {
@@ -305,7 +409,14 @@ async fn run() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| format!("{}", root.file_name().unwrap_or_default().display()));
             let details = vec![root.display().to_string()];
-            show_content(&config, title, show, Content::Static { root, entry }, details).await
+            show_content(
+                &config,
+                title,
+                show,
+                Content::Static { root, entry },
+                details,
+            )
+            .await
         }
 
         Command::Demo { port, path, show } => {
@@ -369,6 +480,19 @@ async fn run() -> Result<()> {
                 eprintln!("showme: session {id} has no reply yet");
                 std::process::exit(2);
             }
+            // Collecting is the transport; the user's page still shows this as
+            // merely picked up until something says it was read.
+            eprintln!(
+                "showme: once you have read this, run \
+                 `showme ack {id} \"<what you are doing>\"`"
+            );
+            Ok(())
+        }
+
+        Command::Ack { id, note } => {
+            let note = note.join(" ");
+            Client::new(&config).ack(&id, &note).await?;
+            eprintln!("showme: acknowledged {id}");
             Ok(())
         }
 
@@ -474,7 +598,24 @@ async fn show_content(
 ) -> Result<()> {
     let kind = content.kind();
     let client = Client::new(config);
-    let id = client.create(title.clone(), show.note.clone(), content).await?;
+    // The theme travels with the session so the page's chrome agrees with the
+    // highlighting the CLI already applied.
+    let theme = show.theme(config)?.to_owned();
+    let brief = show.brief(config)?;
+    let id = client
+        .create(showme::server::CreateSession {
+            note: show.note.clone(),
+            theme: Some(theme),
+            brief,
+            ..showme::server::CreateSession::new(title.clone(), content)
+        })
+        .await?;
+    // Which agent is asking: with several running there is otherwise nothing in
+    // the notification to say which pane to go back to.
+    let mut details = details;
+    if let Some(origin) = showme::origin::Origin::detect().summary() {
+        details.push(origin);
+    }
     // The daemon's port is discovered, not assumed: the range is chosen for
     // being forwarded, which also means other servers are already in it.
     let url = client.session_url(&id).await?;
@@ -490,9 +631,7 @@ async fn show_content(
     let webhook = (!show.no_notify)
         .then_some(config.webhook_url.as_deref())
         .flatten();
-    let sent = notification
-        .send(webhook, &config.webhook_field)
-        .await?;
+    let sent = notification.send(webhook, &config.webhook_field).await?;
 
     // The URL always goes to stdout so the agent can quote it back to the user
     // even when a notification went out.
@@ -504,7 +643,16 @@ async fn show_content(
     if show.wait {
         eprintln!("showme: waiting up to {}s for a reply…", show.timeout);
         match client.wait(&id, Duration::from_secs(show.timeout)).await? {
-            Some(reply) => println!("{}", serde_json::to_string_pretty(&reply)?),
+            Some(reply) => {
+                println!("{}", serde_json::to_string_pretty(&reply)?);
+                // Receiving it is not reading it, and the page says so until an
+                // ack arrives. Prompt for one rather than leaving the user
+                // looking at an amber dot.
+                eprintln!(
+                    "showme: once you have read this, run \
+                     `showme ack {id} \"<what you are doing>\"`"
+                );
+            }
             None => {
                 // The wait gave up, but the session has not: the daemon holds
                 // the reply for as long as the session lives, so say where to
@@ -521,16 +669,15 @@ async fn show_content(
     Ok(())
 }
 
-fn read_text(path: &PathBuf) -> Result<String> {
+fn read_text(path: &Path) -> Result<String> {
     let bytes =
         std::fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
-    String::from_utf8(bytes)
-        .with_context(|| format!("{} is not valid UTF-8", path.display()))
+    String::from_utf8(bytes).with_context(|| format!("{} is not valid UTF-8", path.display()))
 }
 
 /// The label shown for a file: its path as given, which is more useful than a
 /// bare file name when several files share one.
-fn label(path: &PathBuf) -> String {
+fn label(path: &Path) -> String {
     path.display().to_string()
 }
 

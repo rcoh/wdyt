@@ -92,10 +92,31 @@ showme collect <id>       # take one reply and its line comments
 
 This is what makes a reply sent a day after the agent stopped waiting still land.
 
-Collecting marks the reply read, and the page you replied on says so: the reply
-panel carries a dot that pulses while the reply is still unread and turns green
-with "The agent has read this" once collected. It polls a read-only status route,
-so watching the page never marks your own reply read.
+## Did the agent actually read it?
+
+Delivery is not reading. An agent can collect a reply and then die — needing
+credentials, hitting a rate limit — and a receipt that lit up on delivery would
+call that success. So the page shows three states, not two:
+
+| Dot | Means |
+|---|---|
+| Grey, pulsing | Waiting for an agent to pick this up |
+| Amber, pulsing | Picked up by an agent, not yet acknowledged |
+| Green | The agent read this, and here is what it said |
+
+Only an explicit ack reaches green, and it carries the agent's own words:
+
+```sh
+showme ack <id> "rerunning the build with your flag"
+```
+
+The note is required — a bare flag could be sent by the same transport that
+merely moved the bytes, so the signal is the sentence. `showme inbox --unread`
+filters on the ack rather than on delivery, which means a reply some dead process
+collected stays in the inbox instead of vanishing from it.
+
+The page polls a read-only status route, so watching it never advances your own
+receipt.
 
 ## Reviewing a diff
 
@@ -105,21 +126,83 @@ reassembled and highlighted as one document before being split back into lines,
 so a multi-line string or comment colours correctly instead of restarting at
 every line.
 
-Hover a line and a `+` appears in the gutter; click it for a comment box.
-`⌘/Ctrl + Enter` saves, `Escape` cancels, and several comments can stack on one
-line. Comments survive a reload and come back to the agent alongside the reply:
+Hover a line and a `+` appears in the gutter; click it for a comment box, or
+**drag from one `+` to another to comment on a range**. The covered lines are
+marked with a bar down the gutter — not a background tint, which would read as a
+deleted line — and the note is labelled with the span it covers. `⌘/Ctrl + Enter`
+saves, `Escape` cancels, and several comments can stack on one line. Comments
+survive a reload and come back to the agent alongside the reply:
 
 ```sh
 showme collect <id>
 # {"replied": true, "reply": {...}, "comments": [
 #   {"file": "src/lib.rs", "line": 2, "side": "new",
-#    "snippet": "    let x = 2;", "text": "why 2?"}]}
+#    "snippet": "    let x = 2;", "text": "why 2?"},
+#   {"file": "src/lib.rs", "line": 5, "end_line": 9, "side": "new",
+#    "snippet": "fn f() {\n    ...\n}", "text": "this whole block"}]}
 ```
+
+`end_line` is present only for a range, and the snippet then quotes every line it
+covers.
 
 The quoted `snippet` is read from the daemon's own copy of the diff rather than
 taken from the request, so the page is never trusted to say what a line said. A
 context line is addressable only by its new-side number, so the same line cannot
 collect two independent comment threads.
+
+## Guided review
+
+Rather than dropping a diff on someone and hoping, the agent can write the tour:
+what changed, why, and what to look at first. `--brief` takes markdown, or
+`--brief-file` a path:
+
+```sh
+git diff | showme diff --brief-file REVIEW.md
+showme code src/*.rs --brief "Start with the parser; the rest is mechanical."
+```
+
+It renders above the content in the same column as the code, with GFM callouts
+and highlighted fences. A link to `#f-<path>` jumps to that file, with
+non-alphanumerics replaced by dashes — `src/diff.rs` is `#f-src-diff-rs`:
+
+```markdown
+> [!NOTE]
+> The parser bug is the interesting one.
+
+- [src/diff.rs](#f-src-diff-rs) — the hunk-length fix
+- [README.md](#f-readme-md) — docs only
+```
+
+`--brief -` reads from stdin, so it cannot be combined with a diff that is also
+piped in; showme says so rather than silently eating one of them.
+
+## Colour schemes
+
+`showme themes` lists them; `--theme` picks one for a single session, and
+`showme config --theme` sets the lasting default:
+
+```sh
+git diff | showme diff --theme GitHub
+showme config --theme "Solarized (light)"
+```
+
+The theme travels with the session, so the page's own colours follow the code:
+a light theme gives a light card rather than light code on a dark one. Light
+options that sit well with the warm off-white chrome are `GitHub`,
+`OneHalfLight`, `Catppuccin Latte`, and `Solarized (light)`; the default `Nord`
+is dark.
+
+## Which agent is asking
+
+With several agents running there is otherwise nothing to say which one sent a
+link. Each session records where it was created — the working directory, and
+under zellij the session and tab name — and shows it in the bar and in the
+notification: `dd-2 › showme cli — /local/home/rcoh/code/showme`. Hovering gives
+the pane title, which for an agent is usually the task it was handed.
+
+The tab comes from the pane id rather than `zellij action current-tab-info`,
+which reports whichever tab *you* are looking at and so names the wrong one
+whenever the agent is in the background.
 
 ## Hiding the chrome
 
@@ -155,6 +238,19 @@ misrepresent it.
 
 `⌘/Ctrl + Enter` sends, `Escape` closes. Once sent, the panel shows what you
 sent and can still be reopened on a later visit.
+
+## Tests
+
+```sh
+cargo nextest run     # preferred
+cargo test            # also works
+```
+
+[nextest](https://nexte.st) is preferred because the integration tests each start
+a real daemon on a real port: a process per test keeps one test's daemon, port,
+and store out of another's, and a flake gets reported rather than hidden. Ports
+come from a window keyed by process id *and* a counter — the counter alone
+collides under nextest, where each test process restarts it at zero.
 
 ## Notes
 

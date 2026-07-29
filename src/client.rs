@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::server::{Comments, CreateSession, CreatedSession, Inbox, InboxItem};
-use crate::session::{Comment, Content, Reply};
+use crate::session::{Comment, Reply};
 
 pub struct Client {
     /// The port the daemon was last seen on. Cached because every call would
@@ -37,7 +37,11 @@ impl Client {
     /// already forwarded, so it is also already occupied, and the daemon takes
     /// whichever port in it was free.
     async fn base(&self) -> Option<String> {
-        if let Some(port) = *self.port.lock().expect("not poisoned") {
+        // Read and release before probing: holding a std `Mutex` across an await
+        // would block every other caller for the length of a network round trip,
+        // and can deadlock if the future is moved between threads.
+        let cached = *self.port.lock().expect("not poisoned");
+        if let Some(port) = cached {
             let base = format!("http://{}:{port}", self.bind);
             if self.probe(&base).await {
                 return Some(base);
@@ -105,23 +109,18 @@ impl Client {
     }
 
     /// Creates a session, starting the daemon first if needed.
-    pub async fn create(
-        &self,
-        title: String,
-        note: Option<String>,
-        content: Content,
-    ) -> Result<String> {
+    ///
+    /// The origin is filled in here rather than by the caller: this process is
+    /// the one actually sitting in the agent's directory and pane.
+    pub async fn create(&self, mut session: CreateSession) -> Result<String> {
         self.ensure_daemon().await?;
+        session.origin = Some(crate::origin::Origin::detect());
 
         let base = self.require_base().await?;
         let response = self
             .http
             .post(format!("{base}/api/sessions"))
-            .json(&CreateSession {
-                title,
-                note,
-                content,
-            })
+            .json(&session)
             .timeout(Duration::from_secs(30))
             .send()
             .await
@@ -219,6 +218,34 @@ impl Client {
             response.status()
         );
         Ok(response.json::<Response>().await?.reply)
+    }
+
+    /// Tells the daemon an agent has actually read the reply.
+    ///
+    /// Distinct from [`Client::collect`] on purpose: that one moves bytes, this
+    /// one is a live model saying something about them. Only this lights up the
+    /// page's receipt.
+    pub async fn ack(&self, id: &str, note: &str) -> Result<()> {
+        let base = self.require_base().await?;
+        let response = self
+            .http
+            .post(format!("{base}/api/sessions/{id}/ack"))
+            .json(&crate::server::AckInput {
+                note: note.to_owned(),
+            })
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .context("could not reach the showme daemon")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!("no such session: {id}");
+        }
+        anyhow::ensure!(
+            response.status().is_success(),
+            "daemon rejected the ack: {}",
+            response.status()
+        );
+        Ok(())
     }
 
     /// A session's line comments.

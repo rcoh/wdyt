@@ -61,15 +61,19 @@ fn stylesheet(colors: &ThemeColors) -> String {
   --code-muted: {muted};
   color-scheme: light;
 }}
-html, body {{ margin: 0; padding: 0; height: 100%; }}
+html, body {{ margin: 0; padding: 0; }}
 body {{
   background: var(--bg);
   color: var(--fg);
   font: 14px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   display: flex;
   flex-direction: column;
-  min-height: 100%;
+  min-height: 100vh;
 }}
+/* A framed page must not scroll: the iframe owns the space below the chrome and
+   sizes to it. Elsewhere the body has to be free to grow past the viewport, or a
+   `position: sticky` child has no distance to travel and never sticks. */
+html:has(body.framed), body.framed {{ height: 100%; }}
 a {{ color: var(--accent); }}
 
 /* Header ------------------------------------------------------------------ */
@@ -87,6 +91,20 @@ header.bar .brand {{
 header.bar h1 {{ font-size: 15px; font-weight: 600; margin: 0; }}
 header.bar .note {{ color: var(--muted); font-size: 13px; }}
 header.bar .spacer {{ flex: 1; }}
+/* Which agent is asking: the multiplexer pane to switch to, and the directory
+   the work is in. Quiet and monospaced — it is a coordinate, not a headline. */
+header.bar .origin {{
+  display: flex; align-items: baseline; gap: 5px; min-width: 0;
+  font: 11px/1.4 ui-monospace, monospace; color: var(--muted);
+}}
+header.bar .origin .place {{ color: var(--fg); }}
+header.bar .origin .sep {{ opacity: .5; }}
+/* The path is the first thing worth dropping when the bar is tight: the pane
+   name identifies the agent, and the path is usually implied by it. */
+header.bar .origin .cwd {{
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 30ch; direction: rtl; text-align: left;
+}}
 .kind {{
   font: 11px/1 ui-monospace, monospace; text-transform: uppercase;
   padding: 4px 7px; border: 1px solid var(--border-strong); border-radius: 4px;
@@ -97,16 +115,53 @@ main {{ flex: 1 1 auto; min-height: 0; }}
 .wrap {{ max-width: 1100px; margin: 0 auto; padding: 24px 20px 96px; }}
 
 /* File list --------------------------------------------------------------- */
+/* Sticky, because on a long diff this is the only way to jump between files: a
+   jump list that has scrolled off the top is no jump list at all. Only in the
+   scrolling modes — a framed page does not scroll, and `position: sticky` inside
+   a flex column there would just pin it over the iframe. */
 nav.files {{
   display: flex; flex-wrap: wrap; gap: 6px;
   padding: 10px 20px; border-bottom: 1px solid var(--border);
   font: 12px/1 ui-monospace, monospace;
+}}
+body:not(.framed) nav.files {{
+  position: sticky; top: 0; z-index: 3;
+  background: var(--raised);
+  /* Its own backdrop, since content scrolls underneath it. */
+  box-shadow: 0 1px 0 var(--border);
 }}
 nav.files a {{
   padding: 5px 9px; border-radius: 4px; text-decoration: none;
   border: 1px solid transparent;
 }}
 nav.files a:hover {{ border-color: var(--border); }}
+/* An anchored jump must not land under the sticky nav. Generous enough to clear
+   it when it has wrapped to a second row on a wide diff. */
+section.file, section.doc {{ scroll-margin-top: 92px; }}
+
+/* Guided review ----------------------------------------------------------- */
+/* The agent's tour of its own work. Measured column and prose type, because it
+   is the one part of the page meant to be read rather than scanned. */
+/* Left edge shared with `.wrap` below it, so the prose and the code it talks
+   about line up on the same axis; the measure is bounded within that column
+   rather than centred in it, which would read as a different page. */
+section.brief {{
+  /* A flex child of `body`, so it must be told to span the row: left to itself
+     it shrinks to its content and drifts off the axis of the code below. */
+  align-self: stretch; flex: 0 0 auto;
+  box-sizing: border-box;
+  border-bottom: 1px solid var(--border);
+  font: 14px/1.65 ui-sans-serif, system-ui, sans-serif;
+  /* Indented to `.wrap`'s own left edge — 1100px centred, plus its 20px gutter —
+     so the prose starts on the same axis as the code it talks about. */
+  padding: 18px 20px 20px max(20px, calc((100% - 1100px) / 2 + 20px));
+}}
+section.brief > * {{ max-width: 74ch; }}
+section.brief > :first-child {{ margin-top: 0; }}
+section.brief > :last-child {{ margin-bottom: 0; }}
+/* A framed page does not scroll, so an unbounded brief would push the iframe out
+   of view entirely. It scrolls within itself instead. */
+body.framed section.brief {{ max-height: 30vh; overflow-y: auto; }}
 
 /* Code -------------------------------------------------------------------- */
 /* The card carries the syntax theme's own colours: the highlighting inside it
@@ -120,6 +175,11 @@ section.file .filename {{
   border-bottom: none; border-radius: 8px 8px 0 0; background: var(--raised);
   position: sticky; top: 0; z-index: 1;
 }}
+/* Below the sticky jump list rather than under it: both stick, so without an
+   offset the file header would slide underneath the nav. Measured, not guessed —
+   the nav is 45px at one row. With the chrome hidden there is no nav to clear. */
+body:not(.framed) section.file .filename {{ top: 45px; }}
+body.nochrome section.file .filename {{ top: 0; }}
 section.file .filename .meta {{ margin-left: auto; opacity: .8; }}
 .codebox {{
   border: 1px solid var(--border-strong); border-radius: 0 0 8px 8px;
@@ -182,6 +242,25 @@ table.src.diff .note .who {{
   display: block; font-size: 10.5px; text-transform: uppercase;
   letter-spacing: .07em; color: var(--muted);
 }}
+/* Which lines a note covers, when it is more than the one directly above it. */
+table.src.diff .note .who .span {{
+  margin-left: 6px; text-transform: none; letter-spacing: 0;
+  font-family: ui-monospace, monospace; opacity: .85;
+}}
+/* Rows a comment's range covers: while dragging, and once saved.
+   Marked with a bar down the gutter rather than a background tint. Tinting fights
+   the diff's own colours — an accent-tinted row reads as a deleted one — so the
+   row background is left to mean add/remove and nothing else. */
+table.src.diff tr.inrange td.code, table.src.diff tr.selecting td.code {{
+  box-shadow: inset 3px 0 0 var(--accent);
+}}
+/* Mid-drag the whole span also lifts slightly, since nothing is committed yet and
+   the feedback has to be unmistakable. */
+table.src.diff tr.selecting td {{
+  background: color-mix(in srgb, var(--accent) 10%, var(--code-bg));
+}}
+/* A drag over code would otherwise select text and fight the range. */
+table.src.diff tr.selecting {{ user-select: none; }}
 table.src.diff .notebox {{ display: flex; flex-direction: column; gap: 6px; margin: 4px 0; }}
 table.src.diff .notebox textarea {{
   width: 100%; min-height: 62px; resize: vertical;
@@ -397,7 +476,9 @@ body.nochrome #chrome-show {{ display: block; }}
 
 /* Read receipt ------------------------------------------------------------ */
 /* Sending a reply into a daemon is an act of faith otherwise: the agent may be
-   waiting, or may have exited hours ago. The receipt says which. */
+   waiting, or may have exited hours ago. The receipt says which — in three
+   states, because "the bytes left the daemon" and "a model read them" are
+   different claims and conflating them hides a dead agent. */
 #reply .receipt {{
   display: flex; align-items: center; gap: 6px;
   color: var(--muted); font-size: 11.5px; margin: 0;
@@ -406,18 +487,32 @@ body.nochrome #chrome-show {{ display: block; }}
   width: 7px; height: 7px; border-radius: 999px; flex: 0 0 auto;
   background: var(--border-strong);
 }}
-/* Unread: a slow pulse, so a glance tells you it is still outstanding. */
+/* Outstanding: a slow pulse, so a glance tells you it has not moved. */
 #reply .receipt.waiting .dot {{
   background: var(--accent); animation: showme-pulse 1.8s ease-in-out infinite;
 }}
+/* Picked up but unacknowledged: amber, and still pulsing. This is where an agent
+   that died on a credentials prompt sits, so it must not look like success. */
+#reply .receipt.delivered .dot {{
+  background: #b8860b; animation: showme-pulse 1.8s ease-in-out infinite;
+}}
+#reply .receipt.delivered {{ color: #8a6508; }}
 #reply .receipt.read .dot {{ background: #3f7d58; }}
 #reply .receipt.read {{ color: #3f7d58; }}
+/* What the agent said it is doing: the only evidence a model was really there. */
+#reply .acknote {{
+  margin: 0; padding: 6px 9px;
+  background: var(--surface); border: 1px solid var(--border-strong);
+  border-left: 2px solid #3f7d58; border-radius: 0 6px 6px 0;
+  font-size: 12px; color: var(--fg); white-space: pre-wrap;
+}}
+#reply .acknote:empty {{ display: none; }}
 @keyframes showme-pulse {{
   0%, 100% {{ opacity: 1; }}
   50% {{ opacity: .25; }}
 }}
 @media (prefers-reduced-motion: reduce) {{
-  #reply .receipt.waiting .dot {{ animation: none; }}
+  #reply .receipt.waiting .dot, #reply .receipt.delivered .dot {{ animation: none; }}
 }}
 /* Mirrored onto the pill, so the receipt is visible without opening the panel. */
 #reply #toggle.read {{
@@ -564,19 +659,37 @@ const REPLY_JS: &str = r#"
   // --- Read receipt --------------------------------------------------------
   // A reply sits in the daemon until an agent collects it, which may be
   // immediately or hours later. Polling the status endpoint — which never marks
-  // anything read itself — turns that into something visible.
+  // anything itself — turns that into something visible.
+  //
+  // Three stages, because collection and reading are different events: an agent
+  // can pick a reply up and then die before a model ever sees it.
   var session = root.getAttribute('data-session');
+
+  var RECEIPT_TEXT = {
+    read: 'The agent read this and replied',
+    delivered: 'Picked up by an agent, not yet acknowledged',
+    waiting: 'Waiting for an agent to pick this up'
+  };
 
   function receiptEl() { return root.querySelector('.receipt'); }
 
-  function showReceipt(read) {
+  function showReceipt(stage, note) {
     var el = receiptEl();
     if (!el) return;
-    el.className = 'receipt ' + (read ? 'read' : 'waiting');
-    el.querySelector('.text').textContent = read
-      ? 'The agent has read this'
-      : 'Waiting for the agent to read this';
-    if (read) toggle.classList.add('read');
+    el.className = 'receipt ' + stage;
+    el.querySelector('.text').textContent = RECEIPT_TEXT[stage];
+    if (stage === 'read') toggle.classList.add('read');
+
+    // The agent's own note about what it is doing, inserted after the receipt.
+    if (!note) return;
+    var panel = el.parentNode;
+    var slot = panel.querySelector('.acknote');
+    if (!slot) {
+      slot = document.createElement('p');
+      slot.className = 'acknote';
+      el.insertAdjacentElement('afterend', slot);
+    }
+    slot.textContent = note;
   }
 
   function watch() {
@@ -588,9 +701,11 @@ const REPLY_JS: &str = r#"
         .then(function (res) { return res.ok ? res.json() : null; })
         .then(function (s) {
           if (!s || !s.replied) return;
-          showReceipt(s.read);
-          // Read is terminal: there is nothing further to learn.
-          if (s.read) stop = true;
+          var stage = s.ack ? 'read' : (s.delivered ? 'delivered' : 'waiting');
+          showReceipt(stage, s.ack && s.ack.note);
+          // An ack is terminal: there is nothing further to learn. Delivery is
+          // not — the interesting question is whether an ack ever follows.
+          if (s.ack) stop = true;
         })
         .catch(function () { /* daemon restarted or gone: keep trying */ })
         .then(function () { if (!stop) setTimeout(poll, 3000); });
@@ -648,7 +763,7 @@ const REPLY_JS: &str = r#"
       dot.className = 'dot';
       var text = document.createElement('span');
       text.className = 'text';
-      text.textContent = 'Waiting for the agent to read this';
+      text.textContent = RECEIPT_TEXT.waiting;
       receipt.appendChild(dot);
       receipt.appendChild(text);
       panel.appendChild(receipt);
@@ -723,10 +838,73 @@ const COMMENT_JS: &str = r#"
   if (!root) return;
   var session = root.getAttribute('data-session');
   var open = null;
+  // A drag in progress: the `+` it started on, and the row it is currently over.
+  var drag = null;
 
   function close() {
     if (open) { open.remove(); open = null; }
+    clearPreview();
   }
+
+  function clearPreview() {
+    var marked = root.querySelectorAll('tr.selecting');
+    for (var i = 0; i < marked.length; i++) marked[i].classList.remove('selecting');
+  }
+
+  // Every commentable row on one side of one file, in document order.
+  function siblings(button) {
+    var file = button.getAttribute('data-file');
+    var side = button.getAttribute('data-side');
+    var all = root.querySelectorAll(
+      '.addnote[data-file="' + file + '"][data-side="' + side + '"]');
+    var rows = [];
+    for (var i = 0; i < all.length; i++) rows.push(all[i]);
+    return rows;
+  }
+
+  // Highlight what a range would cover while the pointer is still down.
+  function preview(from, to) {
+    clearPreview();
+    var lo = Math.min(Number(from.getAttribute('data-line')), Number(to.getAttribute('data-line')));
+    var hi = Math.max(Number(from.getAttribute('data-line')), Number(to.getAttribute('data-line')));
+    var buttons = siblings(from);
+    for (var i = 0; i < buttons.length; i++) {
+      var n = Number(buttons[i].getAttribute('data-line'));
+      if (n >= lo && n <= hi) buttons[i].closest('tr').classList.add('selecting');
+    }
+  }
+
+  // A range is selected by pressing on one `+` and releasing on another. Pointer
+  // events rather than mouse ones, so a trackpad drag and a touch both work.
+  root.addEventListener('pointerdown', function (e) {
+    var button = e.target.closest ? e.target.closest('.addnote') : null;
+    if (!button || e.button !== 0) return;
+    drag = { from: button, moved: false };
+  });
+
+  root.addEventListener('pointermove', function (e) {
+    if (!drag) return;
+    var over = e.target.closest ? e.target.closest('tr') : null;
+    if (!over) return;
+    var button = over.querySelector('.addnote');
+    // Only within the same file and side: a range across a file boundary has no
+    // meaning, and the server would reject it anyway.
+    if (!button
+        || button.getAttribute('data-file') !== drag.from.getAttribute('data-file')
+        || button.getAttribute('data-side') !== drag.from.getAttribute('data-side')) return;
+    if (button !== drag.from) drag.moved = true;
+    drag.to = button;
+    if (drag.moved) preview(drag.from, button);
+  });
+
+  document.addEventListener('pointerup', function () {
+    if (!drag) return;
+    var from = drag.from;
+    var to = drag.moved && drag.to ? drag.to : from;
+    drag = null;
+    clearPreview();
+    openBox(from, to);
+  });
 
   function noteRow(anchor) {
     // Comments on a line live in one `tr.notes` immediately after it, so a
@@ -746,32 +924,57 @@ const COMMENT_JS: &str = r#"
     var who = document.createElement('span');
     who.className = 'who';
     who.textContent = 'you';
+    // Same shape the server renders, so a reload looks identical.
+    if (comment.end_line && comment.end_line > comment.line) {
+      var span = document.createElement('span');
+      span.className = 'span';
+      span.textContent = 'L' + comment.line + '–L' + comment.end_line;
+      who.appendChild(span);
+    }
     note.appendChild(who);
     note.appendChild(document.createTextNode(comment.text));
     into.appendChild(note);
   }
 
-  root.addEventListener('click', function (e) {
-    var button = e.target.closest ? e.target.closest('.addnote') : null;
-    if (!button) return;
-    var line = button.closest('tr');
-    // Clicking the same line twice closes the box rather than opening a second.
+  function openBox(from, to) {
+    // The box hangs below the last line of the range, so the whole passage it is
+    // about stays visible above it.
+    var lo = Math.min(Number(from.getAttribute('data-line')), Number(to.getAttribute('data-line')));
+    var hi = Math.max(Number(from.getAttribute('data-line')), Number(to.getAttribute('data-line')));
+    var last = hi === Number(from.getAttribute('data-line')) ? from : to;
+    var line = last.closest('tr');
+
+    // Pressing the same line twice closes the box rather than opening a second.
     var reopen = !open || open.previousElementSibling !== line;
     close();
     if (!reopen) return;
 
+    var span = hi > lo ? ' (L' + lo + '–L' + hi + ')' : '';
+    var label = hi > lo ? 'Comment on lines ' + lo + ' to ' + hi : 'Comment on this line';
     var row = document.createElement('tr');
     row.className = 'pending';
     row.innerHTML =
       '<td class="ln" colspan="2"></td>' +
       '<td class="code"><div class="notebox">' +
-      '<textarea placeholder="Comment on this line…" aria-label="Comment on this line"></textarea>' +
+      '<textarea aria-label="' + label + '"></textarea>' +
       '<div class="row"><span class="msg"></span>' +
       '<button type="button" class="cancel">Cancel</button>' +
       '<button type="button" class="primary">Comment</button>' +
       '</div></div></td>';
     line.parentNode.insertBefore(row, line.nextElementSibling);
+    row.querySelector('textarea').placeholder =
+      (hi > lo ? 'Comment on these lines' : 'Comment on this line') + span + '…';
     open = row;
+
+    // Keep the covered rows tinted while the box is open, so it is unambiguous
+    // what a multi-line comment is about.
+    if (hi > lo) {
+      var buttons = siblings(from);
+      for (var i = 0; i < buttons.length; i++) {
+        var n = Number(buttons[i].getAttribute('data-line'));
+        if (n >= lo && n <= hi) buttons[i].closest('tr').classList.add('selecting');
+      }
+    }
 
     var box = row.querySelector('textarea');
     var submit = row.querySelector('button.primary');
@@ -793,9 +996,10 @@ const COMMENT_JS: &str = r#"
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          file: button.getAttribute('data-file'),
-          line: Number(button.getAttribute('data-line')),
-          side: button.getAttribute('data-side'),
+          file: from.getAttribute('data-file'),
+          line: lo,
+          end_line: hi,
+          side: from.getAttribute('data-side'),
           text: text
         })
       }).then(function (res) {
@@ -805,13 +1009,21 @@ const COMMENT_JS: &str = r#"
         // The pending row is replaced by the saved comment, in place.
         var anchor = row.previousElementSibling;
         close();
+        // The rows the comment covers keep their tint, now permanently.
+        if (hi > lo) {
+          var buttons = siblings(from);
+          for (var i = 0; i < buttons.length; i++) {
+            var n = Number(buttons[i].getAttribute('data-line'));
+            if (n >= lo && n <= hi) buttons[i].closest('tr').classList.add('inrange');
+          }
+        }
         render(comment, noteRow(anchor).querySelector('td.code'));
       }).catch(function (err) {
         msg.textContent = String(err.message || err);
         submit.disabled = false;
       });
     });
-  });
+  }
 })();
 "#;
 
@@ -836,15 +1048,26 @@ pub async fn diff_hunk(file: &str, hunk: &Hunk, comments: &[Comment]) -> Result 
                 _ => ("new", line.new),
             };
             let line_no = number.unwrap_or(0);
+            let mine = |c: &&Comment| c.file == file && c.side.as_str() == side;
             Row {
                 line: line.clone(),
                 side,
                 line_no,
+                // A ranged comment hangs below the last line it covers, so the
+                // whole quoted passage is above the note rather than wrapped
+                // around it.
                 comments: comments
                     .iter()
-                    .filter(|c| c.file == file && c.line == line_no && c.side.as_str() == side)
+                    .filter(mine)
+                    .filter(|c| c.end_line.unwrap_or(c.line) == line_no)
                     .cloned()
                     .collect(),
+                // Whether some comment's range covers this line, so the rows it
+                // spans can be tinted as a block.
+                in_range: comments.iter().filter(mine).any(|c| {
+                    c.end_line
+                        .is_some_and(|end| (c.line..=end).contains(&line_no))
+                }),
             }
         })
         .collect();
@@ -857,7 +1080,7 @@ pub async fn diff_hunk(file: &str, hunk: &Hunk, comments: &[Comment]) -> Result 
                     <td class="code">(&hunk.header)</td>
                 </tr>
                 for row in rows {
-                    <tr class=(line_class(row.line.kind))>
+                    <tr class=(row_class(&row))>
                         <td class="ln old">
                             if let Some(n) = row.line.old { (n) }
                         </td>
@@ -865,10 +1088,11 @@ pub async fn diff_hunk(file: &str, hunk: &Hunk, comments: &[Comment]) -> Result 
                             if let Some(n) = row.line.new { (n) }
                         </td>
                         <td class="code">
+                            // Drag from one `+` to another to comment on a range.
                             <button
                                 type="button"
                                 class="addnote"
-                                title="Comment on this line"
+                                title="Comment on this line, or drag to cover more"
                                 data-file=(file)
                                 data-line=(row.line_no)
                                 data-side=(row.side)
@@ -883,7 +1107,14 @@ pub async fn diff_hunk(file: &str, hunk: &Hunk, comments: &[Comment]) -> Result 
                             <td class="code">
                                 for comment in row.comments {
                                     <div class="note">
-                                        <span class="who">"you"</span>
+                                        <span class="who">
+                                            "you"
+                                            // Says what the note is about when it
+                                            // covers more than the line above it.
+                                            if let Some(span) = span_label(&comment) {
+                                                <span class="span">(span)</span>
+                                            }
+                                        </span>
                                         (&comment.text)
                                     </div>
                                 }
@@ -901,7 +1132,29 @@ struct Row {
     line: crate::session::DiffLine,
     side: &'static str,
     line_no: usize,
+    /// Comments that end on this line, shown beneath it.
     comments: Vec<Comment>,
+    /// Whether a ranged comment covers this line.
+    in_range: bool,
+}
+
+/// The row's classes: its diff kind, plus whether a ranged comment covers it.
+fn row_class(row: &Row) -> String {
+    let kind = line_class(row.line.kind);
+    if row.in_range {
+        format!("{kind} inrange")
+    } else {
+        kind.to_owned()
+    }
+}
+
+/// How a ranged comment names what it covers, e.g. `L12–L18`.
+///
+/// `None` for a single line: the note sits directly under it, so saying so again
+/// would be noise.
+fn span_label(comment: &Comment) -> Option<String> {
+    let end = comment.end_line?;
+    (end > comment.line).then(|| format!("L{}–L{end}", comment.line))
 }
 
 /// The row class for a diff line.
@@ -923,6 +1176,19 @@ fn marker(kind: LineKind) -> &'static str {
     }
 }
 
+/// What each receipt stage says, in the user's terms.
+///
+/// "Picked up" rather than "read" for delivery: it is the honest claim, and the
+/// difference between it and "read" is the whole point — an agent stuck on a
+/// credentials prompt sits at "picked up" and never moves.
+fn receipt_text(stage: &str) -> &'static str {
+    match stage {
+        "read" => "The agent read this and replied",
+        "delivered" => "Picked up by an agent, not yet acknowledged",
+        _ => "Waiting for an agent to pick this up",
+    }
+}
+
 /// The floating reply widget.
 ///
 /// Rendered as an overlay in every mode. On a live demo the page underneath is
@@ -940,9 +1206,19 @@ pub async fn reply_widget(session_id: &str, existing: Option<Reply>) -> Result {
     let action = format!("/s/{session_id}/reply");
     // Rendered server-side as well as polled, so a page loaded long after the
     // fact opens in the right state rather than flashing "waiting" first.
-    let read = existing
+    //
+    // Three states, not two. Delivery and reading are different claims: an agent
+    // that collects a reply and then dies has been delivered to and read nothing,
+    // and calling that "read" hides the failure the user most needs to see.
+    let ack = existing.as_ref().and_then(|reply| reply.ack.clone());
+    let delivered = existing
         .as_ref()
-        .is_some_and(|reply| reply.read_at.is_some());
+        .is_some_and(|reply| reply.delivered_at.is_some());
+    let stage = match (&ack, delivered) {
+        (Some(_), _) => "read",
+        (None, true) => "delivered",
+        (None, false) => "waiting",
+    };
 
     view! {
         <div id="reply" class="reply" data-session=(session_id)>
@@ -954,7 +1230,7 @@ pub async fn reply_widget(session_id: &str, existing: Option<Reply>) -> Result {
                     <button
                         id="toggle"
                         type="button"
-                        class=(if read { "done read" } else { "done" })
+                        class=(if ack.is_some() { "done read" } else { "done" })
                     >"Reply sent"</button>
                     <div class="panel">
                         <div class="head">
@@ -966,16 +1242,18 @@ pub async fn reply_widget(session_id: &str, existing: Option<Reply>) -> Result {
                             <br>
                             (reply.text)
                         </p>
-                        <p class=(if read { "receipt read" } else { "receipt waiting" })>
+                        <p class=(format!("receipt {stage}"))>
                             <span class="dot"></span>
-                            <span class="text">
-                                if read {
-                                    "The agent has read this"
-                                } else {
-                                    "Waiting for the agent to read this"
-                                }
-                            </span>
+                            <span class="text">(receipt_text(stage))</span>
                         </p>
+                        // The agent's own words about what it is doing. This is
+                        // the part that cannot be faked by the transport.
+                        match &ack {
+                            Some(ack) => {
+                                <p class="acknote">(ack.note.clone())</p>
+                            }
+                            None => {}
+                        }
                         <div class="row">
                             <span class="spacer"></span>
                             <button type="button" class="close">"Close"</button>
@@ -1010,34 +1288,78 @@ pub async fn reply_widget(session_id: &str, existing: Option<Reply>) -> Result {
     }
 }
 
+/// Everything the shell needs to know about the page it is wrapping.
+///
+/// One value rather than a dozen props: the fields are all answers to "what page
+/// is this?", and a call site passing them individually reads as a wall of
+/// keywords where a mistake is easy to miss.
+#[derive(Debug, Clone)]
+pub struct Page {
+    pub title: String,
+    /// A sentence of extra context, shown beside the title.
+    pub note: Option<String>,
+    /// The mode label: `code`, `diff`, `docs`, `demo`, `static`.
+    pub kind: String,
+    /// The session this page belongs to; empty on the index, which has none.
+    pub session_id: String,
+    /// The reply already sent, if any.
+    pub reply: Option<Reply>,
+    /// Extra `<body>` classes, e.g. `framed`.
+    pub body_class: Option<String>,
+    /// Whether the top bar can be collapsed away. Offered where the chrome
+    /// competes for space with the content: a framed app, or a long diff.
+    pub hideable: bool,
+    /// Whether the page has commentable lines, which need the comment script.
+    pub commentable: bool,
+    /// Where the agent that made this session is running.
+    pub origin: crate::origin::Origin,
+}
+
+impl Page {
+    /// A page with no session behind it: the index.
+    pub fn index() -> Self {
+        Self {
+            title: "Sessions".to_owned(),
+            note: None,
+            kind: "index".to_owned(),
+            session_id: String::new(),
+            reply: None,
+            body_class: None,
+            hideable: false,
+            commentable: false,
+            origin: crate::origin::Origin::default(),
+        }
+    }
+}
+
 /// The document shell shared by every mode.
 #[component]
 pub async fn shell(
-    title: &str,
-    note: Option<&str>,
-    kind: &str,
+    page: Page,
     colors: &ThemeColors,
-    session_id: &str,
-    existing_reply: Option<Reply>,
     /// Rendered into `<main>`.
     child: topcoat::view::View,
-    /// Extra `<body>` classes, e.g. `demo`.
-    body_class: Option<&str>,
     /// Optional markup after the header, e.g. a file list.
     subheader: Option<topcoat::view::View>,
-    /// Whether the top bar can be collapsed away. Offered where the chrome
-    /// competes for space with the content: a framed app, or a long diff.
-    hideable: bool,
-    /// Whether the page has commentable lines, which need the comment script.
-    commentable: bool,
 ) -> Result {
+    let Page {
+        title,
+        note,
+        kind,
+        session_id,
+        reply: existing_reply,
+        body_class,
+        hideable,
+        commentable,
+        origin,
+    } = page;
     view! {
         <!DOCTYPE html>
         <html lang="en">
             <head>
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>(title) " · showme"</title>
+                <title>(&title) " · showme"</title>
                 <style>(Raw(stylesheet(colors)))</style>
             </head>
             <body class=(body_class)>
@@ -1048,6 +1370,23 @@ pub async fn shell(
                         <span class="note">(note)</span>
                     }
                     <span class="spacer"></span>
+                    // Which agent is asking. With several running at once the
+                    // title alone does not say, and the pane is where you go to
+                    // talk to it.
+                    if !origin.is_empty() {
+                        <span class="origin" title=(origin.pane.clone().unwrap_or_default())>
+                            if let Some(session) = origin.session.clone() {
+                                <span class="place">(session)</span>
+                                if let Some(tab) = origin.tab.clone() {
+                                    <span class="sep">"›"</span>
+                                    <span class="place">(tab)</span>
+                                }
+                            }
+                            if let Some(cwd) = origin.cwd.clone() {
+                                <span class="cwd">(cwd)</span>
+                            }
+                        </span>
+                    }
                     <span class="kind">(kind)</span>
                     if hideable {
                         <button id="chrome-toggle" type="button" title="Hide this bar (.)">
@@ -1069,7 +1408,7 @@ pub async fn shell(
                     <script>(Raw(CHROME_JS))</script>
                 }
 
-                reply_widget(session_id: session_id, existing: existing_reply)
+                reply_widget(session_id: &session_id, existing: existing_reply)
 
                 if commentable {
                     <script>(Raw(COMMENT_JS))</script>
@@ -1090,7 +1429,10 @@ mod tests {
         // confined to `--code-*` so a dark theme cannot darken the page.
         let colors = theme_colors(theme("Nord"));
         let css = stylesheet(&colors);
-        assert!(css.contains(&format!("--code-bg: {}", colors.background)), "{css}");
+        assert!(
+            css.contains(&format!("--code-bg: {}", colors.background)),
+            "{css}"
+        );
         assert!(css.contains("--bg: #faf9f5"), "{css}");
         assert!(css.contains("color-scheme: light"), "{css}");
         // The reply widget must be fixed so it cannot reflow demo content.
@@ -1149,7 +1491,10 @@ mod tests {
         // The corner the widget defaults to is often where a framed app keeps
         // its own controls, so it has to be movable.
         let css = stylesheet(&theme_colors(theme("Nord")));
-        assert!(css.contains("#reply.moved { right: auto; bottom: auto; }"), "{css}");
+        assert!(
+            css.contains("#reply.moved { right: auto; bottom: auto; }"),
+            "{css}"
+        );
         assert!(REPLY_JS.contains("root.classList.add('moved')"));
         // The grip the CSS styles has to exist in the markup, and the drag has
         // to be shielded from a cross-origin iframe stealing the pointer.
@@ -1167,7 +1512,10 @@ mod tests {
         // must leave a way back, or the page needs a reload to escape.
         let css = stylesheet(&theme_colors(theme("Nord")));
         assert!(css.contains("body.nochrome header.bar"), "{css}");
-        assert!(css.contains("body.nochrome #chrome-show { display: block; }"), "{css}");
+        assert!(
+            css.contains("body.nochrome #chrome-show { display: block; }"),
+            "{css}"
+        );
         assert!(CHROME_JS.contains("chrome-toggle"));
         assert!(CHROME_JS.contains("chrome-show"));
         // Remembered, since a review usually spans several reloads.
@@ -1178,15 +1526,36 @@ mod tests {
     fn the_read_receipt_has_all_three_states() {
         let css = stylesheet(&theme_colors(theme("Nord")));
         assert!(css.contains("#reply .receipt.waiting .dot"), "{css}");
+        // Picked up but unacknowledged is its own state, styled unlike read: it
+        // is where an agent that died on a credentials prompt sits.
+        assert!(css.contains("#reply .receipt.delivered .dot"), "{css}");
         assert!(css.contains("#reply .receipt.read .dot"), "{css}");
+        assert!(
+            css.contains("#reply .acknote"),
+            "no style for the ack note: {css}"
+        );
         // The pulse must be suppressed for anyone who asked for less motion.
         assert!(css.contains("prefers-reduced-motion"), "{css}");
-        // Polling hits the status route, which never marks anything read; the
+        // Polling hits the status route, which never marks anything; the
         // long-poll route would have the page claiming the agent's own receipt.
         assert!(REPLY_JS.contains("'/status'") || REPLY_JS.contains("/status'"));
         assert!(!REPLY_JS.contains("/reply?"), "the page must not long-poll");
-        // Read is terminal, so the poll has to stop.
-        assert!(REPLY_JS.contains("if (s.read) stop = true"));
+        // An ack is terminal, so the poll stops there — but delivery is not,
+        // since the interesting question is whether an ack ever follows.
+        assert!(REPLY_JS.contains("if (s.ack) stop = true"));
+        assert!(
+            !REPLY_JS.contains("if (s.delivered) stop"),
+            "the poll gave up at delivery, so a later ack would never show"
+        );
+    }
+
+    #[test]
+    fn the_receipt_never_calls_a_mere_delivery_read() {
+        // The bug this flow exists to fix: the wording for a collected-but-
+        // unacknowledged reply must not claim anything read it.
+        let delivered = receipt_text("delivered");
+        assert!(!delivered.contains("read"), "{delivered:?} overclaims");
+        assert!(receipt_text("read").contains("read"));
     }
 
     #[test]
@@ -1198,6 +1567,58 @@ mod tests {
         // Two comments on one line join the same block rather than stacking
         // duplicate rows.
         assert!(COMMENT_JS.contains("classList.contains('notes')"));
+    }
+
+    #[test]
+    fn a_range_can_be_dragged_and_is_bounded_to_one_file_and_side() {
+        // Pointer events, so a trackpad drag and a touch both work where mouse
+        // events would only cover the first.
+        assert!(COMMENT_JS.contains("pointerdown"));
+        assert!(COMMENT_JS.contains("pointerup"));
+        // A range spanning two files or both sides of a diff has no meaning, and
+        // the server would reject it: the drag is confined at the source.
+        assert!(COMMENT_JS.contains("data-file") && COMMENT_JS.contains("data-side"));
+        assert!(COMMENT_JS.contains("end_line"), "the range is never sent");
+        // The pointerup listener is on the document, not the table: releasing
+        // outside the diff must still finish the drag rather than wedge it.
+        assert!(COMMENT_JS.contains("document.addEventListener('pointerup'"));
+    }
+
+    #[test]
+    fn a_ranged_comment_is_labelled_and_marked() {
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        // Marked with a gutter bar, not a background tint: an accent-tinted row
+        // reads as a deleted one and fights the diff's own colours.
+        assert!(css.contains("tr.inrange td.code"), "{css}");
+        assert!(
+            css.contains("box-shadow: inset 3px 0 0 var(--accent)"),
+            "{css}"
+        );
+        assert!(css.contains("tr.selecting"), "no drag feedback: {css}");
+
+        let ranged = Comment {
+            id: 1,
+            file: "a.rs".to_owned(),
+            line: 4,
+            end_line: Some(9),
+            side: crate::session::Side::New,
+            snippet: String::new(),
+            text: String::new(),
+            at: std::time::SystemTime::now(),
+        };
+        assert_eq!(span_label(&ranged).as_deref(), Some("L4–L9"));
+        // A single line is already identified by the row the note hangs under.
+        let single = Comment {
+            end_line: None,
+            ..ranged.clone()
+        };
+        assert_eq!(span_label(&single), None);
+        // And a degenerate range is not labelled either.
+        let degenerate = Comment {
+            end_line: Some(4),
+            ..ranged
+        };
+        assert_eq!(span_label(&degenerate), None);
     }
 
     #[test]
@@ -1216,9 +1637,18 @@ mod tests {
 
     #[test]
     fn line_classes_and_markers_agree() {
-        assert_eq!((line_class(LineKind::Added), marker(LineKind::Added)), ("add", "+"));
-        assert_eq!((line_class(LineKind::Removed), marker(LineKind::Removed)), ("del", "-"));
-        assert_eq!((line_class(LineKind::Context), marker(LineKind::Context)), ("ctx", " "));
+        assert_eq!(
+            (line_class(LineKind::Added), marker(LineKind::Added)),
+            ("add", "+")
+        );
+        assert_eq!(
+            (line_class(LineKind::Removed), marker(LineKind::Removed)),
+            ("del", "-")
+        );
+        assert_eq!(
+            (line_class(LineKind::Context), marker(LineKind::Context)),
+            ("ctx", " ")
+        );
     }
 
     #[test]

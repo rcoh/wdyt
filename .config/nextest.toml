@@ -1,0 +1,20 @@
+# cargo-nextest configuration.
+#
+# The integration tests each start a real daemon on a real port, so they are
+# genuinely concurrent and genuinely I/O-bound. nextest runs every test in its own
+# process, which keeps one test's daemon, port, and store from reaching another's
+# — and reports a flake instead of hiding it.
+
+[profile.default]
+# A test that hangs is a bug, not something to wait out: the long-poll routes are
+# bounded well under this.
+slow-timeout = { period = "20s", terminate-after = 3 }
+
+# Retries are off by default. These tests should be deterministic, and a retry
+# would paper over exactly the port and store races worth finding.
+retries = 0
+
+[profile.ci]
+# On CI a failure is worth the full picture rather than an early exit.
+fail-fast = false
+final-status-level = "slow"

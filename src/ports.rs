@@ -11,7 +11,10 @@ use anyhow::{Context, Result};
 /// could take the port, so callers should treat the answer as a hint and be
 /// ready for a later bind to fail.
 pub fn free_ports(bind: IpAddr, range: impl IntoIterator<Item = u16>) -> Vec<u16> {
-    range.into_iter().filter(|port| is_free(bind, *port)).collect()
+    range
+        .into_iter()
+        .filter(|port| is_free(bind, *port))
+        .collect()
 }
 
 pub fn is_free(bind: IpAddr, port: u16) -> bool {
@@ -19,11 +22,7 @@ pub fn is_free(bind: IpAddr, port: u16) -> bool {
 }
 
 /// Picks the first free port in `range`, skipping `reserved`.
-pub fn pick(
-    bind: IpAddr,
-    range: impl IntoIterator<Item = u16>,
-    reserved: &[u16],
-) -> Result<u16> {
+pub fn pick(bind: IpAddr, range: impl IntoIterator<Item = u16>, reserved: &[u16]) -> Result<u16> {
     let range: Vec<u16> = range.into_iter().collect();
     let (low, high) = (
         range.first().copied().unwrap_or(0),

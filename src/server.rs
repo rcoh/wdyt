@@ -13,22 +13,28 @@ use topcoat::view::view;
 
 use crate::config::Config;
 use crate::render::{ThemeColors, theme, theme_colors};
-use crate::session::{Comment, Content, Reply, Side, Store};
+use crate::session::{Anchor, Comment, Content, Reply, Side, Store};
 use crate::ui::{Raw, diff_hunk, shell};
 
 /// Values shared by every request.
 struct State {
     store: Store,
     colors: ThemeColors,
+    /// The daemon's configured theme, used when a session names none.
+    theme: String,
 }
 
 #[path_param(error = not_found)]
 struct SessionId(String);
 
 /// Builds the router.
-fn router(store: Store, colors: ThemeColors) -> Router {
+fn router(store: Store, colors: ThemeColors, theme: String) -> Router {
     Router::builder()
-        .app_context(State { store, colors })
+        .app_context(State {
+            store,
+            colors,
+            theme,
+        })
         .page(session_page)
         .page(index_page)
         .route(reply_route)
@@ -42,6 +48,7 @@ fn router(store: Store, colors: ThemeColors) -> Router {
         .route(comment_route)
         .route(inbox_route)
         .route(collect_route)
+        .route(ack_route)
         .build()
 }
 
@@ -51,6 +58,31 @@ pub struct CreateSession {
     pub title: String,
     pub note: Option<String>,
     pub content: Content,
+    /// Where the creating agent is running. Sent by the CLI because the daemon
+    /// cannot see it: the daemon's own cwd and pane are its own, not the agent's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::origin::Origin>,
+    /// The theme the content was highlighted with, when not the daemon's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    /// A guided tour of the work as rendered HTML. Rendered by the CLI, which is
+    /// where the theme for fenced code blocks is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief: Option<String>,
+}
+
+impl CreateSession {
+    /// The two things a session cannot do without; the rest is optional context.
+    pub fn new(title: String, content: Content) -> Self {
+        Self {
+            title,
+            content,
+            note: None,
+            origin: None,
+            theme: None,
+            brief: None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,9 +92,15 @@ pub struct CreatedSession {
 
 #[route(POST "/api/sessions")]
 async fn create_route(cx: &Cx, Json(input): Json<CreateSession>) -> Result<Json<CreatedSession>> {
-    let id = state(cx)
-        .store
-        .insert(input.title, input.note, input.content);
+    let id = state(cx).store.insert_new(crate::session::NewSession {
+        note: input.note,
+        // The daemon is long-lived and shared, so it cannot detect this itself:
+        // its own cwd and pane are wherever it happened to be started.
+        origin: input.origin.unwrap_or_default(),
+        theme: input.theme,
+        brief: input.brief,
+        ..crate::session::NewSession::new(input.title, input.content)
+    });
     Ok(Json(CreatedSession { id }))
 }
 
@@ -76,8 +114,8 @@ pub struct AwaitedReply {
 /// Long-polls for a session's reply.
 ///
 /// `timeout_secs` bounds the wait so a caller cannot hang forever; the response
-/// says whether a reply actually arrived. Collecting a reply marks it read, so
-/// the page can show that the agent has seen it.
+/// says whether a reply actually arrived. Receiving it marks it *delivered* and
+/// nothing more: whether anything read it is for the agent to say by acking.
 #[route(GET "/api/sessions/{session_id}/reply")]
 async fn await_reply_route(cx: &Cx) -> Result<Json<AwaitedReply>> {
     let id = path_param::<SessionId>(cx)?;
@@ -85,10 +123,7 @@ async fn await_reply_route(cx: &Cx) -> Result<Json<AwaitedReply>> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(600);
 
-    let receiver = state(cx)
-        .store
-        .subscribe(id)
-        .map_err(|_| not_found())?;
+    let receiver = state(cx).store.subscribe(id).map_err(|_| not_found())?;
 
     let arrived = tokio::time::timeout(std::time::Duration::from_secs(seconds), receiver)
         .await
@@ -96,10 +131,13 @@ async fn await_reply_route(cx: &Cx) -> Result<Json<AwaitedReply>> {
         .and_then(|result| result.ok())
         .is_some();
 
-    // Stamped only once the agent has actually collected it: a peek that times
-    // out must not claim the reply was read.
+    // Stamped only once the bytes are actually going out: a peek that times out
+    // has delivered nothing.
     let reply = if arrived {
-        state(cx).store.mark_read(id).map_err(|_| not_found())?
+        state(cx)
+            .store
+            .mark_delivered(id)
+            .map_err(|_| not_found())?
     } else {
         None
     };
@@ -110,29 +148,71 @@ async fn await_reply_route(cx: &Cx) -> Result<Json<AwaitedReply>> {
     }))
 }
 
-/// Collects a reply that is already there, marking it read.
+/// Collects a reply that is already there, marking it delivered.
 ///
 /// The long-poll route is for an agent that is still waiting. This one is for an
-/// agent that has come back later and found the reply in its inbox: there is
-/// nothing to wait for, but the receipt on the page still has to light up.
+/// agent that has come back later and found the reply in its inbox.
 #[route(POST "/api/sessions/{session_id}/collect")]
 async fn collect_route(cx: &Cx) -> Result<Json<AwaitedReply>> {
     let id = path_param::<SessionId>(cx)?;
-    let reply = state(cx).store.mark_read(id).map_err(|_| not_found())?;
+    let reply = state(cx)
+        .store
+        .mark_delivered(id)
+        .map_err(|_| not_found())?;
     Ok(Json(AwaitedReply {
         replied: reply.is_some(),
         reply,
     }))
 }
 
-/// Whether the reply has been read, for the page's own polling.
+/// What an agent sends to say it has actually read the reply.
+#[derive(Serialize, Deserialize)]
+pub struct AckInput {
+    /// What the agent is doing about the reply.
+    pub note: String,
+}
+
+/// Records that an agent read the reply and is acting on it.
+///
+/// Separate from collecting on purpose. Collecting is the transport moving bytes;
+/// this is a live model saying something about them. An agent that fetches a
+/// reply and then dies — needing credentials, say — will have collected and never
+/// acked, and the page has to be able to show that difference.
+#[route(POST "/api/sessions/{session_id}/ack")]
+async fn ack_route(cx: &Cx, Json(input): Json<AckInput>) -> Result<Json<Acked>> {
+    let id = path_param::<SessionId>(cx)?;
+    let note = input.note.trim();
+    if note.is_empty() {
+        return Err(bad_request("an ack needs a note saying what you are doing").into());
+    }
+    let acked = state(cx)
+        .store
+        .ack(id, note.to_owned())
+        .map_err(|_| not_found())?;
+    if !acked {
+        return Err(bad_request("there is no reply on this session to acknowledge").into());
+    }
+    Ok(Json(Acked { acked }))
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Acked {
+    pub acked: bool,
+}
+
+/// How far a reply has got, for the page's own polling.
 ///
 /// Deliberately not the same route as `await_reply_route`: this one must never
-/// mark anything read, or the page would mark the agent's own receipt.
+/// mark anything delivered, or the page would be reporting its own visit as the
+/// agent's receipt.
 #[derive(Serialize)]
 pub struct ReplyStatus {
     pub replied: bool,
-    pub read: bool,
+    /// The reply has left the daemon for an agent process.
+    pub delivered: bool,
+    /// An agent has said it read the reply, and what it is doing about it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack: Option<crate::session::Ack>,
     /// Comment count, so the page can reconcile after a reconnect.
     pub comments: usize,
 }
@@ -145,10 +225,11 @@ async fn status_route(cx: &Cx) -> Result<Json<ReplyStatus>> {
         .with(id, |session| {
             Json(ReplyStatus {
                 replied: session.reply.is_some(),
-                read: session
+                delivered: session
                     .reply
                     .as_ref()
-                    .is_some_and(|reply| reply.read_at.is_some()),
+                    .is_some_and(|reply| reply.delivered_at.is_some()),
+                ack: session.reply.as_ref().and_then(|reply| reply.ack.clone()),
                 comments: session.comments.len(),
             })
         })
@@ -172,6 +253,9 @@ async fn list_comments_route(cx: &Cx) -> Result<Json<Comments>> {
 struct CommentInput {
     file: String,
     line: usize,
+    /// The last line of a dragged range. Absent for a single-line comment.
+    #[serde(default)]
+    end_line: Option<usize>,
     side: String,
     text: String,
 }
@@ -193,42 +277,71 @@ async fn comment_route(cx: &Cx, Json(input): Json<CommentInput>) -> Result<Json<
     }
     let side = Side::parse(&input.side).ok_or_else(|| bad_request("side must be old or new"))?;
 
+    // `Anchor::range` puts the ends in order, so a drag upwards needs no special
+    // case here.
+    let anchor = match input.end_line {
+        Some(end) => Anchor::range(input.file, input.line, end, side),
+        None => Anchor::line(input.file, input.line, side),
+    };
+    if anchor.span() > MAX_COMMENT_LINES {
+        return Err(bad_request("comment covers too many lines").into());
+    }
+
     let snippet = state(cx)
         .store
-        .with(id, |session| {
-            snippet_for(&session.content, &input.file, input.line, side)
-        })
-        .ok_or_else(|| not_found())?
+        .with(id, |session| snippet_for(&session.content, &anchor))
+        .ok_or_else(not_found)?
         .ok_or_else(|| bad_request("no such line in this diff"))?;
 
     let comment = state(cx)
         .store
-        .comment(id, input.file, input.line, side, snippet, text)
+        .comment(id, anchor, snippet, text)
         .map_err(|_| not_found())?;
     Ok(Json(comment))
 }
 
-/// The text of the line a comment anchors to, if it exists.
-fn snippet_for(content: &Content, file: &str, line: usize, side: Side) -> Option<String> {
+/// The text of the lines a comment anchors to, if any exist.
+///
+/// A range is joined with newlines. Returns `None` when the first line does not
+/// exist, which is the case worth rejecting: a range whose tail runs past the end
+/// of a hunk is quoted as far as it goes rather than refused, since a drag can
+/// legitimately end on the last line shown.
+fn snippet_for(content: &Content, anchor: &Anchor) -> Option<String> {
     let Content::Diff { files } = content else {
         return None;
     };
-    files
+    let (file, line, side) = (&anchor.file, anchor.line, anchor.side);
+    let end_line = anchor.last();
+    // Addressable line numbers on this side, paired with their text. A removed
+    // line is only addressable on the old side and an added one only on the new,
+    // so the kind check keeps a context line's twin numbers from matching the
+    // wrong side.
+    let addressable: Vec<(usize, &str)> = files
         .iter()
-        .filter(|f| f.label == file)
+        .filter(|f| &f.label == file)
         .flat_map(|f| &f.hunks)
         .flat_map(|h| &h.lines)
-        .find(|l| {
+        .filter(|l| crate::session::side_of(l.kind) == side)
+        .filter_map(|l| {
             let number = match side {
                 Side::Old => l.old,
                 Side::New => l.new,
             };
-            // A removed line is only addressable on the old side and an added
-            // one only on the new, so the kind check keeps a context line's
-            // twin numbers from matching the wrong side.
-            number == Some(line) && crate::session::side_of(l.kind) == side
+            number.map(|n| (n, l.text.as_str()))
         })
-        .map(|l| l.text.clone())
+        .collect();
+
+    // The anchor itself must exist; a range whose tail runs past the end of a
+    // hunk is quoted as far as it goes, since a drag can legitimately end there.
+    if !addressable.iter().any(|(n, _)| *n == line) {
+        return None;
+    }
+    let quoted: Vec<&str> = addressable
+        .iter()
+        .filter(|(n, _)| (line..=end_line).contains(n))
+        .map(|(_, text)| *text)
+        .collect();
+    Some(quoted.join("\n"))
 }
 
 /// One session's reply, as reported by `showme inbox`.
@@ -251,8 +364,12 @@ pub struct Inbox {
 /// A foreground `--wait` is a poor place to keep a 24-hour wait: the agent's
 /// turn ends long before the user gets to the notification. The daemon keeps the
 /// reply either way, so this is how a later turn finds one it missed. Marks
-/// nothing read — `showme collect` does that, deliberately, so reading is an
-/// explicit act.
+/// nothing delivered — `showme collect` does that, deliberately, so taking a
+/// reply is an explicit act.
+///
+/// `?unread=1` filters on the *ack*, not on delivery: a reply that was collected
+/// by a process that then died is precisely the one still needing attention, and
+/// filtering on delivery would hide it.
 #[route(GET "/api/inbox")]
 async fn inbox_route(cx: &Cx) -> Result<Json<Inbox>> {
     let unread_only = query_param(cx, "unread").is_some_and(|v| v != "false" && v != "0");
@@ -265,7 +382,7 @@ async fn inbox_route(cx: &Cx) -> Result<Json<Inbox>> {
         .store
         .replied()
         .into_iter()
-        .filter(|(_, _, reply, _)| !unread_only || reply.read_at.is_none())
+        .filter(|(_, _, reply, _)| !unread_only || reply.ack.is_none())
         .map(|(id, title, reply, comments)| InboxItem {
             url: format!("http://{host}:{port}/s/{id}"),
             id,
@@ -329,7 +446,7 @@ pub async fn serve(config: &Config, store: Store) -> AnyResult<()> {
 
     let colors = theme_colors(theme(&config.theme));
     eprintln!("showme listening on http://{}:{port}", config.public_host);
-    topcoat::serve(listener, router(store, colors))
+    topcoat::serve(listener, router(store, colors, config.theme.clone()))
         .await
         .context("server error")
 }
@@ -378,18 +495,12 @@ async fn index_page(cx: &Cx) -> Result {
     }?;
 
     view! { cx =>
+        // `Page::index` says the rest: no session, so no reply box, and no single
+        // agent it belongs to.
         shell(
-            title: "Sessions",
-            note: None,
-            kind: "index",
+            page: crate::ui::Page::index(),
             colors: colors,
-            // The index has no session of its own, so no reply box.
-            session_id: "",
-            existing_reply: None,
-            body_class: None,
             subheader: None,
-            hideable: false,
-            commentable: false,
             child: body,
         )
     }
@@ -411,11 +522,24 @@ async fn session_page(cx: &Cx) -> Result {
                 session.reply.clone(),
                 session.content.kind(),
                 session.comments.clone(),
+                session.origin.clone(),
+                session.theme.clone(),
+                session.brief.clone(),
             )
         })
-        .ok_or_else(|| not_found())?;
-    let (title, note, content, existing_reply, kind, comments) = session;
-    let colors = &state.colors;
+        .ok_or_else(not_found)?;
+    let (title, note, content, existing_reply, kind, comments, origin, session_theme, brief) =
+        session;
+
+    // A session highlighted with its own theme needs the page's colours to match
+    // it: the card's background comes from here, and a mismatch puts light code
+    // on a dark card. Recomputed per request only when it differs, since
+    // `theme()` hands back a `&'static` and this is a handful of colour lookups.
+    let own_colors = session_theme
+        .as_deref()
+        .filter(|name| *name != state.theme)
+        .map(|name| theme_colors(theme(name)));
+    let colors = own_colors.as_ref().unwrap_or(&state.colors);
 
     // Framed content needs `<main>` to fill the viewport with no page scrolling
     // of its own, so the iframe can own the space below the chrome.
@@ -427,7 +551,17 @@ async fn session_page(cx: &Cx) -> Result {
     // but chrome.
     let hideable = true;
 
-    let subheader = match &content {
+    // The agent's own tour of the work, above everything: what changed, why, and
+    // what to look at first. Rendered even in the framed modes, where it is the
+    // only prose the page has room for.
+    let guide = match &brief {
+        Some(html) => Some(view! { cx =>
+            <section class="brief doc">(Raw(html.clone()))</section>
+        }?),
+        None => None,
+    };
+
+    let nav = match &content {
         Content::Code { files } => Some(view! { cx =>
             <nav class="files">
                 for file in files {
@@ -455,6 +589,15 @@ async fn session_page(cx: &Cx) -> Result {
             </nav>
         }?),
         _ => None,
+    };
+
+    // The nav must stay directly under the bar to keep sticking, so the brief
+    // follows it rather than leading.
+    let subheader = match (nav, guide) {
+        (Some(nav), Some(guide)) => Some(view! { cx => (nav) (guide) }?),
+        (Some(nav), None) => Some(nav),
+        (None, Some(guide)) => Some(guide),
+        (None, None) => None,
     };
 
     let body = match &content {
@@ -532,18 +675,23 @@ async fn session_page(cx: &Cx) -> Result {
         }
     };
 
+    let page = crate::ui::Page {
+        title,
+        note,
+        kind: kind.to_owned(),
+        session_id: id.to_owned(),
+        reply: existing_reply,
+        body_class: body_class.map(str::to_owned),
+        hideable,
+        commentable: content.is_commentable(),
+        origin,
+    };
+
     view! { cx =>
         shell(
-            title: &title,
-            note: note.as_deref(),
-            kind: kind,
+            page: page,
             colors: colors,
-            session_id: id,
-            existing_reply: existing_reply,
-            body_class: body_class,
             subheader: subheader,
-            hideable: hideable,
-            commentable: content.is_commentable(),
             child: body,
         )
     }
@@ -595,6 +743,12 @@ struct ReplyOutput {
 /// POST cannot grow the daemon's memory without bound.
 const MAX_REPLY_BYTES: usize = 16 * 1024;
 
+/// The most lines one comment may cover.
+///
+/// A drag across a whole file is more likely a stuck mouse button than an
+/// intention, and the snippet is stored in full.
+const MAX_COMMENT_LINES: usize = 500;
+
 #[route(POST "/s/{session_id}/reply")]
 async fn reply_route(cx: &Cx, Json(input): Json<ReplyInput>) -> Result<Json<ReplyOutput>> {
     let id = path_param::<SessionId>(cx)?;
@@ -636,7 +790,7 @@ async fn raw_route(cx: &Cx) -> Result<topcoat::router::Response> {
     let content = state(cx)
         .store
         .with(id, |session| session.content.clone())
-        .ok_or_else(|| not_found())?;
+        .ok_or_else(not_found)?;
 
     let response = match content {
         Content::Demo { port, path } => Response::builder()
@@ -683,9 +837,9 @@ async fn raw_route(cx: &Cx) -> Result<topcoat::router::Response> {
                 .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
                 .body(Body::from(out))?
         }
-        Content::Docs { files } => html_response(
-            files.iter().map(|f| f.html.clone()).collect::<String>(),
-        )?,
+        Content::Docs { files } => {
+            html_response(files.iter().map(|f| f.html.clone()).collect::<String>())?
+        }
     };
     Ok(response)
 }
@@ -719,8 +873,8 @@ async fn asset_route(cx: &Cx) -> Result<topcoat::router::Response> {
             Content::Static { root, .. } => Some(root.clone()),
             _ => None,
         })
-        .ok_or_else(|| not_found())?
-        .ok_or_else(|| not_found())?;
+        .ok_or_else(not_found)?
+        .ok_or_else(not_found)?;
 
     // Re-derive the sub-path from the URI: it is the part after `/assets/`.
     let uri_path = topcoat::router::uri(cx).path().to_owned();

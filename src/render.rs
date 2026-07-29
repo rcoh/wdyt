@@ -248,7 +248,11 @@ mod tests {
 
     #[test]
     fn renders_markdown_tables_and_tasklists() {
-        let doc = markdown("README.md", "| a | b |\n|---|---|\n| 1 | 2 |\n\n- [x] done\n", "Nord");
+        let doc = markdown(
+            "README.md",
+            "| a | b |\n|---|---|\n| 1 | 2 |\n\n- [x] done\n",
+            "Nord",
+        );
         assert!(doc.html.contains("<table>"));
         assert!(doc.html.contains("checkbox"));
     }
