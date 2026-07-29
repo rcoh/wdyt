@@ -270,7 +270,7 @@ pub struct NewSession {
     pub content: Content,
     pub note: Option<String>,
     /// Where the creating agent is running.
-    pub origin: crate::origin::Origin,
+    pub origin: crate::zellij_origin::Origin,
     /// The syntax theme the content was highlighted with.
     pub theme: Option<String>,
     /// A guided tour of the work, as rendered HTML.
@@ -284,7 +284,7 @@ impl NewSession {
             title,
             content,
             note: None,
-            origin: crate::origin::Origin::default(),
+            origin: crate::zellij_origin::Origin::default(),
             theme: None,
             brief: None,
         }
@@ -299,7 +299,7 @@ pub struct Session {
     pub content: Content,
     /// Where the agent that created this session is running, so a notification
     /// says which of several agents is asking.
-    pub origin: crate::origin::Origin,
+    pub origin: crate::zellij_origin::Origin,
     /// A guided tour of the work, written by the agent and rendered above the
     /// content: what changed, why, and what to look at first.
     ///

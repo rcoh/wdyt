@@ -623,7 +623,7 @@ async fn the_page_says_which_agent_and_directory_it_came_from() {
     // is asking, and the pane name is where you go to talk to it.
     let daemon = Daemon::start().await;
     let id = daemon.store.insert_new(showme::session::NewSession {
-        origin: showme::origin::Origin {
+        origin: showme::zellij_origin::Origin {
             cwd: Some("/local/home/rcoh/code/showme".to_owned()),
             session: Some("dd-2".to_owned()),
             tab: Some("showme cli".to_owned()),

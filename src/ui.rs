@@ -1312,7 +1312,7 @@ pub struct Page {
     /// Whether the page has commentable lines, which need the comment script.
     pub commentable: bool,
     /// Where the agent that made this session is running.
-    pub origin: crate::origin::Origin,
+    pub origin: crate::zellij_origin::Origin,
 }
 
 impl Page {
@@ -1327,7 +1327,7 @@ impl Page {
             body_class: None,
             hideable: false,
             commentable: false,
-            origin: crate::origin::Origin::default(),
+            origin: crate::zellij_origin::Origin::default(),
         }
     }
 }

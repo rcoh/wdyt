@@ -32,20 +32,39 @@ pub struct Origin {
 
 impl Origin {
     /// Reads the current terminal context.
+    ///
+    /// Outside zellij this is just the working directory: the `ZELLIJ_SESSION_NAME`
+    /// guard means a plain shell, tmux, or CI never shells out to a `zellij`
+    /// binary that may not exist, and simply reports its cwd.
     pub fn detect() -> Self {
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.display().to_string());
+        let session = std::env::var("ZELLIJ_SESSION_NAME")
+            .ok()
+            .filter(|s| !s.is_empty());
+        Self::build(cwd, session, zellij_tab_and_pane)
+    }
+
+    /// The assembly logic, with the two zellij lookups injected.
+    ///
+    /// Split out from [`Origin::detect`] so the not-under-zellij path can be
+    /// tested without depending on the ambient environment: when there is no
+    /// session, the tab/pane probe must not even run.
+    fn build(
+        cwd: Option<String>,
+        session: Option<String>,
+        probe: impl FnOnce() -> (Option<String>, Option<String>),
+    ) -> Self {
         let mut origin = Self {
-            cwd: std::env::current_dir()
-                .ok()
-                .map(|path| path.display().to_string()),
+            cwd,
             ..Self::default()
         };
         // Only zellij is probed, because it is the one that can be asked. Other
         // multiplexers would each need their own query and none is in use here.
-        if let Ok(session) = std::env::var("ZELLIJ_SESSION_NAME")
-            && !session.is_empty()
-        {
+        if let Some(session) = session {
             origin.session = Some(session);
-            let (tab, pane) = zellij_tab_and_pane();
+            let (tab, pane) = probe();
             origin.tab = tab;
             origin.pane = pane;
         }
@@ -155,6 +174,40 @@ TAB_ID  TAB_POS  TAB_NAME  PANE_ID  TYPE  TITLE  COMMAND  CWD  FOCUSED  FLOATING
 1  0  get new ui deployed  plugin_2  plugin  zellij:tab-bar  zellij:tab-bar  -  false  false  false  0  0  1  243
 10  4  showme cli  terminal_28  terminal  Build showme CLI tool  claude  /local/home/rcoh/code  true  false  false  0  1  68  121
 10  4  showme cli  terminal_29  terminal  a shell  -  /local/home/rcoh/code  false  false  false  122  1  68  121";
+
+    /// A probe that fails the test if it is ever called.
+    fn never_probed() -> (Option<String>, Option<String>) {
+        panic!("zellij was queried when no session was set");
+    }
+
+    #[test]
+    fn outside_zellij_it_reports_only_the_directory() {
+        // A plain shell, tmux, or CI: no session, so the zellij binary must not
+        // be invoked at all, and the origin is just the cwd.
+        let origin = Origin::build(Some("/work".to_owned()), None, never_probed);
+        assert_eq!(origin.cwd.as_deref(), Some("/work"));
+        assert_eq!(origin.session, None);
+        assert_eq!(origin.tab, None);
+        assert_eq!(origin.pane, None);
+        assert!(!origin.is_empty());
+    }
+
+    #[test]
+    fn with_nothing_at_all_it_is_empty() {
+        let origin = Origin::build(None, None, never_probed);
+        assert!(origin.is_empty());
+        assert_eq!(origin.summary(), None);
+    }
+
+    #[test]
+    fn under_zellij_it_probes_for_tab_and_pane() {
+        let origin = Origin::build(Some("/work".to_owned()), Some("dd-2".to_owned()), || {
+            (Some("showme cli".to_owned()), Some("a task".to_owned()))
+        });
+        assert_eq!(origin.session.as_deref(), Some("dd-2"));
+        assert_eq!(origin.tab.as_deref(), Some("showme cli"));
+        assert_eq!(origin.pane.as_deref(), Some("a task"));
+    }
 
     #[test]
     fn a_pane_resolves_to_its_tab_and_title() {

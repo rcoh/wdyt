@@ -114,7 +114,7 @@ impl Client {
     /// the one actually sitting in the agent's directory and pane.
     pub async fn create(&self, mut session: CreateSession) -> Result<String> {
         self.ensure_daemon().await?;
-        session.origin = Some(crate::origin::Origin::detect());
+        session.origin = Some(crate::zellij_origin::Origin::detect());
 
         let base = self.require_base().await?;
         let response = self

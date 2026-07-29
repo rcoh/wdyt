@@ -9,7 +9,7 @@ pub mod client;
 pub mod config;
 pub mod diff;
 pub mod notify;
-pub mod origin;
+pub mod zellij_origin;
 pub mod ports;
 pub mod render;
 pub mod server;

@@ -61,7 +61,7 @@ pub struct CreateSession {
     /// Where the creating agent is running. Sent by the CLI because the daemon
     /// cannot see it: the daemon's own cwd and pane are its own, not the agent's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin: Option<crate::origin::Origin>,
+    pub origin: Option<crate::zellij_origin::Origin>,
     /// The theme the content was highlighted with, when not the daemon's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,

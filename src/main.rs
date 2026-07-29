@@ -351,7 +351,12 @@ async fn run() -> Result<()> {
                 read_text(&patch)?
             };
 
-            let files = showme::diff::parse(&source, render::theme(show.theme(&config)?))?;
+            let mut files = showme::diff::parse(&source, render::theme(show.theme(&config)?))?;
+            // A `git diff` lists files alphabetically, floating low-signal files
+            // like Cargo.lock and .config/nextest.toml to the top. Order them by
+            // review importance instead; the stable sort keeps patch order within
+            // a rank.
+            files.sort_by_key(|f| showme::diff::review_rank(&f.label));
             let added: usize = files.iter().map(|f| f.added).sum();
             let removed: usize = files.iter().map(|f| f.removed).sum();
             let title = show
@@ -613,7 +618,7 @@ async fn show_content(
     // Which agent is asking: with several running there is otherwise nothing in
     // the notification to say which pane to go back to.
     let mut details = details;
-    if let Some(origin) = showme::origin::Origin::detect().summary() {
+    if let Some(origin) = showme::zellij_origin::Origin::detect().summary() {
         details.push(origin);
     }
     // The daemon's port is discovered, not assumed: the range is chosen for

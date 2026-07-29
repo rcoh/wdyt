@@ -296,6 +296,76 @@ fn syntax_for<'a>(
         .unwrap_or_else(|| syntaxes.find_syntax_plain_text())
 }
 
+/// A rank for ordering files in a review, lower = shown first.
+///
+/// A `git diff` lists files alphabetically, which floats low-signal files like
+/// `Cargo.lock` and `.config/nextest.toml` to the top. A reviewer wants to see
+/// hand-written source first, then the docs and config a human edits, and the
+/// generated or lockfile churn last. Callers sort by this with a stable sort so
+/// files within a rank keep the patch's original order.
+pub fn review_rank(label: &str) -> u8 {
+    const SOURCE: u8 = 0;
+    const DOC_CONFIG: u8 = 1;
+    const LOW_SIGNAL: u8 = 2;
+
+    let path = Path::new(label);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(label)
+        .to_ascii_lowercase();
+    let lower = label.to_ascii_lowercase();
+
+    // Lockfiles and generated bundles carry no hand-written signal.
+    const LOCKFILES: [&str; 6] = [
+        "cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "go.sum",
+    ];
+    if LOCKFILES.contains(&name.as_str())
+        || name.ends_with(".min.js")
+        || name.ends_with(".map")
+    {
+        return LOW_SIGNAL;
+    }
+
+    // Anything under a generated or vendored tree, or a dot-directory of config
+    // (`.config/nextest.toml`), is churn a reviewer rarely needs to read.
+    const LOW_DIRS: [&str; 6] = [
+        "vendor/",
+        "node_modules/",
+        "dist/",
+        "build/",
+        "target/",
+        "generated/",
+    ];
+    let in_low_dir = LOW_DIRS
+        .iter()
+        .any(|d| lower.starts_with(d) || lower.contains(&format!("/{d}")));
+    let in_dot_dir = lower.starts_with('.') || lower.contains("/.");
+    if in_low_dir || in_dot_dir {
+        return LOW_SIGNAL;
+    }
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some(
+            "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "c" | "h" | "cpp"
+            | "cc" | "cxx" | "hpp" | "rb" | "swift" | "kt" | "scala" | "cs" | "php" | "sh",
+        ) => SOURCE,
+        Some("md" | "toml" | "yaml" | "yml" | "json") => DOC_CONFIG,
+        // An unknown or extensionless file is treated as middling: not clearly
+        // source, but not known churn either.
+        _ => DOC_CONFIG,
+    }
+}
+
 /// Strips git's `a/` and `b/` prefixes, and any trailing tab-separated
 /// timestamp that `diff -u` appends.
 fn strip_prefix_dir(path: &str) -> &str {
@@ -601,5 +671,58 @@ index 1111111..2222222 100644
         assert_eq!(hunk_starts("@@ -12,7 +14,9 @@"), Some((12, 14)));
         assert_eq!(hunk_starts("@@ -3 +5 @@ fn f()"), Some((3, 5)));
         assert_eq!(hunk_starts("not a hunk"), None);
+    }
+
+    #[test]
+    fn source_ranks_before_docs_before_lockfiles() {
+        let source = review_rank("src/main.rs");
+        let doc = review_rank("README.md");
+        let lock = review_rank("Cargo.lock");
+        assert!(source < doc, "source should rank before docs/config");
+        assert!(doc < lock, "docs/config should rank before lockfiles");
+    }
+
+    #[test]
+    fn lockfiles_and_generated_config_are_low_signal() {
+        let lock = review_rank("Cargo.lock");
+        assert_eq!(review_rank("package-lock.json"), lock);
+        assert_eq!(review_rank(".config/nextest.toml"), lock);
+        assert_eq!(review_rank("yarn.lock"), lock);
+        assert_eq!(review_rank("go.sum"), lock);
+        assert_eq!(review_rank("node_modules/foo/index.js"), lock);
+        assert_eq!(review_rank("dist/bundle.min.js"), lock);
+    }
+
+    #[test]
+    fn a_real_source_file_ranks_highest() {
+        let source = review_rank("src/diff.rs");
+        assert!(source < review_rank("Cargo.toml"));
+        assert!(source < review_rank("Cargo.lock"));
+        // A `.toml` a human edits still outranks a lockfile.
+        assert!(review_rank("Cargo.toml") < review_rank("Cargo.lock"));
+    }
+
+    #[test]
+    fn sort_is_stable_within_a_rank() {
+        // Two source files: their relative order must be preserved.
+        let mut labels = vec![
+            "Cargo.lock",
+            "src/zebra.rs",
+            "src/alpha.rs",
+            ".config/nextest.toml",
+            "README.md",
+        ];
+        labels.sort_by_key(|l| review_rank(l));
+        assert_eq!(
+            labels,
+            [
+                "src/zebra.rs",
+                "src/alpha.rs",
+                "README.md",
+                "Cargo.lock",
+                ".config/nextest.toml",
+            ],
+            "stable sort must keep zebra before alpha"
+        );
     }
 }
