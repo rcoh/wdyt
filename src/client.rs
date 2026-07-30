@@ -290,23 +290,78 @@ impl Client {
         }
 
         let exe = std::env::current_exe().context("could not locate the wdyt binary")?;
-        std::process::Command::new(exe)
+
+        // Capture the daemon's stderr to a temp file so that, if it dies before
+        // answering, the CLI can surface the daemon's own error text verbatim
+        // rather than a guess. Without this the output would go to /dev/null and
+        // the only recourse was running `wdyt serve` by hand to see the reason.
+        let log_path = daemon_log_path();
+        let log = std::fs::File::create(&log_path)
+            .with_context(|| format!("creating {}", log_path.display()))?;
+
+        let mut child = std::process::Command::new(exe)
             .arg("serve")
-            // Detached: the daemon outlives this CLI invocation. Its output
-            // would otherwise interleave with the agent's own.
+            // Detached: the daemon outlives this CLI invocation. Its stdout would
+            // otherwise interleave with the agent's own; its stderr is diverted
+            // to the log so a startup failure is not lost.
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(log))
             .spawn()
             .context("could not start the wdyt daemon")?;
 
-        // Poll until it answers.
+        // Poll until it answers, but stop early if the child we just started has
+        // exited: a daemon that could not bind dies at once, and polling the
+        // whole window for a process that is already gone only delays the error.
+        let mut child_exited = false;
         for _ in 0..60 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if self.is_up().await {
+                // Success: the daemon is running and holds the log open for its
+                // one "listening" line. Best-effort removal keeps temp files from
+                // accumulating; on Unix the daemon keeps writing to the unlinked
+                // inode, which nothing reads.
+                let _ = std::fs::remove_file(&log_path);
                 return Ok(());
             }
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                child_exited = true;
+                break;
+            }
         }
-        anyhow::bail!("the wdyt daemon did not come up; try `wdyt serve` to see why")
+
+        // It never answered. Read back whatever the daemon printed before dying
+        // (the bind loop names the range and every port it tried) and surface it
+        // verbatim. Remove the log either way.
+        let logged = std::fs::read_to_string(&log_path)
+            .ok()
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty());
+        let _ = std::fs::remove_file(&log_path);
+
+        match logged {
+            Some(reason) => anyhow::bail!("the wdyt daemon could not start:\n{reason}"),
+            // No output captured: either the child is still alive but not
+            // answering (slow start), or it died silently. Fall back to the
+            // generic guidance.
+            None if child_exited => {
+                anyhow::bail!(
+                    "the wdyt daemon exited without starting; try `wdyt serve` to see why"
+                )
+            }
+            None => anyhow::bail!("the wdyt daemon did not come up; try `wdyt serve` to see why"),
+        }
     }
+}
+
+/// A unique path for one daemon-startup log, under the system temp directory.
+///
+/// Keyed by the CLI's pid and a high-resolution timestamp so two concurrent
+/// invocations do not clobber each other's log.
+fn daemon_log_path() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("wdyt-serve-{}-{nanos}.log", std::process::id()))
 }

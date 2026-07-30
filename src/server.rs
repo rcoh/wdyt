@@ -590,7 +590,9 @@ fn query_param(cx: &Cx, name: &str) -> Option<String> {
 /// which also means they are already full of other servers.
 pub async fn serve(config: &Config, store: Store) -> AnyResult<()> {
     let mut bound = None;
-    let mut last_error = None;
+    // Every port we tried and why it was rejected, so the error can list them
+    // all rather than blaming only the last one.
+    let mut tried: Vec<(u16, std::io::Error)> = Vec::new();
     for port in config.ports() {
         let addr = SocketAddr::new(config.bind, port);
         match tokio::net::TcpListener::bind(addr).await {
@@ -598,14 +600,21 @@ pub async fn serve(config: &Config, store: Store) -> AnyResult<()> {
                 bound = Some((listener, port));
                 break;
             }
-            Err(error) => last_error = Some((port, error)),
+            Err(error) => tried.push((port, error)),
         }
     }
 
     let (listener, port) = bound.ok_or_else(|| {
-        let (last, error) = last_error.expect("the range is non-empty");
+        // The CLI captures this text and relays it verbatim, so it is the one
+        // place the failure is explained: name the whole range, then every port
+        // attempted with the reason each was unusable.
+        let attempts = tried
+            .iter()
+            .map(|(port, error)| format!("{port}: {error}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         anyhow::anyhow!(
-            "no free port in {}-{} ({last}: {error}). Is a wdyt daemon already \
+            "no free port in {}-{} (tried {attempts}). Is a wdyt daemon already \
              running? Widen the range with `wdyt config --ports LOW-HIGH`",
             config.port_low,
             config.port_high,

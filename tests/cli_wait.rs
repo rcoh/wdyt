@@ -430,6 +430,85 @@ async fn standalone_wait_still_works() {
 }
 
 #[tokio::test]
+async fn busy_port_range_relays_daemon_bind_error() {
+    // The reported bug: a content command against a range whose ports are all
+    // taken (by unrelated servers) failed with the opaque "daemon did not come
+    // up" instead of the real "no free port" reason the daemon itself printed.
+    // Occupy every port in a small range with plain listeners — not wdyt daemons
+    // — so the spawned daemon cannot bind and the health probe never matches the
+    // marker. We need a *contiguous* fully-occupied range so we can assert the
+    // error enumerates each port it tried: take one ephemeral port, then bind
+    // the one just above it explicitly. Retry until both bind, since the
+    // neighbour is occasionally already taken.
+    let local = IpAddr::from([127, 0, 0, 1]);
+    let (_low_listener, _high_listener, low, high) = {
+        let mut attempt = None;
+        for _ in 0..64 {
+            let low_listener = std::net::TcpListener::bind((local, 0)).unwrap();
+            let low = low_listener.local_addr().unwrap().port();
+            let Some(high) = low.checked_add(1) else {
+                continue;
+            };
+            if let Ok(high_listener) = std::net::TcpListener::bind((local, high)) {
+                attempt = Some((low_listener, high_listener, low, high));
+                break;
+            }
+        }
+        attempt.expect("could not reserve two adjacent ports after 64 tries")
+    };
+    let range = format!("{low}-{high}");
+    // The listeners stay in scope for the rest of the test, keeping both ports
+    // occupied while the daemon tries — and fails — to bind them.
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), "fn main() {}\n").unwrap();
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(wdyt_bin())
+            .args([
+                "code",
+                tmp.path().to_str().unwrap(),
+                "--no-wait",
+                "--no-notify",
+            ])
+            .env("WDYT_PORTS", &range)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("bind-failure test did not finish (30s)")
+    .expect("failed to run wdyt");
+
+    assert!(
+        !output.status.success(),
+        "should fail when every port in the range is busy"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The daemon's own error text must be relayed: it names the range,
+    // enumerates the ports it tried, and points at the fix.
+    assert!(
+        stderr.contains(&format!("no free port in {range}")),
+        "stderr should name the exhausted range: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("{low}:")) && stderr.contains(&format!("{high}:")),
+        "stderr should enumerate every port tried ({low} and {high}): {stderr}"
+    );
+    assert!(
+        stderr.contains("wdyt config --ports"),
+        "stderr should point at widening the range: {stderr}"
+    );
+    // The opaque fallback must not be what the user sees here.
+    assert!(
+        !stderr.contains("did not come up"),
+        "the generic message should be replaced by the daemon's real reason: {stderr}"
+    );
+}
+
+#[tokio::test]
 async fn no_wait_and_timeout_are_rejected() {
     // Ensure the CLI rejects --no-wait combined with --timeout.
     let daemon = TestDaemon::start().await;
