@@ -401,16 +401,22 @@ nav.files .added, nav.files .removed {{ margin-left: 4px; }}
 
 /* Deep-link highlights ---------------------------------------------------- */
 /* A line targeted by a URL fragment (via :target or the JS-applied class). The
-   gutter shifts to the accent so the scrolled-to line is unmistakable even in a
-   large file. The class form is used by the fragment script for ranges and for
-   hashchange without a reload. */
+   whole row is tinted the accent, GitHub-style, so a hand-written deep link
+   lands somewhere unmistakable even in a large diff; the class form is used by
+   the fragment script for ranges and for hashchange without a reload. The mix
+   is derived from the code card's own background, so one rule reads correctly
+   against every syntax theme, light or dark. */
 table.src tr:target td,
 table.src tr.sel-highlight td {{
-  background: color-mix(in srgb, var(--accent) 14%, var(--code-bg));
+  background: color-mix(in srgb, var(--accent) 30%, var(--code-bg));
 }}
+/* A solid accent bar down the gutter so the eye finds the first line of the
+   span at once, and the number itself shifts to the accent. `inset` on td.ln
+   only, matching the ranged-comment marker so the two read as one language. */
 table.src tr:target td.ln,
 table.src tr.sel-highlight td.ln {{
-  color: var(--accent);
+  color: var(--accent); font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--accent);
 }}
 /* A linked comment pulses briefly so the eye finds it among a wall of notes. */
 .note.sel-highlight {{
@@ -1555,7 +1561,10 @@ const FRAGMENT_JS: &str = r##"
           if (!found) clearHighlights();
           row.classList.add('sel-highlight');
           if (!found) {
-            row.scrollIntoView({ block: 'center', behavior: scrollBehavior });
+            // A hand-written deep link jumps instantly: smooth scrolling a long
+            // diff to a line the reader named is slow, not a courtesy. (Reduced
+            // motion already forces 'auto'; this makes the fast path universal.)
+            row.scrollIntoView({ block: 'center', behavior: 'auto' });
             found = true;
           }
         }
@@ -1952,8 +1961,8 @@ pub(crate) const DOC_COMMENT_JS: &str = r##"
         if (!sp) continue;
         // Overlap between the block's source span and the requested one.
         if (sp.startLine <= fl.end && sp.endLine >= fl.start) {
-          var motion = window.matchMedia('(prefers-reduced-motion: reduce)');
-          child.scrollIntoView({ block: 'center', behavior: motion.matches ? 'auto' : 'smooth' });
+          // Instant jump for a hand-written deep link (see FRAGMENT_JS).
+          child.scrollIntoView({ block: 'center', behavior: 'auto' });
           child.classList.add('sel-highlight');
           setTimeout(function (el) { return function () { el.classList.remove('sel-highlight'); }; }(child), 2000);
           return true;
