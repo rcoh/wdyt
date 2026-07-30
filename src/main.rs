@@ -31,7 +31,11 @@ WORKFLOW (for coding agents):
      #f-<path> where non-alphanumerics become dashes:
        src/main.rs  → #f-src-main-rs
        a-b/c-d.rs   → #f-a-b-c-d-rs
-     After session creation, available anchors are printed to stderr.
+     Point at a line span the GitHub way, appending -L<start>[-L<end>]:
+       src/main.rs L10       → #f-src-main-rs-L10
+       src/main.rs L10-L20   → #f-src-main-rs-L10-L20
+     (line anchors resolve in code/diff; in docs they jump to the covering
+     block.) After session creation, available anchors are printed to stderr.
 
   3. stdout is machine-readable: first the session URL, then (if waiting) the
      reply as JSON. Pass --no-wait for fire-and-forget.
@@ -256,7 +260,9 @@ struct ShowArgs {
     ///
     /// Explain what changed and what to look at first. A link to `#f-<path>`
     /// jumps to that file, with non-alphanumerics replaced by dashes: `src/a.rs`
-    /// is `#f-src-a-rs`. Pass `-` to read the markdown from stdin.
+    /// is `#f-src-a-rs`. Append `-L<start>` or `-L<start>-L<end>` for a line
+    /// span, mirroring GitHub: `#f-src-a-rs-L10-L20`. Pass `-` to read the
+    /// markdown from stdin.
     #[arg(long, short = 'b')]
     brief: Option<String>,
 
@@ -754,6 +760,14 @@ async fn show_content(
         eprintln!("wdyt: file anchors for --brief links:");
         for label in &file_labels {
             eprintln!("  {} → #{}", label, wdyt::file_anchor(label));
+        }
+        // GitHub-style line spans hang off the same anchor, so an agent can
+        // point the reader at an exact passage rather than a whole file.
+        if let Some(label) = file_labels.first() {
+            let a = wdyt::file_anchor(label);
+            eprintln!(
+                "  add -L<start> or -L<start>-L<end> for a line span, e.g. #{a}-L10 or #{a}-L10-L20"
+            );
         }
     }
 

@@ -1409,6 +1409,46 @@ const FRAGMENT_JS: &str = r##"
     return Number.isFinite(n) && n > 0 && n <= Number.MAX_SAFE_INTEGER && n === Math.floor(n);
   }
 
+  // Mirror of the Rust `file_anchor`: 'f-' then every ASCII-alphanumeric char
+  // lowercased, everything else a dash. Because the path is lowercased, it can
+  // never contain a capital 'L', which is what lets a trailing '-L<n>' be told
+  // apart from the dashes inside a path.
+  function fileAnchor(label) {
+    var out = 'f-';
+    for (var i = 0; i < label.length; i++) {
+      var ch = label[i];
+      out += /[A-Za-z0-9]/.test(ch) ? ch.toLowerCase() : '-';
+    }
+    return out;
+  }
+
+  // Parse a hand-written GitHub-style file-line anchor:
+  //   f-<path>-L<start>            single line
+  //   f-<path>-L<start>-L<end>     range
+  // Returns {anchor, start, end} or null. Parsed from the RIGHT on the capital
+  // 'L' markers so dashes in <path> are never mistaken for a delimiter, the same
+  // disambiguation parseSel uses for sel- fragments.
+  function parseFileLine(frag) {
+    if (frag.length > 8192 || frag.indexOf('f-') !== 0) return null;
+    // Greedy `.*` peels the LAST -L<digits>: the end line, or the single line.
+    var tail = frag.match(/^(.*)-L(\d+)$/);
+    if (!tail) return null;
+    var end = parseInt(tail[2], 10);
+    if (!safeInt(end)) return null;
+    var head = tail[1];
+    var start = end;
+    var prefix = head;
+    // A second -L<digits> immediately before it makes this a range.
+    var lead = head.match(/^(.*)-L(\d+)$/);
+    if (lead) {
+      start = parseInt(lead[2], 10);
+      if (!safeInt(start)) return null;
+      prefix = lead[1];
+    }
+    if (prefix.indexOf('f-') !== 0) return null;
+    return { anchor: prefix, start: Math.min(start, end), end: Math.max(start, end) };
+  }
+
   // Parse a sel fragment. Returns {path, side, start, end} or null.
   function parseSel(frag) {
     if (frag.indexOf('sel-') !== 0) return null;
@@ -1495,6 +1535,35 @@ const FRAGMENT_JS: &str = r##"
     return found;
   }
 
+  // Highlight a hand-written file-line anchor (`f-<path>-L<start>[-L<end>]`).
+  // The parsed anchor is lossy, so it is matched by recomputing fileAnchor for
+  // each rendered line's own data-file. Only the `new` side has real line
+  // numbers a reader would hand-write against, matching GitHub's blob scheme.
+  function highlightFileLine(fl) {
+    var root = document.querySelector('[data-comments]');
+    if (!root) return false;
+    var buttons = root.querySelectorAll('.addnote');
+    var found = false;
+    for (var i = 0; i < buttons.length; i++) {
+      var btn = buttons[i];
+      if (btn.getAttribute('data-side') !== 'new') continue;
+      if (fileAnchor(btn.getAttribute('data-file')) !== fl.anchor) continue;
+      var n = parseInt(btn.getAttribute('data-line'), 10);
+      if (n >= fl.start && n <= fl.end) {
+        var row = btn.closest('tr');
+        if (row) {
+          if (!found) clearHighlights();
+          row.classList.add('sel-highlight');
+          if (!found) {
+            row.scrollIntoView({ block: 'center', behavior: scrollBehavior });
+            found = true;
+          }
+        }
+      }
+    }
+    return found;
+  }
+
   function handleFragment() {
     var hash = location.hash.slice(1);
     if (!hash) return;
@@ -1510,6 +1579,11 @@ const FRAGMENT_JS: &str = r##"
     var sel = parseSel(hash);
     if (sel) {
       highlightSelection(sel);
+      return;
+    }
+    // Hand-written GitHub-style file-line anchor (f-<path>-L<start>[-L<end>]).
+    var fl = parseFileLine(hash);
+    if (fl && highlightFileLine(fl)) {
       return;
     }
     // Otherwise fall through to native anchor handling (f-* and headings).
@@ -1830,13 +1904,76 @@ pub(crate) const DOC_COMMENT_JS: &str = r##"
     })(docRoots[ri]);
   }
 
+  // Mirror of the Rust `file_anchor` (see FRAGMENT_JS for the rationale).
+  function fileAnchor(label) {
+    var out = 'f-';
+    for (var i = 0; i < label.length; i++) {
+      var ch = label[i];
+      out += /[A-Za-z0-9]/.test(ch) ? ch.toLowerCase() : '-';
+    }
+    return out;
+  }
+
+  // Parse a hand-written GitHub-style file-line anchor, from the right on the
+  // capital-L markers so dashes in the path are never a delimiter.
+  function parseFileLine(frag) {
+    if (frag.length > 8192 || frag.indexOf('f-') !== 0) return null;
+    var tail = frag.match(/^(.*)-L(\d+)$/);
+    if (!tail) return null;
+    var end = parseInt(tail[2], 10);
+    if (!safeLineNo(end)) return null;
+    var start = end;
+    var prefix = tail[1];
+    var lead = tail[1].match(/^(.*)-L(\d+)$/);
+    if (lead) {
+      start = parseInt(lead[2], 10);
+      if (!safeLineNo(start)) return null;
+      prefix = lead[1];
+    }
+    if (prefix.indexOf('f-') !== 0) return null;
+    return { anchor: prefix, start: Math.min(start, end), end: Math.max(start, end) };
+  }
+
+  // Resolve a file-line anchor within docs: find the doc whose label matches and
+  // scroll to the first rendered block whose source range overlaps the span.
+  // Markdown has no per-line addressing, so the covering block is the closest
+  // faithful target; a span matching no block simply falls through.
+  function handleDocFileLine(fl) {
+    for (var ri = 0; ri < docRoots.length; ri++) {
+      var root = docRoots[ri];
+      var docFile = root.getAttribute('data-doc-file');
+      // The brief has no source path a reader would link to by file anchor.
+      if (!docFile || docFile === 'brief:') continue;
+      if (fileAnchor(docFile) !== fl.anchor) continue;
+      var children = root.children;
+      for (var ci = 0; ci < children.length; ci++) {
+        var child = children[ci];
+        var sp = parseSourcepos(child.getAttribute ? child.getAttribute('data-sourcepos') : null);
+        if (!sp) continue;
+        // Overlap between the block's source span and the requested one.
+        if (sp.startLine <= fl.end && sp.endLine >= fl.start) {
+          var motion = window.matchMedia('(prefers-reduced-motion: reduce)');
+          child.scrollIntoView({ block: 'center', behavior: motion.matches ? 'auto' : 'smooth' });
+          child.classList.add('sel-highlight');
+          setTimeout(function (el) { return function () { el.classList.remove('sel-highlight'); }; }(child), 2000);
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   // Handle doc/brief #sel links: resolve, scroll, and highlight on load/hashchange.
   // Uses data-doc-target (explicit target) for resolution, not display label.
   function handleDocFragment() {
     var hash = location.hash.slice(1);
     if (!hash) return;
-    // Only handle sel- fragments that target a doc-file.
-    if (hash.indexOf('sel-') !== 0) return;
+    // Hand-written file-line anchor (f-<path>-L<start>[-L<end>]) → covering block.
+    if (hash.indexOf('sel-') !== 0) {
+      var fl = parseFileLine(hash);
+      if (fl) handleDocFileLine(fl);
+      return;
+    }
     // Try to find a matching doc-addnote button in a doc root.
     for (var ri2 = 0; ri2 < docRoots.length; ri2++) {
       var root = docRoots[ri2];
@@ -2723,6 +2860,31 @@ mod tests {
         // Only `sel-` and `comment-` are handled; everything else falls through.
         assert!(FRAGMENT_JS.contains("indexOf('comment-') === 0"));
         assert!(FRAGMENT_JS.contains("indexOf('sel-') !== 0"));
+    }
+
+    #[test]
+    fn fragment_js_handles_hand_written_file_line_anchors() {
+        // The code/diff fragment script must parse GitHub-style `f-<path>-L<n>`
+        // and `-L<start>-L<end>` anchors and highlight the matching rows.
+        assert!(FRAGMENT_JS.contains("parseFileLine"));
+        assert!(FRAGMENT_JS.contains("highlightFileLine"));
+        // It recomputes the lossy file anchor per row rather than reversing it.
+        assert!(FRAGMENT_JS.contains("fileAnchor"));
+        // Parsing peels the capital-L marker from the right, so dashed paths work.
+        assert!(FRAGMENT_JS.contains(r"-L(\d+)$"));
+        // Only the `new` side carries hand-writable line numbers.
+        assert!(FRAGMENT_JS.contains("getAttribute('data-side') !== 'new'"));
+    }
+
+    #[test]
+    fn doc_comment_js_handles_hand_written_file_line_anchors() {
+        // Docs map a file-line anchor to the rendered block covering those lines.
+        assert!(DOC_COMMENT_JS.contains("parseFileLine"));
+        assert!(DOC_COMMENT_JS.contains("handleDocFileLine"));
+        // Overlap test against the block's sourcepos span.
+        assert!(DOC_COMMENT_JS.contains("sp.startLine <= fl.end && sp.endLine >= fl.start"));
+        // The brief has no source path, so it is skipped for file-line anchors.
+        assert!(DOC_COMMENT_JS.contains("docFile === 'brief:'"));
     }
 
     #[test]
