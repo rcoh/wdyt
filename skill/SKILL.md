@@ -5,8 +5,9 @@ description: "Show your work to the user via a Slack link and collect their repl
 
 # wdyt — show your work, get a reply
 
-Show something to the user over a link in Slack. The page carries a reply box;
-one reply comes back as JSON and you carry on.
+Show something to the user over a link in Slack. The page carries a reply box
+and supports detailed line-by-line comments on your work; the reply and any line
+comments come back as JSON and you carry on.
 
 ## Quick start
 
@@ -19,6 +20,9 @@ git diff | wdyt diff --title "the rewrite"
 
 # Show rendered markdown
 wdyt docs DESIGN.md --title "design writeup"
+
+# Show a live server you already started (here, on port 3001)
+wdyt demo 3001 --title "the running app"
 ```
 
 stdout prints the URL, then blocks until a reply arrives (JSON). Exit 2 = timeout.
@@ -32,6 +36,11 @@ stdout prints the URL, then blocks until a reply arrives (JSON). Exit 2 = timeou
 | `docs` | Rendered markdown (GFM, callouts, tables) | `wdyt docs DESIGN.md --title "…"` |
 | `dir`  | A directory of prepared HTML/assets | `wdyt dir ./report --title "…"` |
 | `demo` | A live server you already started | `wdyt demo 3001 --title "…"` |
+
+`diff` orders files by review importance automatically (hand-written source
+first, docs/config next, lockfiles and generated churn last), so the most
+important files are shown first. Within an importance rank it keeps the order of
+the piped diff — arrange the files you `git diff` to control that.
 
 ## Guided review (--brief)
 
@@ -47,7 +56,9 @@ available anchors.
 
 ## Waiting and collecting
 
-Every content command waits by default (up to `--timeout 600` seconds).
+Every content command waits by default. Unless the user requests one, do not set
+a `--timeout` — run the command with your built-in background-task mechanism (if
+you have one) so you are notified when the reply arrives, instead of blocking.
 
 ```sh
 # Fire and forget
@@ -60,15 +71,8 @@ wdyt collect <id>       # get reply + line comments as JSON
 wdyt ack <id> "on it"  # turn the user's receipt green
 ```
 
-## Reply lifecycle
-
-| Dot on page | Meaning |
-|---|---|
-| Grey pulsing | Waiting for agent to pick up |
-| Amber pulsing | Agent collected, not yet acknowledged |
-| Green | Agent read it and said what it's doing |
-
-Always `ack` after collecting — it tells the user you actually read their note.
+Always `ack` immediately after collecting — it tells the user you actually read
+their note.
 
 ## Output contract
 
@@ -78,6 +82,9 @@ Always `ack` after collecting — it tells the user you actually read their note
 - **exit 2**: timeout (session stays open)
 
 ## Configuration
+
+The webhook always goes directly to the user (not public), and wdyt is served
+only locally — there is no risk in sending information to wdyt.
 
 ```sh
 wdyt config --webhook-url https://hooks.slack.com/services/…
