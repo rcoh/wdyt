@@ -10,10 +10,10 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use wdyt::config::Config;
 use wdyt::render::theme;
 use wdyt::session::{Content, Store};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 // ---------- Test daemon setup (shared with cli_wait.rs pattern) ----------
 
@@ -576,8 +576,7 @@ async fn reply_received_stderr_shows_ack_guidance() {
 #[tokio::test]
 async fn collect_stderr_shows_ack_guidance() {
     let daemon = TestDaemon::start().await;
-    let file =
-        wdyt::render::highlight("src/example.rs", "fn main() {}\n", theme("Nord")).unwrap();
+    let file = wdyt::render::highlight("src/example.rs", "fn main() {}\n", theme("Nord")).unwrap();
     let id = daemon
         .store
         .insert("test".to_owned(), None, Content::Code { files: vec![file] });

@@ -195,6 +195,21 @@ enum Command {
 
     /// List available syntax themes.
     Themes,
+
+    /// Install the wdyt agent skill into a project or globally.
+    ///
+    /// Writes SKILL.md so that coding agents (Kiro, Claude Code, etc.) know how
+    /// to use wdyt. By default installs into the current project's .kiro/skills/
+    /// and .claude/skills/ directories. Pass --global to install into the user's
+    /// home directory instead (~/.kiro/skills/wdyt/ and ~/.claude/skills/wdyt/).
+    ///
+    /// Example: wdyt skill --global
+    Skill {
+        /// Install to ~/.kiro/skills/ and ~/.claude/skills/ instead of the
+        /// current project.
+        #[arg(long, short)]
+        global: bool,
+    },
 }
 
 /// Flags shared by the content-producing subcommands.
@@ -639,6 +654,8 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
+
+        Command::Skill { global } => install_skill(global),
     }
 }
 
@@ -811,6 +828,50 @@ fn parse_range(value: &str) -> Result<(u16, u16)> {
     let high: u16 = high.trim().parse().context("invalid high port")?;
     anyhow::ensure!(low <= high, "range {value:?} is inverted");
     Ok((low, high))
+}
+
+/// The wdyt SKILL.md, embedded at compile time.
+const SKILL_MD: &str = include_str!("../skill/SKILL.md");
+
+/// Install the bundled skill into the appropriate directories.
+fn install_skill(global: bool) -> Result<()> {
+    let targets: Vec<PathBuf> = if global {
+        let home = directories::BaseDirs::new().context("cannot determine home directory")?;
+        let home = home.home_dir();
+        vec![
+            home.join(".kiro/skills/wdyt"),
+            home.join(".claude/skills/wdyt"),
+            home.join(".codex/skills/wdyt"),
+            home.join(".config/agents/skills/wdyt"),
+        ]
+    } else {
+        let cwd = std::env::current_dir().context("cannot determine working directory")?;
+        vec![
+            cwd.join(".kiro/skills/wdyt"),
+            cwd.join(".claude/skills/wdyt"),
+            cwd.join(".codex/skills/wdyt"),
+            cwd.join(".agents/skills/wdyt"),
+        ]
+    };
+
+    let mut installed = Vec::new();
+    for dir in &targets {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let dest = dir.join("SKILL.md");
+        std::fs::write(&dest, SKILL_MD).with_context(|| format!("writing {}", dest.display()))?;
+        installed.push(dest);
+    }
+
+    for path in &installed {
+        eprintln!("wdyt: installed {}", path.display());
+    }
+    let scope = if global {
+        "globally"
+    } else {
+        "in this project"
+    };
+    eprintln!("wdyt: skill installed {scope}. Agents will now know how to use wdyt.");
+    Ok(())
 }
 
 #[cfg(test)]

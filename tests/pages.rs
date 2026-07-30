@@ -854,10 +854,7 @@ async fn a_sessions_own_theme_colours_its_page() {
     let file = wdyt::render::highlight("x.rs", "fn main() {}\n", theme("GitHub")).unwrap();
     let id = daemon.store.insert_new(wdyt::session::NewSession {
         theme: Some("GitHub".to_owned()),
-        ..wdyt::session::NewSession::new(
-            "a title".to_owned(),
-            Content::Code { files: vec![file] },
-        )
+        ..wdyt::session::NewSession::new("a title".to_owned(), Content::Code { files: vec![file] })
     });
 
     let (_, body) = daemon.get(&format!("/s/{id}")).await;
@@ -1009,10 +1006,7 @@ async fn a_plain_server_in_the_range_is_not_mistaken_for_the_daemon() {
         ..Config::default()
     };
     let client = wdyt::client::Client::new(&config);
-    assert!(
-        !client.is_up().await,
-        "an unrelated server passed as wdyt"
-    );
+    assert!(!client.is_up().await, "an unrelated server passed as wdyt");
 }
 
 #[tokio::test]
@@ -1252,10 +1246,7 @@ async fn comments_have_discoverable_permalinks() {
 
     let (_, page) = daemon.get(&format!("/s/{id}")).await;
     // A permalink link should be rendered with href pointing to the comment anchor.
-    let expected_link = format!(
-        "href=\"#{}\"",
-        wdyt::fragment::comment_fragment(comment_id)
-    );
+    let expected_link = format!("href=\"#{}\"", wdyt::fragment::comment_fragment(comment_id));
     assert!(
         page.contains(&expected_link),
         "comment permalink not found: {page}"
@@ -1284,10 +1275,7 @@ async fn code_comments_have_discoverable_permalinks() {
     let comment_id = comment["id"].as_u64().unwrap();
 
     let (_, page) = daemon.get(&format!("/s/{id}")).await;
-    let expected_link = format!(
-        "href=\"#{}\"",
-        wdyt::fragment::comment_fragment(comment_id)
-    );
+    let expected_link = format!("href=\"#{}\"", wdyt::fragment::comment_fragment(comment_id));
     assert!(
         page.contains(&expected_link),
         "comment permalink not found on code page: {page}"
@@ -1787,10 +1775,7 @@ async fn a_commentable_brief_on_a_code_session_works() {
     let id = daemon.store.insert_new(wdyt::session::NewSession {
         brief: Some(brief_doc.html),
         brief_sources: brief_doc.sources,
-        ..wdyt::session::NewSession::new(
-            "a title".to_owned(),
-            Content::Code { files: vec![file] },
-        )
+        ..wdyt::session::NewSession::new("a title".to_owned(), Content::Code { files: vec![file] })
     });
 
     let (_, body) = daemon.get(&format!("/s/{id}")).await;
@@ -2213,10 +2198,7 @@ async fn commentable_brief_does_not_steal_code_comment_root() {
     let id = daemon.store.insert_new(wdyt::session::NewSession {
         brief: Some(brief_doc.html),
         brief_sources: brief_doc.sources,
-        ..wdyt::session::NewSession::new(
-            "a title".to_owned(),
-            Content::Code { files: vec![file] },
-        )
+        ..wdyt::session::NewSession::new("a title".to_owned(), Content::Code { files: vec![file] })
     });
 
     let (_, body) = daemon.get(&format!("/s/{id}")).await;
@@ -3475,8 +3457,7 @@ async fn stale_marker_only_daemon_is_skipped() {
                 let mut buf = vec![0u8; 1024];
                 let _ = socket.read(&mut buf).await;
                 // Old-style response: has marker but no protocol field.
-                let body =
-                    r#"{"ok":true,"service":"wdyt-daemon","version":"0.0.1","sessions":0}"#;
+                let body = r#"{"ok":true,"service":"wdyt-daemon","version":"0.0.1","sessions":0}"#;
                 let _ = socket
                     .write_all(
                         format!(
@@ -3721,8 +3702,7 @@ async fn api_accepts_valid_non_colliding_labels() {
     let daemon = Daemon::start().await;
 
     let file_a = wdyt::render::highlight("src/main.rs", "fn main() {}\n", theme("Nord")).unwrap();
-    let file_b =
-        wdyt::render::highlight("src/lib.rs", "pub fn lib() {}\n", theme("Nord")).unwrap();
+    let file_b = wdyt::render::highlight("src/lib.rs", "pub fn lib() {}\n", theme("Nord")).unwrap();
 
     let (status, body) = daemon
         .post_json(
@@ -3747,8 +3727,7 @@ async fn code_file_ids_are_namespaced_to_prevent_cross_file_collision() {
     // the file anchor so id="L1" doesn't collide across files.
     let daemon = Daemon::start().await;
     let file_a = wdyt::render::highlight("src/main.rs", "fn main() {}\n", theme("Nord")).unwrap();
-    let file_b =
-        wdyt::render::highlight("src/lib.rs", "pub fn lib() {}\n", theme("Nord")).unwrap();
+    let file_b = wdyt::render::highlight("src/lib.rs", "pub fn lib() {}\n", theme("Nord")).unwrap();
     let id = daemon.insert(Content::Code {
         files: vec![file_a, file_b],
     });

@@ -15,10 +15,10 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use wdyt::config::Config;
 use wdyt::render::theme;
 use wdyt::session::{Content, Store};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 /// A daemon on its own port range, with helpers for creating sessions and
 /// sending replies programmatically.
