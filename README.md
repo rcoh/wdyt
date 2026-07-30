@@ -11,8 +11,10 @@ one reply; the agent gets it and carries on.
 ## Install
 
 ```sh
-cargo install --path .
+cargo install --locked wdyt
 ```
+
+Or from a checkout: `cargo install --locked --path .`
 
 ## Configure
 
