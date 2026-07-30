@@ -1,13 +1,17 @@
-//! Sessions: one per "show me this", held in memory by the daemon.
+//! Sessions: one per "show me this", persisted by the daemon.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use anyhow::{Context as _, Result as AnyResult};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
+
+const STATE_VERSION: u32 = 1;
 
 /// What a session shows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +341,7 @@ impl NewSession {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub title: String,
@@ -364,6 +369,7 @@ pub struct Session {
     /// the daemon, so the name has to travel with the session or the two would
     /// disagree — light code in a dark card, or the reverse.
     pub theme: Option<String>,
+    #[serde(with = "unix_seconds")]
     pub created: SystemTime,
     /// The reply, once the user sends one. A session accepts a single reply;
     /// the sender is consumed on first use.
@@ -371,8 +377,6 @@ pub struct Session {
     /// Line comments on a diff, oldest first. Unlike the reply these are not
     /// capped at one: commenting on six lines of a diff is the normal case.
     pub comments: Vec<Comment>,
-    /// Wakes up a `wdyt wait` for this session.
-    pub waiters: Vec<oneshot::Sender<Reply>>,
 }
 
 impl Session {
@@ -384,18 +388,87 @@ impl Session {
 /// Shared session store. Cloneable; all clones see the same sessions.
 #[derive(Clone)]
 pub struct Store {
-    inner: Arc<Mutex<HashMap<String, Session>>>,
+    inner: Arc<Mutex<StoreInner>>,
     counter: Arc<AtomicU64>,
     ttl: Option<Duration>,
+    state_path: Option<PathBuf>,
+    /// Keeps the exclusive sibling lock held for every clone's lifetime.
+    _state_lock: Option<Arc<std::fs::File>>,
+}
+
+struct StoreInner {
+    sessions: HashMap<String, Session>,
+    /// Waiters belong to this daemon process and are deliberately not persisted.
+    waiters: HashMap<String, Vec<oneshot::Sender<Reply>>>,
+}
+
+#[derive(Deserialize)]
+struct StateHeader {
+    version: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateFileV1 {
+    version: u32,
+    sessions: Vec<Session>,
+}
+
+#[derive(Serialize)]
+struct StateFileRef<'a> {
+    version: u32,
+    sessions: Vec<&'a Session>,
 }
 
 impl Store {
+    /// Creates an in-memory store. Tests and embedded callers that do not need
+    /// restart recovery can keep using this constructor.
     pub fn new(ttl: Option<Duration>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(Mutex::new(StoreInner {
+                sessions: HashMap::new(),
+                waiters: HashMap::new(),
+            })),
             counter: Arc::new(AtomicU64::new(0)),
             ttl,
+            state_path: None,
+            _state_lock: None,
         }
+    }
+
+    /// Opens a durable store, restoring sessions from `state_path` when present.
+    ///
+    /// Unknown or malformed versions fail rather than silently replacing state
+    /// with an empty file. Sessions already beyond the configured TTL are
+    /// discarded before the store starts serving.
+    pub fn open(state_path: impl Into<PathBuf>, ttl: Option<Duration>) -> AnyResult<Self> {
+        let state_path = state_path.into();
+        let state_lock = Arc::new(Self::acquire_state_lock(&state_path)?);
+        let mut sessions = match std::fs::read(&state_path) {
+            Ok(bytes) => Self::decode_state(&state_path, &bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading wdyt state at {}", state_path.display()));
+            }
+        };
+
+        let before = sessions.len();
+        Self::evict(&mut sessions, ttl, SystemTime::now());
+        if sessions.len() != before {
+            Self::write_state(&state_path, &sessions)?;
+        }
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(StoreInner {
+                sessions,
+                waiters: HashMap::new(),
+            })),
+            counter: Arc::new(AtomicU64::new(0)),
+            ttl,
+            state_path: Some(state_path),
+            _state_lock: Some(state_lock),
+        })
     }
 
     /// Inserts a session and returns its id.
@@ -416,6 +489,13 @@ impl Store {
     /// Takes a struct rather than a growing list of positional arguments: most
     /// callers care about two or three of these and the rest are `None`.
     pub fn insert_new(&self, new: NewSession) -> String {
+        self.try_insert_new(new)
+            .expect("failed to insert session into the store")
+    }
+
+    /// Fallible insertion for persistent callers that need to report disk
+    /// failures instead of terminating.
+    pub fn try_insert_new(&self, new: NewSession) -> Result<String, StoreError> {
         let NewSession {
             title,
             note,
@@ -426,41 +506,47 @@ impl Store {
             brief_sources,
         } = new;
         let now = SystemTime::now();
-        let seq = self.counter.fetch_add(1, Ordering::Relaxed);
-        let stamp = now
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
-        // Base36 of a time/sequence mix: compact and URL-safe.
-        let id = base36(stamp.rotate_left(17) ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        self.mutate(move |sessions| {
+            let id = loop {
+                let seq = self.counter.fetch_add(1, Ordering::Relaxed);
+                let stamp = now
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64);
+                // Base36 of a time/sequence mix: compact and URL-safe.
+                let candidate =
+                    base36(stamp.rotate_left(17) ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                if !sessions.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
 
-        let session = Session {
-            id: id.clone(),
-            title,
-            note,
-            content,
-            origin,
-            theme,
-            brief,
-            brief_sources,
-            created: now,
-            reply: None,
-            comments: Vec::new(),
-            waiters: Vec::new(),
-        };
+            let session = Session {
+                id: id.clone(),
+                title,
+                note,
+                content,
+                origin,
+                theme,
+                brief,
+                brief_sources,
+                created: now,
+                reply: None,
+                comments: Vec::new(),
+            };
 
-        let mut sessions = self.lock();
-        sessions.insert(id.clone(), session);
-        Self::evict(&mut sessions, self.ttl, now);
-        id
+            sessions.insert(id.clone(), session);
+            Self::evict(sessions, self.ttl, now);
+            Ok(id)
+        })
     }
 
     /// Runs `f` against a session, if it exists.
     pub fn with<T>(&self, id: &str, f: impl FnOnce(&Session) -> T) -> Option<T> {
-        self.lock().get(id).map(f)
+        self.lock().sessions.get(id).map(f)
     }
 
     pub fn exists(&self, id: &str) -> bool {
-        self.lock().contains_key(id)
+        self.lock().sessions.contains_key(id)
     }
 
     /// Records a reply and wakes any waiters.
@@ -468,25 +554,31 @@ impl Store {
     /// Returns `Err` if the session is unknown, `Ok(false)` if it already had
     /// a reply. A session takes one reply: this is a "send the agent a note"
     /// box, not a chat.
-    pub fn reply(&self, id: &str, text: String) -> Result<bool, UnknownSession> {
-        let mut sessions = self.lock();
-        let session = sessions.get_mut(id).ok_or(UnknownSession)?;
-        if session.reply.is_some() {
-            return Ok(false);
-        }
-
+    pub fn reply(&self, id: &str, text: String) -> Result<bool, StoreError> {
         let reply = Reply {
             text,
             at: SystemTime::now(),
             delivered_at: None,
             ack: None,
         };
-        session.reply = Some(reply.clone());
-        for waiter in session.waiters.drain(..) {
-            // A dropped receiver just means that `wait` gave up.
-            let _ = waiter.send(reply.clone());
+        let reply_to_send = reply.clone();
+        let accepted = self.mutate(|sessions| {
+            let session = sessions.get_mut(id).ok_or(UnknownSession)?;
+            if session.reply.is_some() {
+                return Ok(false);
+            }
+            session.reply = Some(reply);
+            Ok(true)
+        })?;
+
+        if accepted {
+            let waiters = self.lock().waiters.remove(id).unwrap_or_default();
+            for waiter in waiters {
+                // A dropped receiver just means that `wait` gave up.
+                let _ = waiter.send(reply_to_send.clone());
+            }
         }
-        Ok(true)
+        Ok(accepted)
     }
 
     /// Marks a session's reply as delivered to an agent process, returning it.
@@ -495,14 +587,15 @@ impl Store {
     /// original stamp, so a re-fetch does not look like a fresh delivery. This
     /// claims only that the bytes left the daemon — see [`Store::ack`] for the
     /// claim that something read them.
-    pub fn mark_delivered(&self, id: &str) -> Result<Option<Reply>, UnknownSession> {
-        let mut sessions = self.lock();
-        let session = sessions.get_mut(id).ok_or(UnknownSession)?;
-        let Some(reply) = session.reply.as_mut() else {
-            return Ok(None);
-        };
-        reply.delivered_at.get_or_insert_with(SystemTime::now);
-        Ok(Some(reply.clone()))
+    pub fn mark_delivered(&self, id: &str) -> Result<Option<Reply>, StoreError> {
+        self.mutate(|sessions| {
+            let session = sessions.get_mut(id).ok_or(UnknownSession)?;
+            let Some(reply) = session.reply.as_mut() else {
+                return Ok(None);
+            };
+            reply.delivered_at.get_or_insert_with(SystemTime::now);
+            Ok(Some(reply.clone()))
+        })
     }
 
     /// Records an agent's acknowledgement that it read the reply.
@@ -510,19 +603,20 @@ impl Store {
     /// Returns `Ok(false)` when there is no reply to acknowledge: an ack without
     /// one is a bug in the agent, not something to record. A later ack replaces
     /// an earlier one, so an agent can report progress more than once.
-    pub fn ack(&self, id: &str, note: String) -> Result<bool, UnknownSession> {
-        let mut sessions = self.lock();
-        let session = sessions.get_mut(id).ok_or(UnknownSession)?;
-        let Some(reply) = session.reply.as_mut() else {
-            return Ok(false);
-        };
-        // An ack implies delivery even if the agent got the text some other way.
-        reply.delivered_at.get_or_insert_with(SystemTime::now);
-        reply.ack = Some(Ack {
-            note,
-            at: SystemTime::now(),
-        });
-        Ok(true)
+    pub fn ack(&self, id: &str, note: String) -> Result<bool, StoreError> {
+        self.mutate(|sessions| {
+            let session = sessions.get_mut(id).ok_or(UnknownSession)?;
+            let Some(reply) = session.reply.as_mut() else {
+                return Ok(false);
+            };
+            // An ack implies delivery even if the agent got the text some other way.
+            reply.delivered_at.get_or_insert_with(SystemTime::now);
+            reply.ack = Some(Ack {
+                note,
+                at: SystemTime::now(),
+            });
+            Ok(true)
+        })
     }
 
     /// Adds a line comment, returning it with its assigned id.
@@ -532,7 +626,7 @@ impl Store {
         anchor: Anchor,
         snippet: String,
         text: String,
-    ) -> Result<Comment, UnknownSession> {
+    ) -> Result<Comment, StoreError> {
         let Anchor {
             file,
             target,
@@ -540,26 +634,27 @@ impl Store {
             end_line,
             side,
         } = anchor;
-        let mut sessions = self.lock();
-        let session = sessions.get_mut(id).ok_or(UnknownSession)?;
-        // Ids are per session and monotonic, so a page can address the comment
-        // it just made without a round trip for a name.
-        let next = session.comments.last().map_or(1, |last| last.id + 1);
-        let comment = Comment {
-            id: next,
-            file,
-            target,
-            line,
-            // A range that covers one line is not a range: normalised away so
-            // the common case has one representation.
-            end_line: end_line.filter(|end| *end > line),
-            side,
-            snippet,
-            text,
-            at: SystemTime::now(),
-        };
-        session.comments.push(comment.clone());
-        Ok(comment)
+        self.mutate(|sessions| {
+            let session = sessions.get_mut(id).ok_or(UnknownSession)?;
+            // Ids are per session and monotonic, so a page can address the comment
+            // it just made without a round trip for a name.
+            let next = session.comments.last().map_or(1, |last| last.id + 1);
+            let comment = Comment {
+                id: next,
+                file,
+                target,
+                line,
+                // A range that covers one line is not a range: normalised away so
+                // the common case has one representation.
+                end_line: end_line.filter(|end| *end > line),
+                side,
+                snippet,
+                text,
+                at: SystemTime::now(),
+            };
+            session.comments.push(comment.clone());
+            Ok(comment)
+        })
     }
 
     /// Every session that has a reply, newest first.
@@ -571,6 +666,7 @@ impl Store {
     pub fn replied(&self) -> Vec<(String, String, Reply, usize)> {
         let mut items: Vec<_> = self
             .lock()
+            .sessions
             .values()
             .filter_map(|s| {
                 let reply = s.reply.clone()?;
@@ -592,7 +688,13 @@ impl Store {
 
     /// A session's comments, oldest first.
     pub fn comments(&self, id: &str) -> Result<Vec<Comment>, UnknownSession> {
-        Ok(self.lock().get(id).ok_or(UnknownSession)?.comments.clone())
+        Ok(self
+            .lock()
+            .sessions
+            .get(id)
+            .ok_or(UnknownSession)?
+            .comments
+            .clone())
     }
 
     /// Registers interest in a session's reply.
@@ -601,13 +703,13 @@ impl Store {
     /// starts after the user has replied does not hang.
     pub fn subscribe(&self, id: &str) -> Result<oneshot::Receiver<Reply>, UnknownSession> {
         let (tx, rx) = oneshot::channel();
-        let mut sessions = self.lock();
-        let session = sessions.get_mut(id).ok_or(UnknownSession)?;
+        let mut inner = self.lock();
+        let session = inner.sessions.get(id).ok_or(UnknownSession)?;
         match &session.reply {
             Some(reply) => {
                 let _ = tx.send(reply.clone());
             }
-            None => session.waiters.push(tx),
+            None => inner.waiters.entry(id.to_owned()).or_default().push(tx),
         }
         Ok(rx)
     }
@@ -616,6 +718,7 @@ impl Store {
     pub fn summaries(&self) -> Vec<(String, String, &'static str, bool)> {
         let mut items: Vec<_> = self
             .lock()
+            .sessions
             .values()
             .map(|s| {
                 (
@@ -641,11 +744,173 @@ impl Store {
         sessions.retain(|_, session| !session.expired(ttl, now));
     }
 
+    /// Applies a durable mutation. Persistent stores write a complete candidate
+    /// snapshot before exposing it in memory, so a failed write cannot leave the
+    /// running daemon ahead of what a restart would restore.
+    fn mutate<T>(
+        &self,
+        change: impl FnOnce(&mut HashMap<String, Session>) -> Result<T, UnknownSession>,
+    ) -> Result<T, StoreError> {
+        let mut inner = self.lock();
+        let output = if let Some(path) = &self.state_path {
+            let mut candidate = inner.sessions.clone();
+            let output = change(&mut candidate)?;
+            Self::write_state(path, &candidate).map_err(StoreError::Persistence)?;
+            inner.sessions = candidate;
+            output
+        } else {
+            change(&mut inner.sessions)?
+        };
+
+        let StoreInner { sessions, waiters } = &mut *inner;
+        waiters.retain(|id, _| sessions.contains_key(id));
+        Ok(output)
+    }
+
+    fn decode_state(path: &Path, bytes: &[u8]) -> AnyResult<HashMap<String, Session>> {
+        let header: StateHeader = serde_json::from_slice(bytes)
+            .with_context(|| format!("parsing wdyt state header at {}", path.display()))?;
+        anyhow::ensure!(
+            header.version == STATE_VERSION,
+            "unsupported wdyt state version {} at {} (this binary supports version {})",
+            header.version,
+            path.display(),
+            STATE_VERSION
+        );
+
+        let state: StateFileV1 = serde_json::from_slice(bytes)
+            .with_context(|| format!("parsing wdyt state at {}", path.display()))?;
+        anyhow::ensure!(
+            state.version == STATE_VERSION,
+            "wdyt state version changed while parsing {}",
+            path.display()
+        );
+        let mut sessions = HashMap::with_capacity(state.sessions.len());
+        for session in state.sessions {
+            let id = session.id.clone();
+            anyhow::ensure!(
+                sessions.insert(id.clone(), session).is_none(),
+                "duplicate session id {id:?} in {}",
+                path.display()
+            );
+        }
+        Ok(sessions)
+    }
+
+    fn acquire_state_lock(path: &Path) -> AnyResult<std::fs::File> {
+        let parent = path
+            .parent()
+            .context("wdyt state path has no parent directory")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating wdyt state directory {}", parent.display()))?;
+
+        let mut lock_name = path
+            .file_name()
+            .context("wdyt state path has no file name")?
+            .to_os_string();
+        lock_name.push(".lock");
+        let lock_path = path.with_file_name(lock_name);
+
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&lock_path)
+            .with_context(|| format!("opening wdyt state lock {}", lock_path.display()))?;
+        file.try_lock().with_context(|| {
+            format!(
+                "locking wdyt state at {} (another daemon may already be using it)",
+                path.display()
+            )
+        })?;
+        Ok(file)
+    }
+
+    fn write_state(path: &Path, sessions: &HashMap<String, Session>) -> AnyResult<()> {
+        let parent = path
+            .parent()
+            .context("wdyt state path has no parent directory")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating wdyt state directory {}", parent.display()))?;
+
+        let mut ordered: Vec<_> = sessions.values().collect();
+        ordered.sort_by_key(|session| (session.created, session.id.as_str()));
+        let state = StateFileRef {
+            version: STATE_VERSION,
+            sessions: ordered,
+        };
+        let mut bytes = serde_json::to_vec(&state).context("serializing wdyt state")?;
+        bytes.push(b'\n');
+
+        let temp_path = path.with_extension(
+            path.extension()
+                .map(|extension| format!("{}.tmp", extension.to_string_lossy()))
+                .unwrap_or_else(|| "tmp".to_owned()),
+        );
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .with_context(|| format!("opening temporary state file {}", temp_path.display()))?;
+        file.write_all(&bytes)
+            .with_context(|| format!("writing temporary state file {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing temporary state file {}", temp_path.display()))?;
+        drop(file);
+        std::fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "replacing wdyt state {} with {}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
+        Ok(())
+    }
+
     /// A poisoned lock means another thread panicked while holding it. The
     /// guarded map is still structurally sound, so recovering keeps the daemon
     /// serving instead of turning one bad request into a dead server.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Session>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, StoreInner> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[derive(Debug)]
+pub enum StoreError {
+    UnknownSession,
+    Persistence(anyhow::Error),
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownSession => f.write_str("no such session"),
+            Self::Persistence(error) => write!(f, "persisting wdyt state: {error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UnknownSession => None,
+            Self::Persistence(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+impl From<UnknownSession> for StoreError {
+    fn from(_: UnknownSession) -> Self {
+        Self::UnknownSession
     }
 }
 
@@ -785,7 +1050,7 @@ mod tests {
         let store = Store::new(Some(Duration::from_secs(60)));
         let stale = store.insert("stale".into(), None, demo());
         // Backdate past the TTL.
-        store.lock().get_mut(&stale).unwrap().created =
+        store.lock().sessions.get_mut(&stale).unwrap().created =
             SystemTime::now() - Duration::from_secs(3600);
 
         let fresh = store.insert("fresh".into(), None, demo());
@@ -1032,5 +1297,140 @@ mod tests {
         let second = store.insert("second".into(), None, demo());
         let ids: Vec<_> = store.summaries().into_iter().map(|s| s.0).collect();
         assert_eq!(ids, vec![second, first]);
+    }
+
+    #[test]
+    fn persistent_store_restores_the_complete_reply_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        let store = Store::open(&path, None).unwrap();
+        let id = store.insert_new(NewSession {
+            note: Some("look closely".into()),
+            origin: crate::zellij_origin::Origin {
+                cwd: Some("/work/repo".into()),
+                ..Default::default()
+            },
+            theme: Some("GitHub".into()),
+            brief: Some("<p>start here</p>".into()),
+            brief_sources: vec!["start here".into()],
+            ..NewSession::new("durable".into(), demo())
+        });
+        store.reply(&id, "ship it".into()).unwrap();
+        store.mark_delivered(&id).unwrap();
+        store.ack(&id, "running the final checks".into()).unwrap();
+        store
+            .comment(
+                &id,
+                Anchor::line("src/lib.rs".into(), 4, Side::New),
+                "let answer = 42;".into(),
+                "why 42?".into(),
+            )
+            .unwrap();
+        drop(store);
+
+        let restored = Store::open(&path, None).unwrap();
+        let session = restored.with(&id, Clone::clone).expect("session restored");
+        assert_eq!(session.title, "durable");
+        assert_eq!(session.note.as_deref(), Some("look closely"));
+        assert_eq!(session.origin.cwd.as_deref(), Some("/work/repo"));
+        assert_eq!(session.theme.as_deref(), Some("GitHub"));
+        assert_eq!(session.brief_sources, vec!["start here"]);
+        assert_eq!(session.comments.len(), 1);
+        let reply = session.reply.expect("reply restored");
+        assert_eq!(reply.text, "ship it");
+        assert!(reply.delivered_at.is_some());
+        assert_eq!(
+            reply.ack.expect("ack restored").note,
+            "running the final checks"
+        );
+
+        let file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(file["version"], STATE_VERSION);
+        assert_eq!(file["sessions"][0]["id"], id);
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "atomic-write temporary file was left behind"
+        );
+    }
+
+    #[test]
+    fn unsupported_state_version_is_preserved_and_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        let bytes = br#"{"version":2,"sessions":[]}"#;
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = Store::open(&path, None).err().expect("version 2 accepted");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported wdyt state version 2"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn persistent_store_excludes_a_second_writer_for_every_clones_lifetime() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        let store = Store::open(&path, None).unwrap();
+        let clone = store.clone();
+        drop(store);
+
+        let error = Store::open(&path, None)
+            .err()
+            .expect("second writer acquired the state lock");
+        assert!(
+            error
+                .to_string()
+                .contains("another daemon may already be using it"),
+            "{error:#}"
+        );
+
+        drop(clone);
+        Store::open(&path, None).expect("state lock was not released on final drop");
+    }
+
+    #[test]
+    fn expired_sessions_are_pruned_when_state_is_loaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        let store = Store::open(&path, None).unwrap();
+        let id = store.insert("old".into(), None, demo());
+        drop(store);
+
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file["sessions"][0]["created"] = 0.into();
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let restored = Store::open(&path, Some(Duration::from_secs(60))).unwrap();
+        assert!(!restored.exists(&id));
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(rewritten["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn failed_persistence_does_not_change_live_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state");
+        let path = state_directory.join("sessions.json");
+        let store = Store::open(&path, None).unwrap();
+        let id = store.insert("pending".into(), None, demo());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(state_directory.join("sessions.json.lock")).unwrap();
+        std::fs::remove_dir(&state_directory).unwrap();
+        std::fs::write(&state_directory, b"not a directory").unwrap();
+
+        let error = store.reply(&id, "must not leak".into()).unwrap_err();
+        assert!(matches!(error, StoreError::Persistence(_)));
+        assert!(
+            store.with(&id, |session| session.reply.is_none()).unwrap(),
+            "failed disk mutation became visible in memory"
+        );
     }
 }

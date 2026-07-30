@@ -269,9 +269,17 @@ wdyt serve         # run the daemon in the foreground
 Any session page also serves `/s/<id>/raw` — the plain source, or for a diff the
 reconstructed patch.
 
-The daemon starts automatically on first use and holds sessions in memory, so
-restarting it drops them. Sessions expire after `session_ttl_hours` (24 by
-default; set it to nothing to keep them for the daemon's lifetime).
+The daemon starts automatically on first use and persists live sessions to
+`$XDG_STATE_HOME/wdyt/sessions.json` (normally
+`~/.local/state/wdyt/sessions.json`). Restarting restores their content, replies,
+comments, and acknowledgement state. Sessions expire after `session_ttl_hours`
+(24 by default; set it to nothing to keep them indefinitely).
+
+The state file is an atomically replaced, versioned JSON snapshot. An active
+`wdyt wait` disconnects during a restart and must be rerun, but it reconnects to
+the restored session id. Set `WDYT_STATE_PATH` to use a different file, such as
+`WDYT_STATE_PATH=/tmp/wdyt-test/sessions.json` for an isolated test daemon.
+A sibling `.lock` file prevents two daemons from writing the same snapshot.
 
 ## The reply box
 

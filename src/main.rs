@@ -334,7 +334,8 @@ async fn run() -> Result<()> {
             let ttl = config
                 .session_ttl_hours
                 .map(|h| Duration::from_secs(h * 3600));
-            wdyt::server::serve(&config, Store::new(ttl)).await
+            let store = Store::open(Config::state_path()?, ttl)?;
+            wdyt::server::serve(&config, store).await
         }
 
         Command::Port { all } => {

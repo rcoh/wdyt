@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 use topcoat::Result;
 use topcoat::context::{Cx, app_context};
 use topcoat::router::content::Json;
-use topcoat::router::error::{bad_request, not_found};
+use topcoat::router::error::{bad_request, internal_server_error, not_found};
 use topcoat::router::{Router, page, path_param, route};
 use topcoat::view::view;
 
 use crate::config::Config;
 use crate::render::{ThemeColors, theme, theme_colors};
-use crate::session::{Anchor, Comment, Content, Reply, Session, Side, Store};
+use crate::session::{Anchor, Comment, Content, Reply, Session, Side, Store, StoreError};
 use crate::ui::{Raw, code_file, diff_hunk, shell};
 
 /// Values shared by every request.
@@ -111,16 +111,19 @@ async fn create_route(cx: &Cx, Json(input): Json<CreateSession>) -> Result<Json<
         return Err(bad_request(msg).into());
     }
 
-    let id = state(cx).store.insert_new(crate::session::NewSession {
-        note: input.note,
-        // The daemon is long-lived and shared, so it cannot detect this itself:
-        // its own cwd and pane are wherever it happened to be started.
-        origin: input.origin.unwrap_or_default(),
-        theme: input.theme,
-        brief: input.brief,
-        brief_sources: input.brief_sources,
-        ..crate::session::NewSession::new(input.title, input.content)
-    });
+    let id = state(cx)
+        .store
+        .try_insert_new(crate::session::NewSession {
+            note: input.note,
+            // The daemon is long-lived and shared, so it cannot detect this itself:
+            // its own cwd and pane are wherever it happened to be started.
+            origin: input.origin.unwrap_or_default(),
+            theme: input.theme,
+            brief: input.brief,
+            brief_sources: input.brief_sources,
+            ..crate::session::NewSession::new(input.title, input.content)
+        })
+        .map_err(store_error)?;
     Ok(Json(CreatedSession { id }))
 }
 
@@ -154,10 +157,7 @@ async fn await_reply_route(cx: &Cx) -> Result<Json<AwaitedReply>> {
     // Stamped only once the bytes are actually going out: a peek that times out
     // has delivered nothing.
     let reply = if arrived {
-        state(cx)
-            .store
-            .mark_delivered(id)
-            .map_err(|_| not_found())?
+        state(cx).store.mark_delivered(id).map_err(store_error)?
     } else {
         None
     };
@@ -175,10 +175,7 @@ async fn await_reply_route(cx: &Cx) -> Result<Json<AwaitedReply>> {
 #[route(POST "/api/sessions/{session_id}/collect")]
 async fn collect_route(cx: &Cx) -> Result<Json<AwaitedReply>> {
     let id = path_param::<SessionId>(cx)?;
-    let reply = state(cx)
-        .store
-        .mark_delivered(id)
-        .map_err(|_| not_found())?;
+    let reply = state(cx).store.mark_delivered(id).map_err(store_error)?;
     Ok(Json(AwaitedReply {
         replied: reply.is_some(),
         reply,
@@ -208,7 +205,7 @@ async fn ack_route(cx: &Cx, Json(input): Json<AckInput>) -> Result<Json<Acked>> 
     let acked = state(cx)
         .store
         .ack(id, note.to_owned())
-        .map_err(|_| not_found())?;
+        .map_err(store_error)?;
     if !acked {
         return Err(bad_request("there is no reply on this session to acknowledge").into());
     }
@@ -373,7 +370,7 @@ async fn comment_route(cx: &Cx, Json(mut input): Json<CommentInput>) -> Result<J
     let comment = state(cx)
         .store
         .comment(id, anchor, snippet, text)
-        .map_err(|_| not_found())?;
+        .map_err(store_error)?;
     Ok(Json(comment))
 }
 
@@ -630,6 +627,16 @@ pub async fn serve(config: &Config, store: Store) -> AnyResult<()> {
 
 fn state(cx: &Cx) -> &State {
     app_context::<State>(cx)
+}
+
+fn store_error(error: StoreError) -> topcoat::Error {
+    match error {
+        StoreError::UnknownSession => not_found().into(),
+        error @ StoreError::Persistence(_) => {
+            eprintln!("wdyt: {error:#}");
+            internal_server_error(error).into()
+        }
+    }
 }
 
 // --- Pages ------------------------------------------------------------------
@@ -1059,7 +1066,7 @@ async fn reply_route(cx: &Cx, Json(input): Json<ReplyInput>) -> Result<Json<Repl
             text: String::new(),
             message: Some("this session already has a reply".to_owned()),
         })),
-        Err(_) => Err(not_found().into()),
+        Err(error) => Err(store_error(error)),
     }
 }
 

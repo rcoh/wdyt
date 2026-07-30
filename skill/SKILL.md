@@ -83,15 +83,14 @@ one session.
 - **Reuse the running daemon.** Before doing anything drastic, `wdyt list` shows
   the daemon URL and live sessions. Just run another content command to add a
   session — they coexist.
-- **Never kill/restart the daemon to "reset" it.** Sessions live in memory, so
-  killing it (`pkill wdyt`) drops *every* session and invalidates all `/s/<id>`
-  links. If you must rebuild/reinstall the binary, expect to **republish** your
-  docs afterward (new session ids).
+- **Never kill/restart the daemon to "reset" it.** Sessions are persisted and
+  restored with the same ids, so restart is not a reset. An active `wdyt wait`
+  disconnects and must be rerun after the daemon returns.
 - **Don't spawn stray daemons.** Running `wdyt serve` from another checkout or
   worktree starts a *second* daemon on a *different* port, fragmenting sessions.
   Stick to the one installed daemon.
-- **Share the root URL, not `/s/<id>`.** If the daemon ever restarts, the root
-  index still works while old per-session links won't.
+- **Share the root URL when practical.** Session ids survive restart, but an
+  exact `/s/<id>` link still assumes the daemon rebinds the same port.
 
 ## Output contract
 
@@ -111,4 +110,5 @@ wdyt config --ports 3000-3010
 wdyt config --theme "GitHub"     # see `wdyt themes`
 ```
 
-Env overrides: `WDYT_WEBHOOK_URL`, `WDYT_PORTS`, `WDYT_THEME`, `WDYT_PUBLIC_HOST`.
+Env overrides: `WDYT_WEBHOOK_URL`, `WDYT_PORTS`, `WDYT_THEME`,
+`WDYT_PUBLIC_HOST`, `WDYT_STATE_PATH`.

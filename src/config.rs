@@ -3,6 +3,7 @@
 //! Every field has an environment-variable override so a one-off run can
 //! change behaviour without editing the file.
 
+use std::ffi::OsStr;
 use std::net::IpAddr;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -149,6 +150,21 @@ impl Config {
         Ok(dirs.config_dir().join("wdyt"))
     }
 
+    pub fn state_dir() -> Result<PathBuf> {
+        let dirs = directories::BaseDirs::new().context("could not determine a home directory")?;
+        // XDG_STATE_HOME is the right home on Linux. Platforms without a
+        // dedicated state directory fall back to their local data directory.
+        let base = dirs.state_dir().unwrap_or_else(|| dirs.data_local_dir());
+        Ok(base.join("wdyt"))
+    }
+
+    pub fn state_path() -> Result<PathBuf> {
+        resolve_state_path(
+            &Self::state_dir()?,
+            std::env::var_os("WDYT_STATE_PATH").as_deref(),
+        )
+    }
+
     pub fn path() -> Result<PathBuf> {
         Ok(Self::config_dir()?.join("config.toml"))
     }
@@ -163,6 +179,16 @@ impl Config {
         let text = toml::to_string_pretty(self)?;
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         Ok(path)
+    }
+}
+
+fn resolve_state_path(default_dir: &Path, override_path: Option<&OsStr>) -> Result<PathBuf> {
+    match override_path {
+        Some(path) => {
+            anyhow::ensure!(!path.is_empty(), "WDYT_STATE_PATH must not be empty");
+            Ok(PathBuf::from(path))
+        }
+        None => Ok(default_dir.join("sessions.json")),
     }
 }
 
@@ -223,6 +249,20 @@ mod tests {
         let config = Config::load_from(Path::new("/nonexistent/wdyt/config.toml")).unwrap();
         assert_eq!(config.port_low, DEFAULT_PORT_LOW);
         assert_eq!(config.port_high, DEFAULT_PORT_HIGH);
+    }
+
+    #[test]
+    fn state_path_can_be_overridden_for_an_isolated_daemon() {
+        let default = Path::new("/home/test/.local/state/wdyt");
+        assert_eq!(
+            resolve_state_path(default, None).unwrap(),
+            default.join("sessions.json")
+        );
+        assert_eq!(
+            resolve_state_path(default, Some(OsStr::new("/tmp/wdyt-test/state.json"))).unwrap(),
+            PathBuf::from("/tmp/wdyt-test/state.json")
+        );
+        assert!(resolve_state_path(default, Some(OsStr::new(""))).is_err());
     }
 
     #[test]
