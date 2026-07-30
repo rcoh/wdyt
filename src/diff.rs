@@ -325,10 +325,7 @@ pub fn review_rank(label: &str) -> u8 {
         "poetry.lock",
         "go.sum",
     ];
-    if LOCKFILES.contains(&name.as_str())
-        || name.ends_with(".min.js")
-        || name.ends_with(".map")
-    {
+    if LOCKFILES.contains(&name.as_str()) || name.ends_with(".min.js") || name.ends_with(".map") {
         return LOW_SIGNAL;
     }
 
@@ -356,8 +353,8 @@ pub fn review_rank(label: &str) -> u8 {
         .map(|e| e.to_ascii_lowercase());
     match ext.as_deref() {
         Some(
-            "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "c" | "h" | "cpp"
-            | "cc" | "cxx" | "hpp" | "rb" | "swift" | "kt" | "scala" | "cs" | "php" | "sh",
+            "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java" | "c" | "h" | "cpp" | "cc"
+            | "cxx" | "hpp" | "rb" | "swift" | "kt" | "scala" | "cs" | "php" | "sh",
         ) => SOURCE,
         Some("md" | "toml" | "yaml" | "yml" | "json") => DOC_CONFIG,
         // An unknown or extensionless file is treated as middling: not clearly

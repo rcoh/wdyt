@@ -58,7 +58,13 @@ impl Client {
         None
     }
 
-    /// Whether a showme daemon — not merely *something* — answers at `base`.
+    /// Whether a wdyt daemon — not merely *something* — answers at `base`.
+    ///
+    /// Checks both the identifying marker and the protocol version. A daemon
+    /// that carries the marker but lacks a compatible protocol version is
+    /// treated as stale (returns `false`), so the client will skip it and
+    /// start a new one. This prevents silent feature loss when a newer client
+    /// encounters an older daemon.
     async fn probe(&self, base: &str) -> bool {
         let Ok(response) = self
             .http
@@ -74,10 +80,20 @@ impl Client {
         }
         // The range is full of other people's servers, several of which answer
         // 200 on `/health`. Only the marker identifies ours.
-        response
-            .text()
-            .await
-            .is_ok_and(|body| body.contains(crate::server::HEALTH_MARKER))
+        let Ok(body) = response.text().await else {
+            return false;
+        };
+        if !body.contains(crate::server::HEALTH_MARKER) {
+            return false;
+        }
+        // Protocol version check: a daemon without a protocol field (old daemon)
+        // or with a mismatched version is incompatible.
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+            return false;
+        };
+        json.get("protocol")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|v| v == u64::from(crate::server::PROTOCOL_VERSION))
     }
 
     /// The URL a browser should use for a session, once the daemon is known.
@@ -101,7 +117,7 @@ impl Client {
     async fn require_base(&self) -> Result<String> {
         self.base().await.with_context(|| {
             format!(
-                "no showme daemon on ports {}-{}",
+                "no wdyt daemon on ports {}-{}",
                 self.ports.start(),
                 self.ports.end()
             )
@@ -124,7 +140,7 @@ impl Client {
             .timeout(Duration::from_secs(30))
             .send()
             .await
-            .context("could not reach the showme daemon")?;
+            .context("could not reach the wdyt daemon")?;
 
         anyhow::ensure!(
             response.status().is_success(),
@@ -154,7 +170,7 @@ impl Client {
             .timeout(timeout + Duration::from_secs(15))
             .send()
             .await
-            .context("could not reach the showme daemon")?;
+            .context("could not reach the wdyt daemon")?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             anyhow::bail!("no such session: {id}");
@@ -185,7 +201,7 @@ impl Client {
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .context("could not reach the showme daemon")?;
+            .context("could not reach the wdyt daemon")?;
         anyhow::ensure!(
             response.status().is_success(),
             "daemon returned {}",
@@ -208,7 +224,7 @@ impl Client {
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .context("could not reach the showme daemon")?;
+            .context("could not reach the wdyt daemon")?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             anyhow::bail!("no such session: {id}");
         }
@@ -236,7 +252,7 @@ impl Client {
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .context("could not reach the showme daemon")?;
+            .context("could not reach the wdyt daemon")?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             anyhow::bail!("no such session: {id}");
         }
@@ -257,7 +273,7 @@ impl Client {
             .timeout(Duration::from_secs(10))
             .send()
             .await
-            .context("could not reach the showme daemon")?;
+            .context("could not reach the wdyt daemon")?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             anyhow::bail!("no such session: {id}");
         }
@@ -266,14 +282,14 @@ impl Client {
 
     /// Starts a background daemon if none is running.
     ///
-    /// Agents call `showme code …` directly without thinking about a server,
+    /// Agents call `wdyt code …` directly without thinking about a server,
     /// so the first such call brings one up.
     async fn ensure_daemon(&self) -> Result<()> {
         if self.is_up().await {
             return Ok(());
         }
 
-        let exe = std::env::current_exe().context("could not locate the showme binary")?;
+        let exe = std::env::current_exe().context("could not locate the wdyt binary")?;
         std::process::Command::new(exe)
             .arg("serve")
             // Detached: the daemon outlives this CLI invocation. Its output
@@ -282,7 +298,7 @@ impl Client {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .context("could not start the showme daemon")?;
+            .context("could not start the wdyt daemon")?;
 
         // Poll until it answers.
         for _ in 0..60 {
@@ -291,6 +307,6 @@ impl Client {
                 return Ok(());
             }
         }
-        anyhow::bail!("the showme daemon did not come up; try `showme serve` to see why")
+        anyhow::bail!("the wdyt daemon did not come up; try `wdyt serve` to see why")
     }
 }

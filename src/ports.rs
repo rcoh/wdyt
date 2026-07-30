@@ -35,7 +35,7 @@ pub fn pick(bind: IpAddr, range: impl IntoIterator<Item = u16>, reserved: &[u16]
         .with_context(|| {
             format!(
                 "no free port in {low}-{high}. Free one up, or widen the range with \
-                 `showme config --ports LOW-HIGH`"
+                 `wdyt config --ports LOW-HIGH`"
             )
         })
 }

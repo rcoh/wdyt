@@ -5,7 +5,7 @@ use topcoat::context::Cx;
 use topcoat::view::{NodeViewParts, PartsWriter, component, view};
 
 use crate::render::ThemeColors;
-use crate::session::{Comment, Hunk, LineKind, Reply};
+use crate::session::{Comment, Hunk, LineKind, Reply, Side};
 
 /// Pre-rendered HTML injected verbatim.
 ///
@@ -135,9 +135,98 @@ nav.files a {{
   border: 1px solid transparent;
 }}
 nav.files a:hover {{ border-color: var(--border); }}
+/* Active file indicator: visible on both horizontal (mobile) and vertical
+   (desktop sidebar) nav so tracking works at every breakpoint. */
+nav.files a.active {{
+  background: var(--surface); border-color: var(--border);
+  color: var(--accent); font-weight: 600;
+}}
 /* An anchored jump must not land under the sticky nav. Generous enough to clear
    it when it has wrapped to a second row on a wide diff. */
 section.file, section.doc {{ scroll-margin-top: 92px; }}
+
+/* File sidebar (desktop) -------------------------------------------------- */
+/* On wide screens with multiple files, a vertical sticky sidebar replaces the
+   horizontal chip bar. The horizontal bar remains as a compact fallback on
+   narrower screens, and both live inside the same `nav.files` element so
+   anchor links and guided-review fragment refs keep working. */
+@media (min-width: 1380px) {{
+  body:not(.framed):not(.nochrome) nav.files.has-sidebar {{
+    position: fixed; top: 56px; left: 0; bottom: 0;
+    width: 200px; z-index: 4;
+    display: flex; flex-direction: column; flex-wrap: nowrap;
+    gap: 2px; padding: 12px 10px;
+    overflow-y: auto; overflow-x: hidden;
+    border-bottom: none; border-right: 1px solid var(--border);
+    box-shadow: none;
+  }}
+  body:not(.framed):not(.nochrome) nav.files.has-sidebar a {{
+    display: block; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; padding: 5px 8px;
+  }}
+  /* The main content shifts right to make room for the sidebar. */
+  body:not(.framed):not(.nochrome).has-file-sidebar main {{
+    margin-left: 200px;
+  }}
+  body:not(.framed):not(.nochrome).has-file-sidebar section.brief {{
+    margin-left: 200px;
+    padding-left: max(20px, calc((100% - 200px - 1100px) / 2 + 20px));
+  }}
+  /* Anchor offset accounts for only the filename header, not the top nav. */
+  body:not(.framed):not(.nochrome).has-file-sidebar section.file,
+  body:not(.framed):not(.nochrome).has-file-sidebar section.doc {{
+    scroll-margin-top: 8px;
+  }}
+  body:not(.framed):not(.nochrome).has-file-sidebar section.file .filename {{
+    top: 0;
+  }}
+}}
+/* On narrower screens and mobile the sidebar is not shown; the horizontal
+   sticky bar remains as a single-row scrollable strip so it never obscures
+   content even on very narrow viewports. */
+@media (max-width: 1379px) {{
+  nav.files.has-sidebar {{
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+  }}
+  nav.files.has-sidebar a {{
+    white-space: nowrap; flex: 0 0 auto;
+  }}
+  /* With a single-row strip (~45px), the filename header sticks below it and
+     the file section must clear both. Derived for one row height. */
+  body:not(.framed) nav.files.has-sidebar ~ main section.file .filename {{
+    top: 45px;
+  }}
+  body:not(.framed) nav.files.has-sidebar ~ main section.file,
+  body:not(.framed) nav.files.has-sidebar ~ main section.doc {{
+    scroll-margin-top: 92px;
+  }}
+}}
+
+/* Jump-to-top ------------------------------------------------------------- */
+/* An always-available button when scrolled down past the first screen, so the
+   user can get back to the top without scrolling through a long diff. */
+#jump-top {{
+  display: none;
+  position: fixed; bottom: 80px; left: 20px; z-index: 2147482998;
+  width: 36px; height: 36px; padding: 0;
+  border: 1px solid var(--border-strong); border-radius: 999px;
+  background: var(--surface); color: var(--muted);
+  font: 16px/34px ui-sans-serif, system-ui, sans-serif;
+  text-align: center; cursor: pointer;
+  box-shadow: 0 1px 4px rgba(31,30,29,.12);
+  opacity: .7; transition: opacity .15s;
+}}
+#jump-top:hover, #jump-top:focus {{ opacity: 1; color: var(--fg); }}
+#jump-top:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
+#jump-top.visible {{ display: block; }}
+/* On framed pages or when chrome is hidden, adjust position. */
+body.framed #jump-top {{ display: none !important; }}
+@media (max-width: 600px) {{
+  #jump-top {{ left: 12px; bottom: 72px; width: 32px; height: 32px; font-size: 14px; line-height: 30px; }}
+}}
 
 /* Guided review ----------------------------------------------------------- */
 /* The agent's tour of its own work. Measured column and prose type, because it
@@ -213,37 +302,51 @@ table.src.diff tr.hunk td {{
   padding: 3px 14px; white-space: pre; user-select: none;
 }}
 table.src.diff .marker {{ user-select: none; opacity: .65; }}
+/* Comment affordances are shared by the diff and the plain-code listing: both
+   carry `commentable`, so one set of rules drives the `+` button, the inline
+   note box, and the range highlight in either mode. The diff-only tints above
+   stay scoped to `.diff`. */
 /* The comment affordance sits in the code cell's left padding so it cannot
-   shift the code, which would make the diff jump on hover. */
-table.src.diff td.code {{ position: relative; padding-left: 22px; }}
-table.src.diff .addnote {{
+   shift the code, which would make the listing jump on hover. */
+table.src.commentable td.code {{ position: relative; padding-left: 22px; }}
+table.src.commentable .addnote {{
   position: absolute; left: 1px; top: 1px;
   width: 17px; height: 17px; padding: 0; line-height: 15px;
   border: none; border-radius: 4px; cursor: pointer;
   background: var(--accent); color: #fff; font: 600 13px/15px ui-sans-serif, sans-serif;
   opacity: 0; transition: opacity .1s;
 }}
-table.src.diff tr:hover .addnote, table.src.diff .addnote:focus {{ opacity: 1; }}
+table.src.commentable tr:hover .addnote, table.src.commentable .addnote:focus {{ opacity: 1; }}
 /* Comments break out of the code card's monospace world: they are prose. Inset
-   as a card rather than a full-bleed band, so the diff still reads as one
-   continuous listing with a note tucked into it. */
-table.src.diff tr.notes td.code, table.src.diff tr.pending td.code {{
+   as a card rather than a full-bleed band, so the listing still reads as one
+   continuous block with a note tucked into it. */
+table.src.commentable tr.notes td.code, table.src.commentable tr.pending td.code {{
   white-space: normal; padding: 6px 14px 6px 22px;
   background: var(--code-gutter);
   font: 13px/1.55 ui-sans-serif, system-ui, sans-serif;
 }}
-table.src.diff .note, table.src.diff .notebox {{
+table.src.commentable .note, table.src.commentable .notebox {{
   background: var(--surface); color: var(--fg);
   border: 1px solid var(--border-strong); border-left: 2px solid var(--accent);
   border-radius: 0 8px 8px 0; padding: 7px 12px; max-width: 620px;
 }}
-table.src.diff .note {{ margin: 4px 0; }}
-table.src.diff .note .who {{
+table.src.commentable .note {{ margin: 4px 0; }}
+table.src.commentable .note .who {{
   display: block; font-size: 10.5px; text-transform: uppercase;
   letter-spacing: .07em; color: var(--muted);
 }}
+/* A small link to copy the comment's URL: discoverable on hover, stays quiet. */
+table.src.commentable .note .permalink {{
+  float: right; text-decoration: none; color: var(--border-strong);
+  font: 11px/1 ui-monospace, monospace; padding: 2px 4px; border-radius: 3px;
+  opacity: 0; transition: opacity .12s;
+}}
+table.src.commentable .note:hover .permalink,
+table.src.commentable .note .permalink:focus,
+table.src.commentable .note .permalink:focus-visible {{ opacity: 1; }}
+table.src.commentable .note .permalink:hover {{ color: var(--accent); background: var(--bg); }}
 /* Which lines a note covers, when it is more than the one directly above it. */
-table.src.diff .note .who .span {{
+table.src.commentable .note .who .span {{
   margin-left: 6px; text-transform: none; letter-spacing: 0;
   font-family: ui-monospace, monospace; opacity: .85;
 }}
@@ -251,40 +354,75 @@ table.src.diff .note .who .span {{
    Marked with a bar down the gutter rather than a background tint. Tinting fights
    the diff's own colours — an accent-tinted row reads as a deleted one — so the
    row background is left to mean add/remove and nothing else. */
-table.src.diff tr.inrange td.code, table.src.diff tr.selecting td.code {{
+table.src.commentable tr.inrange td.code, table.src.commentable tr.selecting td.code {{
   box-shadow: inset 3px 0 0 var(--accent);
 }}
 /* Mid-drag the whole span also lifts slightly, since nothing is committed yet and
    the feedback has to be unmistakable. */
-table.src.diff tr.selecting td {{
+table.src.commentable tr.selecting td {{
   background: color-mix(in srgb, var(--accent) 10%, var(--code-bg));
 }}
 /* A drag over code would otherwise select text and fight the range. */
-table.src.diff tr.selecting {{ user-select: none; }}
-table.src.diff .notebox {{ display: flex; flex-direction: column; gap: 6px; margin: 4px 0; }}
-table.src.diff .notebox textarea {{
+table.src.commentable tr.selecting {{ user-select: none; }}
+table.src.commentable .notebox {{ display: flex; flex-direction: column; gap: 6px; margin: 4px 0; }}
+table.src.commentable .notebox textarea {{
   width: 100%; min-height: 62px; resize: vertical;
   background: var(--bg); color: var(--fg);
   border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 9px;
   font: 13px/1.5 ui-sans-serif, system-ui, sans-serif;
 }}
-table.src.diff .notebox textarea:focus {{
+table.src.commentable .notebox textarea:focus {{
   outline: none; border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }}
-table.src.diff .notebox .row {{ display: flex; gap: 6px; align-items: center; }}
-table.src.diff .notebox .msg {{ color: #b3452c; font-size: 12px; margin-right: auto; }}
-table.src.diff .notebox button {{
+table.src.commentable .notebox .row {{ display: flex; gap: 6px; align-items: center; }}
+table.src.commentable .notebox .msg {{ color: #b3452c; font-size: 12px; margin-right: auto; }}
+table.src.commentable .notebox button {{
   font: 12.5px/1 ui-sans-serif, system-ui, sans-serif;
   padding: 6px 11px; border-radius: 7px; cursor: pointer;
   border: 1px solid var(--border-strong); background: var(--bg); color: var(--fg);
 }}
-table.src.diff .notebox button.primary {{
+table.src.commentable .notebox button.primary {{
   background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600;
 }}
+/* Keyboard shortcut hint in comment editors: visible but unobtrusive. */
+.kb-hint {{
+  font: 11px/1 ui-sans-serif, system-ui, sans-serif;
+  color: var(--muted); margin-right: auto;
+}}
+.kb-hint abbr {{
+  text-decoration: none; border: none;
+  font: inherit;
+}}
+.doc .doc-notebox .kb-hint {{ margin-right: auto; }}
 .added {{ color: #3f7d58; }}
 .removed {{ color: #b3452c; }}
 nav.files .added, nav.files .removed {{ margin-left: 4px; }}
+
+/* Deep-link highlights ---------------------------------------------------- */
+/* A line targeted by a URL fragment (via :target or the JS-applied class). The
+   gutter shifts to the accent so the scrolled-to line is unmistakable even in a
+   large file. The class form is used by the fragment script for ranges and for
+   hashchange without a reload. */
+table.src tr:target td,
+table.src tr.sel-highlight td {{
+  background: color-mix(in srgb, var(--accent) 14%, var(--code-bg));
+}}
+table.src tr:target td.ln,
+table.src tr.sel-highlight td.ln {{
+  color: var(--accent);
+}}
+/* A linked comment pulses briefly so the eye finds it among a wall of notes. */
+.note.sel-highlight {{
+  animation: wdyt-flash 1.6s ease-out;
+}}
+@keyframes wdyt-flash {{
+  0% {{ background: color-mix(in srgb, var(--accent) 22%, var(--surface)); }}
+  100% {{ background: var(--surface); }}
+}}
+@media (prefers-reduced-motion: reduce) {{
+  .note.sel-highlight {{ animation: none; }}
+}}
 
 /* Docs -------------------------------------------------------------------- */
 .doc {{ font-size: 15px; }}
@@ -299,7 +437,7 @@ nav.files .added, nav.files .removed {{ margin-left: 4px; }}
   font: .875em/1.5 ui-monospace, monospace;
   background: var(--raised); padding: .15em .4em; border-radius: 4px;
 }}
-/* Fenced blocks come out of the same syntect theme as `showme code`, so they
+/* Fenced blocks come out of the same syntect theme as `wdyt code`, so they
    get the code card's colours rather than the page's. */
 .doc pre {{
   background: var(--code-bg); color: var(--code-fg);
@@ -343,6 +481,77 @@ nav.files .added, nav.files .removed {{ margin-left: 4px; }}
    terminate this raw string. */
 .doc a.anchor::after {{ content: '\0023'; }}
 .doc h1:hover a.anchor, .doc h2:hover a.anchor, .doc h3:hover a.anchor {{ opacity: .5; }}
+
+/* Doc comments ------------------------------------------------------------ */
+/* The `+` button on a commentable markdown block. Positioned inside the element
+   it annotates, at the left margin, hidden until hover. Mirrors the code/diff
+   affordance visually. */
+.doc .doc-addnote {{
+  position: absolute; left: -24px; top: 2px;
+  width: 18px; height: 18px; padding: 0; line-height: 16px;
+  border: none; border-radius: 4px; cursor: pointer;
+  background: var(--accent); color: #fff; font: 600 13px/16px ui-sans-serif, sans-serif;
+  opacity: 0; transition: opacity .1s;
+  z-index: 1;
+}}
+.doc [data-sourcepos]:hover > .doc-addnote, .doc .doc-addnote:focus {{ opacity: 1; }}
+/* The note box that appears when the user clicks `+`. */
+.doc .doc-notebox {{
+  background: var(--surface); color: var(--fg);
+  border: 1px solid var(--border-strong); border-left: 2px solid var(--accent);
+  border-radius: 0 8px 8px 0; padding: 10px 12px; margin: 6px 0; max-width: 620px;
+}}
+.doc .doc-notebox textarea {{
+  width: 100%; min-height: 62px; resize: vertical;
+  background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 9px;
+  font: 13px/1.5 ui-sans-serif, system-ui, sans-serif;
+}}
+.doc .doc-notebox textarea:focus {{
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+}}
+.doc .doc-notebox .row {{ display: flex; gap: 6px; align-items: center; margin-top: 6px; }}
+.doc .doc-notebox .msg {{ color: #b3452c; font-size: 12px; margin-right: auto; }}
+.doc .doc-notebox button {{
+  font: 12.5px/1 ui-sans-serif, system-ui, sans-serif;
+  padding: 6px 11px; border-radius: 7px; cursor: pointer;
+  border: 1px solid var(--border-strong); background: var(--bg); color: var(--fg);
+}}
+.doc .doc-notebox button.primary {{
+  background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600;
+}}
+/* Saved comment notes on markdown blocks, reusing the same card style. */
+.doc .doc-notes {{
+  margin: 6px 0;
+}}
+.doc .doc-notes .note {{
+  background: var(--surface); color: var(--fg);
+  border: 1px solid var(--border-strong); border-left: 2px solid var(--accent);
+  border-radius: 0 8px 8px 0; padding: 7px 12px; max-width: 620px;
+  margin: 4px 0;
+}}
+.doc .doc-notes .note .who {{
+  display: block; font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: .07em; color: var(--muted);
+}}
+.doc .doc-notes .note .who .span {{
+  margin-left: 6px; text-transform: none; letter-spacing: 0;
+  font-family: ui-monospace, monospace; opacity: .85;
+}}
+.doc .doc-notes .note .permalink {{
+  float: right; text-decoration: none; color: var(--border-strong);
+  font: 11px/1 ui-monospace, monospace; padding: 2px 4px; border-radius: 3px;
+  opacity: 0; transition: opacity .12s;
+}}
+.doc .doc-notes .note:hover .permalink,
+.doc .doc-notes .note .permalink:focus,
+.doc .doc-notes .note .permalink:focus-visible {{ opacity: 1; }}
+.doc .doc-notes .note .permalink:hover {{ color: var(--accent); background: var(--bg); }}
+/* Deep-linked comment flash in doc notes. */
+.doc .doc-notes .note.sel-highlight {{
+  animation: wdyt-flash 1.6s ease-out;
+}}
 
 /* Framed content ---------------------------------------------------------- */
 /* Both `dir` and `demo` hand the viewport to an iframe: the page itself must
@@ -489,12 +698,12 @@ body.nochrome #chrome-show {{ display: block; }}
 }}
 /* Outstanding: a slow pulse, so a glance tells you it has not moved. */
 #reply .receipt.waiting .dot {{
-  background: var(--accent); animation: showme-pulse 1.8s ease-in-out infinite;
+  background: var(--accent); animation: wdyt-pulse 1.8s ease-in-out infinite;
 }}
 /* Picked up but unacknowledged: amber, and still pulsing. This is where an agent
    that died on a credentials prompt sits, so it must not look like success. */
 #reply .receipt.delivered .dot {{
-  background: #b8860b; animation: showme-pulse 1.8s ease-in-out infinite;
+  background: #b8860b; animation: wdyt-pulse 1.8s ease-in-out infinite;
 }}
 #reply .receipt.delivered {{ color: #8a6508; }}
 #reply .receipt.read .dot {{ background: #3f7d58; }}
@@ -507,7 +716,7 @@ body.nochrome #chrome-show {{ display: block; }}
   font-size: 12px; color: var(--fg); white-space: pre-wrap;
 }}
 #reply .acknote:empty {{ display: none; }}
-@keyframes showme-pulse {{
+@keyframes wdyt-pulse {{
   0%, 100% {{ opacity: 1; }}
   50% {{ opacity: .25; }}
 }}
@@ -527,7 +736,7 @@ body.nochrome #chrome-show {{ display: block; }}
 ///
 /// Written by hand rather than with topcoat's runtime because the runtime's
 /// browser script is served from an asset bundle produced by the `topcoat`
-/// CLI, and showme needs to run from a plain `cargo install`.
+/// CLI, and wdyt needs to run from a plain `cargo install`.
 const REPLY_JS: &str = r#"
 (function () {
   var root = document.getElementById('reply');
@@ -570,7 +779,7 @@ const REPLY_JS: &str = r#"
   // The default corner is often where the framed app keeps its own controls,
   // so the widget can be moved out of the way. The position is remembered per
   // origin, since the same app tends to be reviewed repeatedly.
-  var KEY = 'showme.reply.pos';
+  var KEY = 'wdyt.reply.pos';
 
   function place(x, y) {
     // Clamp into view so it cannot be dragged somewhere unreachable.
@@ -805,7 +1014,7 @@ const CHROME_JS: &str = r#"
   var hide = document.getElementById('chrome-toggle');
   var show = document.getElementById('chrome-show');
   if (!hide || !show) return;
-  var KEY = 'showme.chrome.hidden';
+  var KEY = 'wdyt.chrome.hidden';
 
   function apply(hidden) {
     document.body.classList.toggle('nochrome', hidden);
@@ -827,19 +1036,99 @@ const CHROME_JS: &str = r#"
 })();
 "#;
 
+/// Navigation enhancements: jump-to-top button and sidebar active-file tracking.
+///
+/// The jump-to-top appears after scrolling past the first screenful. The sidebar
+/// highlights the file whose section is currently in view, using IntersectionObserver
+/// for efficiency.
+pub(crate) const NAV_JS: &str = r##"
+(function () {
+  // --- Jump to top ---------------------------------------------------------
+  var btn = document.getElementById('jump-top');
+  if (btn) {
+    var threshold = 300;
+    var ticking = false;
+    function checkScroll() {
+      ticking = false;
+      btn.classList.toggle('visible', window.scrollY > threshold);
+    }
+    window.addEventListener('scroll', function () {
+      if (!ticking) { ticking = true; requestAnimationFrame(checkScroll); }
+    }, { passive: true });
+    btn.addEventListener('click', function () {
+      var prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      window.scrollTo({ top: 0, behavior: prefersReduced ? 'auto' : 'smooth' });
+    });
+    checkScroll();
+  }
+
+  // --- Sidebar active tracking ---------------------------------------------
+  var nav = document.querySelector('nav.files.has-sidebar');
+  if (!nav) return;
+
+  // Add the body class so CSS can shift the main content.
+  document.body.classList.add('has-file-sidebar');
+
+  var links = nav.querySelectorAll('a[href^="#"]');
+  if (!links.length) return;
+
+  // Map section ids to their nav links.
+  var sections = [];
+  for (var i = 0; i < links.length; i++) {
+    var href = links[i].getAttribute('href');
+    if (!href || href.length < 2) continue;
+    var target = document.getElementById(href.slice(1));
+    if (target) sections.push({ el: target, link: links[i] });
+  }
+  if (!sections.length) return;
+
+  var current = null;
+  var observer = new IntersectionObserver(function (entries) {
+    // Find the topmost visible section.
+    var visible = null;
+    for (var j = 0; j < entries.length; j++) {
+      if (entries[j].isIntersecting) {
+        if (!visible || entries[j].boundingClientRect.top < visible.boundingClientRect.top) {
+          visible = entries[j];
+        }
+      }
+    }
+    if (visible) {
+      var id = visible.target.id;
+      if (id !== current) {
+        current = id;
+        for (var k = 0; k < sections.length; k++) {
+          sections[k].link.classList.toggle('active', sections[k].el.id === id);
+        }
+      }
+    }
+  }, { rootMargin: '-10% 0px -70% 0px', threshold: 0 });
+
+  for (var si = 0; si < sections.length; si++) {
+    observer.observe(sections[si].el);
+  }
+})();
+"##;
+
 /// Line comments on a diff.
 ///
 /// The box is opened next to the line rather than in a dialog: a review comment
 /// only makes sense against the code it is about, and moving the eye away from
 /// the line to a modal loses exactly the context that matters.
-const COMMENT_JS: &str = r#"
+pub(crate) const COMMENT_JS: &str = r#"
 (function () {
-  var root = document.getElementById('diff');
+  var root = document.querySelector('[data-comments]');
   if (!root) return;
   var session = root.getAttribute('data-session');
   var open = null;
   // A drag in progress: the `+` it started on, and the row it is currently over.
   var drag = null;
+
+  // --- Helpers for safe integer and range validation -------------------------
+  function safeLineNo(n) {
+    var v = Number(n);
+    return Number.isFinite(v) && v > 0 && v <= Number.MAX_SAFE_INTEGER && v === Math.floor(v) ? v : null;
+  }
 
   function close() {
     if (open) { open.remove(); open = null; }
@@ -852,25 +1141,35 @@ const COMMENT_JS: &str = r#"
   }
 
   // Every commentable row on one side of one file, in document order.
+  // Uses attribute comparison on actual DOM elements rather than string
+  // interpolation into selectors, which is unsafe for paths with quotes.
   function siblings(button) {
     var file = button.getAttribute('data-file');
     var side = button.getAttribute('data-side');
-    var all = root.querySelectorAll(
-      '.addnote[data-file="' + file + '"][data-side="' + side + '"]');
+    var all = root.querySelectorAll('.addnote');
     var rows = [];
-    for (var i = 0; i < all.length; i++) rows.push(all[i]);
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getAttribute('data-file') === file &&
+          all[i].getAttribute('data-side') === side) {
+        rows.push(all[i]);
+      }
+    }
     return rows;
   }
 
   // Highlight what a range would cover while the pointer is still down.
+  // Iterates actual rendered buttons rather than a numeric span, so a hostile
+  // huge range cannot cause unbounded work.
   function preview(from, to) {
     clearPreview();
-    var lo = Math.min(Number(from.getAttribute('data-line')), Number(to.getAttribute('data-line')));
-    var hi = Math.max(Number(from.getAttribute('data-line')), Number(to.getAttribute('data-line')));
+    var lo = safeLineNo(from.getAttribute('data-line'));
+    var hi = safeLineNo(to.getAttribute('data-line'));
+    if (lo == null || hi == null) return;
+    if (lo > hi) { var t = lo; lo = hi; hi = t; }
     var buttons = siblings(from);
     for (var i = 0; i < buttons.length; i++) {
-      var n = Number(buttons[i].getAttribute('data-line'));
-      if (n >= lo && n <= hi) buttons[i].closest('tr').classList.add('selecting');
+      var n = safeLineNo(buttons[i].getAttribute('data-line'));
+      if (n != null && n >= lo && n <= hi) buttons[i].closest('tr').classList.add('selecting');
     }
   }
 
@@ -921,6 +1220,8 @@ const COMMENT_JS: &str = r#"
   function render(comment, into) {
     var note = document.createElement('div');
     note.className = 'note';
+    // Stable anchor so the fragment script can scroll to it.
+    if (comment.id != null) note.id = 'comment-' + comment.id;
     var who = document.createElement('span');
     who.className = 'who';
     who.textContent = 'you';
@@ -928,19 +1229,42 @@ const COMMENT_JS: &str = r#"
     if (comment.end_line && comment.end_line > comment.line) {
       var span = document.createElement('span');
       span.className = 'span';
-      span.textContent = 'L' + comment.line + '–L' + comment.end_line;
+      span.textContent = 'L' + comment.line + '\u2013L' + comment.end_line;
       who.appendChild(span);
     }
     note.appendChild(who);
+    // Discoverable permalink.
+    if (comment.id != null) {
+      var plink = document.createElement('a');
+      plink.className = 'permalink';
+      plink.href = '#comment-' + comment.id;
+      plink.title = 'Link to this comment';
+      plink.textContent = '#';
+      note.appendChild(plink);
+    }
     note.appendChild(document.createTextNode(comment.text));
     into.appendChild(note);
+  }
+
+  // Base64url encode (no padding) for building sel- fragments.
+  function b64encode(s) {
+    return btoa(unescape(encodeURIComponent(s)))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  function selFragment(path, side, start, end) {
+    var enc = b64encode(path);
+    if (end && end !== start) return 'sel-' + enc + '-' + side + '-' + start + '-' + end;
+    return 'sel-' + enc + '-' + side + '-' + start;
   }
 
   function openBox(from, to) {
     // The box hangs below the last line of the range, so the whole passage it is
     // about stays visible above it.
-    var lo = Math.min(Number(from.getAttribute('data-line')), Number(to.getAttribute('data-line')));
-    var hi = Math.max(Number(from.getAttribute('data-line')), Number(to.getAttribute('data-line')));
+    var lo = safeLineNo(from.getAttribute('data-line'));
+    var hi = safeLineNo(to.getAttribute('data-line'));
+    if (lo == null || hi == null) return;
+    if (lo > hi) { var t = lo; lo = hi; hi = t; }
     var last = hi === Number(from.getAttribute('data-line')) ? from : to;
     var line = last.closest('tr');
 
@@ -949,7 +1273,13 @@ const COMMENT_JS: &str = r#"
     close();
     if (!reopen) return;
 
-    var span = hi > lo ? ' (L' + lo + '–L' + hi + ')' : '';
+    // Update the URL fragment to the selection so the range is copyable.
+    var filePath = from.getAttribute('data-file');
+    var side = from.getAttribute('data-side');
+    var frag = selFragment(filePath, side, lo, hi);
+    history.replaceState(null, '', '#' + frag);
+
+    var span = hi > lo ? ' (L' + lo + '\u2013L' + hi + ')' : '';
     var label = hi > lo ? 'Comment on lines ' + lo + ' to ' + hi : 'Comment on this line';
     var row = document.createElement('tr');
     row.className = 'pending';
@@ -958,12 +1288,17 @@ const COMMENT_JS: &str = r#"
       '<td class="code"><div class="notebox">' +
       '<textarea aria-label="' + label + '"></textarea>' +
       '<div class="row"><span class="msg"></span>' +
+      '<kbd class="kb-hint" aria-label="Keyboard shortcuts: ' +
+      (navigator.platform && navigator.platform.indexOf("Mac") > -1 ? "Cmd" : "Ctrl") +
+      '+Enter to send, Escape to cancel">' +
+      '<abbr title="' + (navigator.platform && navigator.platform.indexOf("Mac") > -1 ? "Cmd" : "Ctrl") +
+      '+Enter">' + (navigator.platform && navigator.platform.indexOf("Mac") > -1 ? '\u2318+Enter' : 'Ctrl+Enter') + '</abbr> send \u00B7 <abbr title="Escape">Esc</abbr> cancel</kbd>' +
       '<button type="button" class="cancel">Cancel</button>' +
       '<button type="button" class="primary">Comment</button>' +
       '</div></div></td>';
     line.parentNode.insertBefore(row, line.nextElementSibling);
     row.querySelector('textarea').placeholder =
-      (hi > lo ? 'Comment on these lines' : 'Comment on this line') + span + '…';
+      (hi > lo ? 'Comment on these lines' : 'Comment on this line') + span + '\u2026';
     open = row;
 
     // Keep the covered rows tinted while the box is open, so it is unambiguous
@@ -971,8 +1306,8 @@ const COMMENT_JS: &str = r#"
     if (hi > lo) {
       var buttons = siblings(from);
       for (var i = 0; i < buttons.length; i++) {
-        var n = Number(buttons[i].getAttribute('data-line'));
-        if (n >= lo && n <= hi) buttons[i].closest('tr').classList.add('selecting');
+        var n = safeLineNo(buttons[i].getAttribute('data-line'));
+        if (n != null && n >= lo && n <= hi) buttons[i].closest('tr').classList.add('selecting');
       }
     }
 
@@ -1013,11 +1348,15 @@ const COMMENT_JS: &str = r#"
         if (hi > lo) {
           var buttons = siblings(from);
           for (var i = 0; i < buttons.length; i++) {
-            var n = Number(buttons[i].getAttribute('data-line'));
-            if (n >= lo && n <= hi) buttons[i].closest('tr').classList.add('inrange');
+            var n = safeLineNo(buttons[i].getAttribute('data-line'));
+            if (n != null && n >= lo && n <= hi) buttons[i].closest('tr').classList.add('inrange');
           }
         }
         render(comment, noteRow(anchor).querySelector('td.code'));
+        // Update the URL to point at the new comment for deep-linking.
+        if (comment.id != null) {
+          history.replaceState(null, '', '#comment-' + comment.id);
+        }
       }).catch(function (err) {
         msg.textContent = String(err.message || err);
         submit.disabled = false;
@@ -1026,6 +1365,510 @@ const COMMENT_JS: &str = r#"
   }
 })();
 "#;
+
+/// Deep-link fragment handling.
+///
+/// On page load and on hashchange, parses the URL fragment and either:
+/// - Scrolls to a comment (`#comment-<id>`) and pulses it.
+/// - Scrolls to and highlights a line or range (`#sel-<b64path>-<side>-<line>[-<end>]`).
+/// - Falls through to the browser's native anchor scroll for file sections and
+///   markdown headings.
+///
+/// Also updates the URL fragment when a line number link is clicked (code mode)
+/// or when a comment is saved, so the deep-link is always copy-paste-able.
+const FRAGMENT_JS: &str = r##"
+(function () {
+  // Respect reduced motion preference for scrolling.
+  var scrollBehavior = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    ? 'auto' : 'smooth';
+
+  // Base64url decode (no padding).
+  function b64decode(s) {
+    // Restore padding for atob.
+    var pad = (4 - s.length % 4) % 4;
+    var b64 = s.replace(/-/g, '+').replace(/_/g, '/') + '===='.slice(0, pad);
+    try { return decodeURIComponent(escape(atob(b64))); }
+    catch (e) { return null; }
+  }
+
+  // Base64url encode (no padding).
+  function b64encode(s) {
+    return btoa(unescape(encodeURIComponent(s)))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  // Build a sel fragment for a line or range.
+  function selFragment(path, side, start, end) {
+    var enc = b64encode(path);
+    if (end && end !== start) return 'sel-' + enc + '-' + side + '-' + start + '-' + end;
+    return 'sel-' + enc + '-' + side + '-' + start;
+  }
+
+  // Safe positive integer check: must be finite, positive, and within safe range.
+  function safeInt(n) {
+    return Number.isFinite(n) && n > 0 && n <= Number.MAX_SAFE_INTEGER && n === Math.floor(n);
+  }
+
+  // Parse a sel fragment. Returns {path, side, start, end} or null.
+  function parseSel(frag) {
+    if (frag.indexOf('sel-') !== 0) return null;
+    // Reject oversized fragments to prevent unbounded work.
+    if (frag.length > 8192) return null;
+    var rest = frag.slice(4);
+    // Split from right: last 2 or 3 segments are side + line(s).
+    var parts = rest.split('-');
+    if (parts.length < 3) return null;
+    // Try range first (last is end, second-last is start, third-last is side).
+    var last = parts[parts.length - 1];
+    var secondLast = parts[parts.length - 2];
+    var thirdLast = parts[parts.length - 3];
+    // Check if last two are numbers and third-last is side.
+    if (/^\d+$/.test(last) && /^\d+$/.test(secondLast) &&
+        (thirdLast === 'old' || thirdLast === 'new')) {
+      var encodedPath = parts.slice(0, parts.length - 3).join('-');
+      if (!encodedPath || encodedPath.length > 4096) return null;
+      var path = b64decode(encodedPath);
+      if (!path) return null;
+      var start = parseInt(secondLast, 10);
+      var end = parseInt(last, 10);
+      if (!safeInt(start) || !safeInt(end)) return null;
+      return { path: path, side: thirdLast, start: Math.min(start, end), end: Math.max(start, end) };
+    }
+    // Single line: last is line, second-last is side.
+    if (/^\d+$/.test(last) && (secondLast === 'old' || secondLast === 'new')) {
+      var encodedPath2 = parts.slice(0, parts.length - 2).join('-');
+      if (!encodedPath2 || encodedPath2.length > 4096) return null;
+      var path2 = b64decode(encodedPath2);
+      if (!path2) return null;
+      var line = parseInt(last, 10);
+      if (!safeInt(line)) return null;
+      return { path: path2, side: secondLast, start: line, end: line };
+    }
+    return null;
+  }
+
+  function clearHighlights() {
+    // Only clear highlights within code/diff areas (under [data-comments]),
+    // never doc/brief highlights which are owned by the doc comment script.
+    var root = document.querySelector('[data-comments]');
+    if (!root) return;
+    var els = root.querySelectorAll('.sel-highlight');
+    for (var i = 0; i < els.length; i++) els[i].classList.remove('sel-highlight');
+    // Also clear any comment highlight (comment-* anchors live in code/diff).
+    var commentEls = document.querySelectorAll('.wdyt-comment.sel-highlight');
+    for (var j = 0; j < commentEls.length; j++) commentEls[j].classList.remove('sel-highlight');
+  }
+
+  function highlightComment(id) {
+    var el = document.getElementById('comment-' + id);
+    if (!el) return false;
+    clearHighlights();
+    el.classList.add('sel-highlight');
+    el.scrollIntoView({ block: 'center', behavior: scrollBehavior });
+    return true;
+  }
+
+  function highlightSelection(sel) {
+    // Find matching rows by iterating actual rendered addnote buttons rather
+    // than a numeric range, so a hostile huge range cannot cause unbounded work.
+    var root = document.querySelector('[data-comments]');
+    if (!root) return false;
+    var buttons = root.querySelectorAll('.addnote');
+    var found = false;
+    for (var i = 0; i < buttons.length; i++) {
+      var btn = buttons[i];
+      if (btn.getAttribute('data-file') !== sel.path) continue;
+      if (btn.getAttribute('data-side') !== sel.side) continue;
+      var n = parseInt(btn.getAttribute('data-line'), 10);
+      if (n >= sel.start && n <= sel.end) {
+        var row = btn.closest('tr');
+        if (row) {
+          if (!found) clearHighlights();
+          row.classList.add('sel-highlight');
+          if (!found) {
+            row.scrollIntoView({ block: 'center', behavior: scrollBehavior });
+            found = true;
+          }
+        }
+      }
+    }
+    return found;
+  }
+
+  function handleFragment() {
+    var hash = location.hash.slice(1);
+    if (!hash) return;
+    // Comment anchor.
+    if (hash.indexOf('comment-') === 0) {
+      var id = hash.slice(8);
+      if (/^\d+$/.test(id)) {
+        highlightComment(id);
+        return;
+      }
+    }
+    // Selection anchor.
+    var sel = parseSel(hash);
+    if (sel) {
+      highlightSelection(sel);
+      return;
+    }
+    // Otherwise fall through to native anchor handling (f-* and headings).
+    // Do NOT clear code/diff highlights here: falling through means this
+    // script does not own the fragment, so it should not disturb existing state.
+  }
+
+  // On load.
+  if (location.hash) {
+    // Defer slightly so the browser's own scroll has settled.
+    setTimeout(handleFragment, 50);
+  }
+  // On hashchange (clicking a line-number link, back/forward, manual edit).
+  window.addEventListener('hashchange', handleFragment);
+
+  // Intercept clicks on line-number links in code mode to set a sel fragment
+  // instead of the simple #L<n> that only works for single-file sessions.
+  var root = document.querySelector('[data-comments]');
+  if (root) {
+    root.addEventListener('click', function (e) {
+      var link = e.target.closest ? e.target.closest('td.ln a[href^="#"]') : null;
+      if (!link) return;
+      // Find the associated addnote button on this row to get file/side/line.
+      var row = link.closest('tr');
+      if (!row) return;
+      var btn = row.querySelector('.addnote');
+      if (!btn) return;
+      e.preventDefault();
+      var path = btn.getAttribute('data-file');
+      var side = btn.getAttribute('data-side');
+      var line = btn.getAttribute('data-line');
+      var frag = selFragment(path, side, parseInt(line, 10));
+      history.replaceState(null, '', '#' + frag);
+      clearHighlights();
+      row.classList.add('sel-highlight');
+    });
+  }
+})();
+"##;
+
+/// Comments on rendered markdown (docs and briefs).
+///
+/// Complementary to `COMMENT_JS`, which handles code/diff tables. This script
+/// finds elements with `data-sourcepos` attributes (emitted by comrak when
+/// `render.sourcepos = true`) inside containers that also have `data-doc-file`,
+/// and attaches a `+` affordance to each top-level block so the user can comment.
+///
+/// The file identifier for the comment comes from the element's own
+/// `data-doc-file` attribute — `"brief:"` for the guided-review brief, or the
+/// doc file's label for docs mode. This means a brief and a doc with the same
+/// label text cannot collide: the API sees different `file` values.
+///
+/// Comments are stored with `side: "new"` (the only meaningful value for
+/// markdown) and `line`/`end_line` set to the exact sourcepos start/end from
+/// `data-sourcepos`.
+///
+/// Comment data is read from hidden `<div>` elements with class
+/// `wdyt-comment-data`, rendered server-side with proper HTML escaping. Each
+/// element carries `data-comment-*` attributes for structured fields and has
+/// the comment text as its `textContent`. No `<script type="application/json">`
+/// or `Raw` JSON hydration is used.
+pub(crate) const DOC_COMMENT_JS: &str = r##"
+(function () {
+  var docRoots = document.querySelectorAll('[data-doc-file]');
+  if (!docRoots.length) return;
+
+  // Load comments from hidden DOM elements (server-rendered, escaped).
+  function loadComments(containerId) {
+    var container = document.getElementById(containerId);
+    if (!container) return [];
+    var items = container.querySelectorAll('.wdyt-comment-data');
+    var result = [];
+    for (var i = 0; i < items.length; i++) {
+      var el = items[i];
+      var endLine = el.getAttribute('data-comment-end-line');
+      result.push({
+        id: parseInt(el.getAttribute('data-comment-id'), 10) || null,
+        target: el.getAttribute('data-comment-target') || '',
+        file: el.getAttribute('data-comment-file') || '',
+        line: parseInt(el.getAttribute('data-comment-line'), 10) || 0,
+        end_line: endLine ? parseInt(endLine, 10) : null,
+        side: el.getAttribute('data-comment-side') || 'new',
+        snippet: el.getAttribute('data-comment-snippet') || '',
+        text: el.textContent || ''
+      });
+    }
+    return result;
+  }
+
+  // Find the session id from the element's own data-session, or a sibling with
+  // data-session. This allows the brief (which does NOT carry data-comments) to
+  // find the session without stealing the COMMENT_JS root.
+  function findSession(root) {
+    if (root.getAttribute && root.getAttribute('data-session')) {
+      return root.getAttribute('data-session');
+    }
+    var wrap = document.querySelector('[data-session]');
+    return wrap ? wrap.getAttribute('data-session') : null;
+  }
+
+  // Parse data-sourcepos="startLine:startCol-endLine:endCol"
+  function parseSourcepos(sp) {
+    if (!sp) return null;
+    var m = sp.match(/^(\d+):(\d+)-(\d+):(\d+)$/);
+    if (!m) return null;
+    return { startLine: parseInt(m[1], 10), endLine: parseInt(m[3], 10) };
+  }
+
+  function safeLineNo(n) {
+    return Number.isFinite(n) && n > 0 && n <= Number.MAX_SAFE_INTEGER && n === Math.floor(n) ? n : null;
+  }
+
+  // Base64url encode (no padding).
+  function b64encode(s) {
+    return btoa(unescape(encodeURIComponent(s)))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  // Use the explicit target (data-doc-target) for fragment encoding, not
+  // the display label. This ensures duplicate labels deep-link uniquely.
+  function selFragment(docTarget, side, start, end) {
+    var enc = b64encode(docTarget);
+    if (end && end !== start) return 'sel-' + enc + '-' + side + '-' + start + '-' + end;
+    return 'sel-' + enc + '-' + side + '-' + start;
+  }
+
+  for (var ri = 0; ri < docRoots.length; ri++) {
+    (function (root) {
+      var docFile = root.getAttribute('data-doc-file');
+      var docTarget = root.getAttribute('data-doc-target') || docFile;
+      var session = findSession(root);
+      if (!session) return;
+
+      // Only operate on DIRECT children with data-sourcepos (top-level blocks).
+      // This prevents inserting affordances into nested table cells, list items,
+      // etc. which would break semantics.
+      var blocks = [];
+      var children = root.children;
+      for (var ci = 0; ci < children.length; ci++) {
+        if (children[ci].getAttribute && children[ci].getAttribute('data-sourcepos')) {
+          blocks.push(children[ci]);
+        }
+      }
+      if (!blocks.length) return;
+
+      // Existing comments for this doc root, loaded from hidden DOM elements.
+      var existing = [];
+      if (docTarget === 'brief') {
+        existing = loadComments('wdyt-brief-comments');
+      } else {
+        // Filter by target if available, otherwise by file.
+        var all = loadComments('wdyt-doc-comments');
+        existing = all.filter(function (c) {
+          if (c.target) return c.target === docTarget;
+          return c.file === docFile;
+        });
+      }
+
+      var openBox = null;
+
+      function closeBox() {
+        if (openBox) { openBox.remove(); openBox = null; }
+      }
+
+      function noteContainer(block) {
+        // Comments live in a div immediately after the block element.
+        var next = block.nextElementSibling;
+        if (next && next.classList.contains('doc-notes')) return next;
+        var div = document.createElement('div');
+        div.className = 'doc-notes';
+        block.parentNode.insertBefore(div, block.nextSibling);
+        return div;
+      }
+
+      function renderNote(comment, container) {
+        var note = document.createElement('div');
+        note.className = 'note';
+        if (comment.id != null) note.id = 'comment-' + comment.id;
+        var who = document.createElement('span');
+        who.className = 'who';
+        who.textContent = 'you';
+        if (comment.end_line && comment.end_line > comment.line) {
+          var span = document.createElement('span');
+          span.className = 'span';
+          span.textContent = 'L' + comment.line + '\u2013L' + comment.end_line;
+          who.appendChild(span);
+        }
+        note.appendChild(who);
+        if (comment.id != null) {
+          var plink = document.createElement('a');
+          plink.className = 'permalink';
+          plink.href = '#comment-' + comment.id;
+          plink.title = 'Link to this comment';
+          plink.textContent = '#';
+          note.appendChild(plink);
+        }
+        note.appendChild(document.createTextNode(comment.text));
+        container.appendChild(note);
+      }
+
+      // Build a map of exact source range -> block for deterministic hydration.
+      var rangeToBlock = {};
+      for (var i = 0; i < blocks.length; i++) {
+        var sp = parseSourcepos(blocks[i].getAttribute('data-sourcepos'));
+        if (sp && safeLineNo(sp.startLine) && safeLineNo(sp.endLine)) {
+          rangeToBlock[sp.startLine + ':' + sp.endLine] = blocks[i];
+        }
+      }
+
+      // Hydrate only an exact target+range match. A stale or legacy comment is
+      // never relocated onto a different markdown block.
+      for (var eci = 0; eci < existing.length; eci++) {
+        var c = existing[eci];
+        var commentEnd = c.end_line || c.line;
+        var targetBlock = rangeToBlock[c.line + ':' + commentEnd] || null;
+        if (targetBlock) {
+          renderNote(c, noteContainer(targetBlock));
+        }
+      }
+
+      for (var i = 0; i < blocks.length; i++) {
+        (function (block) {
+          var sp = parseSourcepos(block.getAttribute('data-sourcepos'));
+          if (!sp) return;
+          var startLine = safeLineNo(sp.startLine);
+          var endLine = safeLineNo(sp.endLine);
+          if (!startLine) return;
+
+          // Make the block a positioned ancestor for the button.
+          block.style.position = 'relative';
+
+          var btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'doc-addnote';
+          btn.title = 'Comment on this block';
+          btn.textContent = '+';
+          btn.setAttribute('data-start', startLine);
+          btn.setAttribute('data-end', endLine || startLine);
+          btn.setAttribute('data-doc-file', docFile);
+          btn.setAttribute('data-doc-target', docTarget);
+          block.insertBefore(btn, block.firstChild);
+
+          btn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            var lo = startLine;
+            var hi = endLine || startLine;
+
+            // Toggle: clicking the same block closes the box.
+            var reopen = !openBox || openBox._block !== block;
+            closeBox();
+            if (!reopen) return;
+
+            // Update URL fragment using explicit target for unique deep-links.
+            var frag = selFragment(docTarget, 'new', lo, hi);
+            history.replaceState(null, '', '#' + frag);
+
+            var box = document.createElement('div');
+            box.className = 'doc-notebox';
+            box._block = block;
+            var label = hi > lo ? 'Comment on lines ' + lo + ' to ' + hi : 'Comment on this block';
+            var isMac = navigator.platform && navigator.platform.indexOf('Mac') > -1;
+            var modKey = isMac ? 'Cmd' : 'Ctrl';
+            box.innerHTML =
+              '<textarea aria-label="' + label + '" placeholder="' + label + '\u2026"></textarea>' +
+              '<div class="row"><span class="msg"></span>' +
+              '<kbd class="kb-hint" aria-label="Keyboard shortcuts: ' + modKey + '+Enter to send, Escape to cancel">' +
+              '<abbr title="' + modKey + '+Enter">' + (isMac ? '\u2318+Enter' : 'Ctrl+Enter') + '</abbr> send \u00B7 <abbr title="Escape">Esc</abbr> cancel</kbd>' +
+              '<button type="button" class="cancel">Cancel</button>' +
+              '<button type="button" class="primary">Comment</button>' +
+              '</div>';
+            block.parentNode.insertBefore(box, block.nextSibling);
+            openBox = box;
+
+            var textarea = box.querySelector('textarea');
+            var submitBtn = box.querySelector('.primary');
+            var msg = box.querySelector('.msg');
+            textarea.focus();
+
+            box.querySelector('.cancel').addEventListener('click', closeBox);
+            textarea.addEventListener('keydown', function (ev) {
+              if (ev.key === 'Escape') { closeBox(); return; }
+              if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') submitBtn.click();
+            });
+
+            submitBtn.addEventListener('click', function () {
+              var text = textarea.value.trim();
+              if (!text) { textarea.focus(); return; }
+              submitBtn.disabled = true;
+              msg.textContent = '';
+              fetch('/s/' + session + '/comments', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  file: docFile,
+                  target: docTarget,
+                  line: lo,
+                  end_line: hi,
+                  side: 'new',
+                  text: text
+                })
+              }).then(function (res) {
+                if (!res.ok) throw new Error('could not save the comment');
+                return res.json();
+              }).then(function (comment) {
+                closeBox();
+                renderNote(comment, noteContainer(block));
+                if (comment.id != null) {
+                  history.replaceState(null, '', '#comment-' + comment.id);
+                }
+              }).catch(function (err) {
+                msg.textContent = String(err.message || err);
+                submitBtn.disabled = false;
+              });
+            });
+          });
+        })(blocks[i]);
+      }
+    })(docRoots[ri]);
+  }
+
+  // Handle doc/brief #sel links: resolve, scroll, and highlight on load/hashchange.
+  // Uses data-doc-target (explicit target) for resolution, not display label.
+  function handleDocFragment() {
+    var hash = location.hash.slice(1);
+    if (!hash) return;
+    // Only handle sel- fragments that target a doc-file.
+    if (hash.indexOf('sel-') !== 0) return;
+    // Try to find a matching doc-addnote button in a doc root.
+    for (var ri2 = 0; ri2 < docRoots.length; ri2++) {
+      var root = docRoots[ri2];
+      var docTarget = root.getAttribute('data-doc-target') || root.getAttribute('data-doc-file');
+      var children = root.children;
+      for (var ci2 = 0; ci2 < children.length; ci2++) {
+        var child = children[ci2];
+        var sp = parseSourcepos(child.getAttribute ? child.getAttribute('data-sourcepos') : null);
+        if (!sp) continue;
+        var btn = child.querySelector('.doc-addnote');
+        if (!btn) continue;
+        var start = parseInt(btn.getAttribute('data-start'), 10);
+        var end = parseInt(btn.getAttribute('data-end'), 10);
+        // Build what our fragment would be for this block and compare using target.
+        var expected = selFragment(docTarget, 'new', start, end);
+        if (expected === hash) {
+          // Respect reduced motion preference.
+          var motion = window.matchMedia('(prefers-reduced-motion: reduce)');
+          var behavior = motion.matches ? 'auto' : 'smooth';
+          child.scrollIntoView({ block: 'center', behavior: behavior });
+          child.classList.add('sel-highlight');
+          setTimeout(function () { child.classList.remove('sel-highlight'); }, 2000);
+          return;
+        }
+      }
+    }
+  }
+
+  if (location.hash) setTimeout(handleDocFragment, 80);
+  window.addEventListener('hashchange', handleDocFragment);
+})();
+"##;
 
 /// One hunk of a diff, with a comment affordance on every line.
 ///
@@ -1048,7 +1891,8 @@ pub async fn diff_hunk(file: &str, hunk: &Hunk, comments: &[Comment]) -> Result 
                 _ => ("new", line.new),
             };
             let line_no = number.unwrap_or(0);
-            let mine = |c: &&Comment| c.file == file && c.side.as_str() == side;
+            let mine =
+                |c: &&Comment| c.target.is_none() && c.file == file && c.side.as_str() == side;
             Row {
                 line: line.clone(),
                 side,
@@ -1073,7 +1917,7 @@ pub async fn diff_hunk(file: &str, hunk: &Hunk, comments: &[Comment]) -> Result 
         .collect();
 
     view! {
-        <table class="src diff">
+        <table class="src diff commentable">
             <tbody>
                 <tr class="hunk">
                     <td class="ln" colspan="2"></td>
@@ -1082,10 +1926,22 @@ pub async fn diff_hunk(file: &str, hunk: &Hunk, comments: &[Comment]) -> Result 
                 for row in rows {
                     <tr class=(row_class(&row))>
                         <td class="ln old">
-                            if let Some(n) = row.line.old { (n) }
+                            if let Some(n) = row.line.old {
+                                if row.side == "old" {
+                                    <a href=(format!("#{}", crate::fragment::line_fragment(file, "old", n)))>(n)</a>
+                                } else {
+                                    (n)
+                                }
+                            }
                         </td>
                         <td class="ln new">
-                            if let Some(n) = row.line.new { (n) }
+                            if let Some(n) = row.line.new {
+                                if row.side == "new" {
+                                    <a href=(format!("#{}", crate::fragment::line_fragment(file, "new", n)))>(n)</a>
+                                } else {
+                                    (n)
+                                }
+                            }
                         </td>
                         <td class="code">
                             // Drag from one `+` to another to comment on a range.
@@ -1105,8 +1961,8 @@ pub async fn diff_hunk(file: &str, hunk: &Hunk, comments: &[Comment]) -> Result 
                         <tr class="notes">
                             <td class="ln" colspan="2"></td>
                             <td class="code">
-                                for comment in row.comments {
-                                    <div class="note">
+                                for comment in row.comments.clone() {
+                                    <div class="note" id=(format!("comment-{}", comment.id))>
                                         <span class="who">
                                             "you"
                                             // Says what the note is about when it
@@ -1115,6 +1971,7 @@ pub async fn diff_hunk(file: &str, hunk: &Hunk, comments: &[Comment]) -> Result 
                                                 <span class="span">(span)</span>
                                             }
                                         </span>
+                                        <a class="permalink" href=(format!("#{}", crate::fragment::comment_fragment(comment.id))) title="Link to this comment">"#"</a>
                                         (&comment.text)
                                     </div>
                                 }
@@ -1125,6 +1982,107 @@ pub async fn diff_hunk(file: &str, hunk: &Hunk, comments: &[Comment]) -> Result 
             </tbody>
         </table>
     }
+}
+
+/// A syntax-highlighted source file, with a comment affordance on every line.
+///
+/// The plain-code counterpart to [`diff_hunk`]: it emits the same `.addnote`
+/// buttons and `tr.notes` rows so the one shared comment script drives both.
+/// Code has no old/new sides, so every line is addressed on the `new` side.
+///
+/// `highlighted` is the per-line HTML pre-rendered by `render::highlight`; it is
+/// never re-highlighted here, keeping this a render-once design. The table spans
+/// three columns like the diff — a `colspan="2"` line-number cell plus the code
+/// cell — so the shared script's `colspan="2"` note rows line up.
+#[component]
+pub async fn code_file(file: &str, highlighted: &[String], comments: &[Comment]) -> Result {
+    // Line numbers are 1-indexed and every line is addressable on the new side,
+    // so the anchor work mirrors `diff_hunk` with the side fixed.
+    let rows: Vec<CodeRow> = highlighted
+        .iter()
+        .enumerate()
+        .map(|(index, html)| {
+            let line_no = index + 1;
+            let mine = |c: &&Comment| c.target.is_none() && c.file == file && c.side == Side::New;
+            CodeRow {
+                line_no,
+                html: html.clone(),
+                // A ranged comment hangs below the last line it covers.
+                comments: comments
+                    .iter()
+                    .filter(mine)
+                    .filter(|c| c.end_line.unwrap_or(c.line) == line_no)
+                    .cloned()
+                    .collect(),
+                in_range: comments.iter().filter(mine).any(|c| {
+                    c.end_line
+                        .is_some_and(|end| (c.line..=end).contains(&line_no))
+                }),
+            }
+        })
+        .collect();
+
+    view! {
+        <table class="src commentable">
+            <tbody>
+                if rows.is_empty() {
+                    <tr>
+                        <td class="ln" colspan="2"></td>
+                        <td class="code"><em>"empty file"</em></td>
+                    </tr>
+                }
+                for row in rows {
+                    <tr id=(format!("{}-L{}", crate::file_anchor(file), row.line_no)) class=(if row.in_range { "inrange" } else { "" })>
+                        <td class="ln" colspan="2">
+                            <a href=(format!("#{}", crate::fragment::line_fragment(file, "new", row.line_no)))>(row.line_no)</a>
+                        </td>
+                        <td class="code">
+                            // Drag from one `+` to another to comment on a range.
+                            <button
+                                type="button"
+                                class="addnote"
+                                title="Comment on this line, or drag to cover more"
+                                data-file=(file)
+                                data-line=(row.line_no)
+                                data-side="new"
+                            >"+"</button>
+                            (Raw(row.html.clone()))
+                        </td>
+                    </tr>
+                    if !row.comments.is_empty() {
+                        <tr class="notes">
+                            <td class="ln" colspan="2"></td>
+                            <td class="code">
+                                for comment in row.comments.clone() {
+                                    <div class="note" id=(format!("comment-{}", comment.id))>
+                                        <span class="who">
+                                            "you"
+                                            if let Some(span) = span_label(&comment) {
+                                                <span class="span">(span)</span>
+                                            }
+                                        </span>
+                                        <a class="permalink" href=(format!("#{}", crate::fragment::comment_fragment(comment.id))) title="Link to this comment">"#"</a>
+                                        (&comment.text)
+                                    </div>
+                                }
+                            </td>
+                        </tr>
+                    }
+                }
+            </tbody>
+        </table>
+    }
+}
+
+/// A source line with its comment anchor resolved.
+struct CodeRow {
+    line_no: usize,
+    /// The line's pre-rendered highlighted HTML.
+    html: String,
+    /// Comments that end on this line, shown beneath it.
+    comments: Vec<Comment>,
+    /// Whether a ranged comment covers this line.
+    in_range: bool,
 }
 
 /// A diff line with its comment anchor resolved.
@@ -1359,12 +2317,12 @@ pub async fn shell(
             <head>
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>(&title) " · showme"</title>
+                <title>(&title) " · wdyt"</title>
                 <style>(Raw(stylesheet(colors)))</style>
             </head>
             <body class=(body_class)>
                 <header class="bar">
-                    <span class="brand">"showme"</span>
+                    <span class="brand">"wdyt"</span>
                     <h1>(title)</h1>
                     if let Some(note) = note {
                         <span class="note">(note)</span>
@@ -1403,19 +2361,34 @@ pub async fn shell(
 
                 if hideable {
                     <button id="chrome-show" type="button" title="Show the bar (.)">
-                        "showme ▾"
+                        "wdyt ▾"
                     </button>
                     <script>(Raw(CHROME_JS))</script>
                 }
+
+                // Jump-to-top: always rendered, shown by JS when scrolled down.
+                <button id="jump-top" type="button" aria-label="Jump to top" title="Back to top">
+                    "↑"
+                </button>
+                <script>(Raw(NAV_JS))</script>
 
                 reply_widget(session_id: &session_id, existing: existing_reply)
 
                 if commentable {
                     <script>(Raw(COMMENT_JS))</script>
+                    <script>(Raw(DOC_COMMENT_JS))</script>
+                    <script>(Raw(FRAGMENT_JS))</script>
                 }
             </body>
         </html>
     }
+}
+
+/// Test-visible: returns the full stylesheet string for a default theme.
+///
+/// Integration tests need to assert on CSS rules without rendering a full page.
+pub fn stylesheet_for_test() -> String {
+    stylesheet(&crate::render::theme_colors(crate::render::theme("Nord")))
 }
 
 #[cfg(test)]
@@ -1519,7 +2492,7 @@ mod tests {
         assert!(CHROME_JS.contains("chrome-toggle"));
         assert!(CHROME_JS.contains("chrome-show"));
         // Remembered, since a review usually spans several reloads.
-        assert!(CHROME_JS.contains("showme.chrome.hidden"));
+        assert!(CHROME_JS.contains("wdyt.chrome.hidden"));
     }
 
     #[test]
@@ -1560,6 +2533,9 @@ mod tests {
 
     #[test]
     fn comment_js_posts_to_the_session_it_was_rendered_for() {
+        // The script binds to a shared hook rather than the diff container by id,
+        // so a code listing carrying the same attribute is driven by it too.
+        assert!(COMMENT_JS.contains("querySelector('[data-comments]')"));
         // The session id travels on the element rather than being inlined into
         // the script, which is shared by every page.
         assert!(COMMENT_JS.contains("getAttribute('data-session')"));
@@ -1567,6 +2543,42 @@ mod tests {
         // Two comments on one line join the same block rather than stacking
         // duplicate rows.
         assert!(COMMENT_JS.contains("classList.contains('notes')"));
+    }
+
+    #[test]
+    fn comment_js_uses_attribute_comparison_not_selector_interpolation() {
+        // Path matching must compare attributes directly rather than
+        // interpolating raw file paths into CSS selectors, which would be
+        // unsafe for paths containing quotes or backslashes.
+        assert!(
+            !COMMENT_JS.contains(r#"'[data-file="' + file + '"]'"#),
+            "unsafe selector interpolation found in COMMENT_JS"
+        );
+        // Instead it iterates all buttons and compares via getAttribute.
+        assert!(COMMENT_JS.contains("getAttribute('data-file') === file"));
+    }
+
+    #[test]
+    fn comment_js_validates_line_numbers_as_safe_integers() {
+        // The script must validate line numbers to protect against huge/unsafe
+        // values that could cause unbounded work.
+        assert!(COMMENT_JS.contains("safeLineNo"));
+        assert!(COMMENT_JS.contains("Number.MAX_SAFE_INTEGER"));
+    }
+
+    #[test]
+    fn comment_js_updates_url_on_range_gesture() {
+        // When the + gesture opens the comment editor, the URL should update to
+        // the canonical selection fragment so ranges are copyable.
+        assert!(COMMENT_JS.contains("selFragment(filePath, side, lo, hi)"));
+        assert!(COMMENT_JS.contains("history.replaceState(null, '', '#' + frag)"));
+    }
+
+    #[test]
+    fn comment_js_renders_permalink_on_saved_comments() {
+        // Saved comments should include a discoverable permalink.
+        assert!(COMMENT_JS.contains("permalink"));
+        assert!(COMMENT_JS.contains("'#comment-' + comment.id"));
     }
 
     #[test]
@@ -1599,6 +2611,7 @@ mod tests {
         let ranged = Comment {
             id: 1,
             file: "a.rs".to_owned(),
+            target: None,
             line: 4,
             end_line: Some(9),
             side: crate::session::Side::New,
@@ -1630,8 +2643,9 @@ mod tests {
         assert!(css.contains("table.src.diff tr.del td"), "{css}");
         assert!(css.contains("var(--code-bg)"), "{css}");
         // The comment button is absolutely placed: in the flow it would shift
-        // the code on hover and make the diff jump.
-        assert!(css.contains("table.src.diff .addnote"), "{css}");
+        // the code on hover and make the diff jump. Its rules are shared with the
+        // plain-code listing via `.commentable`, which both tables carry.
+        assert!(css.contains("table.src.commentable .addnote"), "{css}");
         assert!(css.contains("position: absolute; left: 1px"), "{css}");
     }
 
@@ -1674,5 +2688,334 @@ mod tests {
         assert!(open_close.contains("toggle.addEventListener('click'"));
         assert!(open_close.contains("open();"));
         assert!(sending.contains("form.addEventListener('submit'"));
+    }
+
+    #[test]
+    fn fragment_js_handles_comment_and_selection_anchors() {
+        // The fragment script must handle both comment-<id> and sel-<...> forms.
+        assert!(FRAGMENT_JS.contains("comment-"));
+        assert!(FRAGMENT_JS.contains("parseSel"));
+        assert!(FRAGMENT_JS.contains("highlightComment"));
+        assert!(FRAGMENT_JS.contains("highlightSelection"));
+    }
+
+    #[test]
+    fn fragment_js_listens_to_hashchange_and_page_load() {
+        // On load and on navigation the fragment must be processed.
+        assert!(FRAGMENT_JS.contains("addEventListener('hashchange'"));
+        assert!(FRAGMENT_JS.contains("location.hash"));
+        assert!(FRAGMENT_JS.contains("setTimeout(handleFragment"));
+    }
+
+    #[test]
+    fn fragment_js_updates_url_on_line_click() {
+        // Clicking a line number updates the URL fragment to a sel- form so the
+        // deep link is copyable.
+        assert!(FRAGMENT_JS.contains("history.replaceState"));
+        assert!(FRAGMENT_JS.contains("selFragment"));
+    }
+
+    #[test]
+    fn fragment_js_falls_through_for_file_anchors() {
+        // The script must not eat fragments it does not own: file anchors and
+        // heading anchors are handled natively by the browser.
+        assert!(FRAGMENT_JS.contains("clearHighlights"));
+        // Only `sel-` and `comment-` are handled; everything else falls through.
+        assert!(FRAGMENT_JS.contains("indexOf('comment-') === 0"));
+        assert!(FRAGMENT_JS.contains("indexOf('sel-') !== 0"));
+    }
+
+    #[test]
+    fn fragment_js_respects_reduced_motion() {
+        // Scrolling must use 'auto' behaviour when reduced motion is preferred.
+        assert!(FRAGMENT_JS.contains("prefers-reduced-motion: reduce"));
+        assert!(FRAGMENT_JS.contains("scrollBehavior"));
+        assert!(FRAGMENT_JS.contains("'auto'"));
+    }
+
+    #[test]
+    fn fragment_js_validates_safe_integers() {
+        // The parser must reject non-positive or non-finite line numbers.
+        assert!(FRAGMENT_JS.contains("safeInt"));
+        assert!(FRAGMENT_JS.contains("Number.MAX_SAFE_INTEGER"));
+    }
+
+    #[test]
+    fn fragment_js_iterates_dom_not_numeric_range() {
+        // highlightSelection must iterate actual buttons in the DOM rather than
+        // looping over a numeric range, which would be unbounded for a hostile
+        // huge range.
+        assert!(FRAGMENT_JS.contains("querySelectorAll('.addnote')"));
+        // Must NOT contain a `for (var line = sel.start; line <= sel.end` loop.
+        assert!(
+            !FRAGMENT_JS.contains("line <= sel.end"),
+            "fragment JS still uses numeric range iteration"
+        );
+    }
+
+    #[test]
+    fn deep_link_highlight_styles_exist() {
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        // Highlighted rows get an accent tint distinct from the range marker.
+        assert!(css.contains("tr.sel-highlight td"), "{css}");
+        // Comments flash briefly to draw the eye.
+        assert!(css.contains(".note.sel-highlight"), "{css}");
+        assert!(css.contains("wdyt-flash"), "{css}");
+        // Reduced motion preference is respected for the flash animation.
+        assert!(css.contains("prefers-reduced-motion"), "{css}");
+        // Permalink on comments is styled.
+        assert!(css.contains(".note .permalink"), "{css}");
+    }
+
+    // --- Task #11: keyboard hints in comment editors -------------------------
+
+    #[test]
+    fn comment_js_includes_keyboard_hint_with_accessible_markup() {
+        // The hint must be visible, using semantic elements.
+        assert!(COMMENT_JS.contains("kb-hint"));
+        assert!(COMMENT_JS.contains("<kbd"));
+        assert!(COMMENT_JS.contains("<abbr"));
+        assert!(COMMENT_JS.contains("aria-label"));
+        // Retains the actual keyboard behavior.
+        assert!(COMMENT_JS.contains("ev.key === 'Escape'"));
+        assert!(COMMENT_JS.contains("ev.metaKey || ev.ctrlKey"));
+    }
+
+    #[test]
+    fn doc_comment_js_includes_keyboard_hint() {
+        assert!(DOC_COMMENT_JS.contains("kb-hint"));
+        assert!(DOC_COMMENT_JS.contains("<kbd"));
+        assert!(DOC_COMMENT_JS.contains("<abbr"));
+        assert!(DOC_COMMENT_JS.contains("aria-label"));
+    }
+
+    #[test]
+    fn keyboard_hint_is_styled_unobtrusively() {
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        assert!(css.contains(".kb-hint"));
+        // The hint uses the muted color and small font to stay unobtrusive.
+        assert!(css.contains(".kb-hint"));
+    }
+
+    // --- Task #12: navigation ------------------------------------------------
+
+    #[test]
+    fn jump_to_top_is_styled_and_hidden_on_framed() {
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        assert!(css.contains("#jump-top"), "no jump-to-top CSS");
+        assert!(
+            css.contains("body.framed #jump-top"),
+            "framed pages must hide jump-to-top"
+        );
+        // Mobile responsive adjustments.
+        assert!(css.contains("max-width: 600px"));
+    }
+
+    #[test]
+    fn sidebar_desktop_rules_are_responsive() {
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        // Sidebar activates at wide viewports only.
+        assert!(css.contains("min-width: 1380px"));
+        assert!(css.contains("nav.files.has-sidebar"));
+        // Active link state is global (visible on both mobile and desktop).
+        assert!(css.contains("nav.files a.active"));
+        // Content shifts right.
+        assert!(css.contains("has-file-sidebar main"));
+    }
+
+    #[test]
+    fn nav_js_uses_intersection_observer_and_passive_scroll() {
+        assert!(NAV_JS.contains("IntersectionObserver"));
+        // Scroll listener is passive for performance.
+        assert!(NAV_JS.contains("passive: true"));
+        // Jump-to-top respects reduced motion preference.
+        assert!(NAV_JS.contains("prefers-reduced-motion: reduce"));
+        assert!(NAV_JS.contains("'auto' : 'smooth'"));
+    }
+
+    #[test]
+    fn nochrome_does_not_activate_sidebar() {
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        // The sidebar CSS explicitly excludes .nochrome bodies.
+        assert!(css.contains("not(.nochrome)"));
+    }
+
+    // =========================================================================
+    // Review finding #1: <=1379px horizontal scrollable strip
+    // =========================================================================
+
+    #[test]
+    fn narrow_nav_is_single_row_scrollable_strip() {
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        // At <=1379px, the nav must be nowrap + overflow-x: auto for horizontal
+        // scrolling, and use `scrollbar-width: thin` for unobtrusive scrollbar.
+        assert!(
+            css.contains("max-width: 1379px"),
+            "no narrow breakpoint: {css}"
+        );
+        assert!(
+            css.contains("flex-wrap: nowrap"),
+            "narrow nav not forced to nowrap: {css}"
+        );
+        assert!(
+            css.contains("overflow-x: auto"),
+            "narrow nav missing horizontal scroll: {css}"
+        );
+        assert!(
+            css.contains("-webkit-overflow-scrolling: touch"),
+            "narrow nav missing touch scrolling: {css}"
+        );
+        assert!(
+            css.contains("scrollbar-width: thin"),
+            "narrow nav missing thin scrollbar: {css}"
+        );
+        // Items must not wrap: each link stays on one line.
+        assert!(
+            css.contains("nav.files.has-sidebar a {\n    white-space: nowrap; flex: 0 0 auto;")
+                || css.contains("white-space: nowrap; flex: 0 0 auto;"),
+            "narrow nav links not set to nowrap: {css}"
+        );
+        // Scroll-margin-top derived for one row so anchors are not hidden.
+        assert!(
+            css.contains("scroll-margin-top: 92px"),
+            "narrow nav missing scroll-margin for anchors: {css}"
+        );
+    }
+
+    // =========================================================================
+    // Review finding #2: desktop sidebar alignment (brief + .wrap same left axis)
+    // =========================================================================
+
+    #[test]
+    fn desktop_brief_and_wrap_share_left_axis() {
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        // The brief must have `margin-left: 200px` when sidebar is present,
+        // so it shifts the same amount as `main`.
+        assert!(
+            css.contains("has-file-sidebar section.brief {\n    margin-left: 200px;")
+                || css.contains("has-file-sidebar section.brief {\n    margin-left: 200px"),
+            "brief not shifted by sidebar width: {css}"
+        );
+        // The brief's padding-left formula must use (100% - 200px - 1100px) to
+        // account for the sidebar width, matching .wrap's centering within the
+        // remaining space.
+        assert!(
+            css.contains("100% - 200px - 1100px"),
+            "brief padding formula does not account for sidebar width: {css}"
+        );
+    }
+
+    // =========================================================================
+    // Review finding #3: active nav-link styling outside desktop-only media
+    // =========================================================================
+
+    #[test]
+    fn active_link_styling_is_global_not_desktop_only() {
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        // The rule `nav.files a.active` must exist at the top level (not inside
+        // a min-width: 1380px media query) so horizontal/mobile tracking works.
+        assert!(
+            css.contains("nav.files a.active"),
+            "no global active link rule: {css}"
+        );
+        // Verify it has the expected styles.
+        assert!(
+            css.contains("nav.files a.active {\n  background: var(--surface)")
+                || css.contains("nav.files a.active {"),
+            "active rule missing styling: {css}"
+        );
+    }
+
+    // =========================================================================
+    // Review finding #4: shortcut hint platform-conditional visible text
+    // =========================================================================
+
+    #[test]
+    fn comment_js_keyboard_hint_renders_ctrl_on_non_mac() {
+        // The visible text inside <abbr> must be conditional on platform:
+        // - Mac: ⌘↩ (\u2318+Enter)
+        // - Non-Mac: Ctrl↩
+        assert!(
+            COMMENT_JS.contains(r"'\u2318+Enter' : 'Ctrl+Enter'")
+                || COMMENT_JS.contains(r#"'\u2318+Enter' : 'Ctrl+Enter'"#),
+            "COMMENT_JS visible hint not platform-conditional"
+        );
+        // Must NOT hard-code only the Mac glyph unconditionally.
+        assert!(
+            !COMMENT_JS.contains(r#"'>\u2318+Enter</abbr> send"#),
+            "COMMENT_JS still hard-codes Mac glyph without condition"
+        );
+    }
+
+    #[test]
+    fn doc_comment_js_keyboard_hint_renders_ctrl_on_non_mac() {
+        // Same check for doc comment JS.
+        assert!(
+            DOC_COMMENT_JS.contains(r"'\u2318+Enter' : 'Ctrl+Enter'")
+                || DOC_COMMENT_JS.contains(r#"'\u2318+Enter' : 'Ctrl+Enter'"#),
+            "DOC_COMMENT_JS visible hint not platform-conditional"
+        );
+    }
+
+    // =========================================================================
+    // Review finding #5: jump-to-top respects prefers-reduced-motion
+    // =========================================================================
+
+    #[test]
+    fn jump_to_top_respects_reduced_motion() {
+        // The scrollTo call must query prefers-reduced-motion and use 'auto'
+        // when the user prefers reduced motion.
+        assert!(
+            NAV_JS.contains("prefers-reduced-motion: reduce"),
+            "NAV_JS does not query reduced motion"
+        );
+        assert!(
+            NAV_JS.contains("prefersReduced") || NAV_JS.contains("prefers-reduced-motion"),
+            "NAV_JS does not store reduced motion preference"
+        );
+        // When reduced motion is preferred, behavior should be 'auto'.
+        assert!(
+            NAV_JS.contains("'auto' : 'smooth'") || NAV_JS.contains("'auto':'smooth'"),
+            "NAV_JS does not conditionally use 'auto' for reduced motion"
+        );
+        // Must NOT unconditionally use 'smooth'.
+        let smooth_count = NAV_JS.matches("behavior: 'smooth'").count();
+        assert_eq!(
+            smooth_count, 0,
+            "NAV_JS has unconditional 'smooth' scrolling ({smooth_count} occurrences)"
+        );
+    }
+
+    // =========================================================================
+    // Review finding #6: comment permalinks visible on keyboard focus
+    // =========================================================================
+
+    #[test]
+    fn permalink_visible_on_focus_not_hover_only_code_diff() {
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        // The permalink must become visible on :focus and :focus-visible,
+        // not just on :hover.
+        assert!(
+            css.contains(".note .permalink:focus"),
+            "code/diff permalink not visible on :focus: {css}"
+        );
+        assert!(
+            css.contains(".note .permalink:focus-visible"),
+            "code/diff permalink not visible on :focus-visible: {css}"
+        );
+    }
+
+    #[test]
+    fn permalink_visible_on_focus_not_hover_only_docs() {
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        // Doc notes permalinks must also become visible on focus.
+        assert!(
+            css.contains(".doc .doc-notes .note .permalink:focus"),
+            "doc permalink not visible on :focus: {css}"
+        );
+        assert!(
+            css.contains(".doc .doc-notes .note .permalink:focus-visible"),
+            "doc permalink not visible on :focus-visible: {css}"
+        );
     }
 }

@@ -1,8 +1,8 @@
-# showme
+# wdyt
 
 Let coding agents show you their work: a link in Slack, a reply box on the page.
 
-An agent finishes something worth looking at, runs `showme`, and you get a
+An agent finishes something worth looking at, runs `wdyt`, and you get a
 notification with a link. The page renders whatever it wanted to show you —
 highlighted source, a reviewable diff, rendered markdown, a static directory, or
 a live server it just started — with a floating reply box in the corner. You type
@@ -17,11 +17,11 @@ cargo install --path .
 ## Configure
 
 ```sh
-showme config --webhook-url https://hooks.slack.com/services/...
-showme config --ports 3000-3010      # default; the daemon takes the first free one
-showme config                        # print current settings
-showme config --path                 # where the file lives
-showme themes                        # syntax themes for --theme
+wdyt config --webhook-url https://hooks.slack.com/services/...
+wdyt config --ports 3000-3010      # default; the daemon takes the first free one
+wdyt config                        # print current settings
+wdyt config --path                 # where the file lives
+wdyt themes                        # syntax themes for --theme
 ```
 
 Ports default to `3000-3010` because those are commonly forwarded from a dev
@@ -31,42 +31,46 @@ takes whichever port in it was free and the CLI finds it by scanning — a plain
 server that answers `/health` is not mistaken for one, since the daemon's
 response carries an identifying marker.
 
-Environment overrides for one-off runs: `SHOWME_WEBHOOK_URL`, `SHOWME_PORTS`,
-`SHOWME_THEME`, `SHOWME_PUBLIC_HOST`.
+Environment overrides for one-off runs: `WDYT_WEBHOOK_URL`, `WDYT_PORTS`,
+`WDYT_THEME`, `WDYT_PUBLIC_HOST`.
 
-With no webhook configured, showme prints the link instead of sending it, so it
+With no webhook configured, wdyt prints the link instead of sending it, so it
 is usable before it is set up.
 
 ## The modes
 
 ```sh
 # Source files, syntax highlighted, with line anchors
-showme code src/lib.rs src/main.rs --title "the new parser"
+wdyt code src/lib.rs src/main.rs --title "the new parser"
 
 # A unified diff, reviewable line by line with comments
-git diff | showme diff --title "the parser rewrite"
+git diff | wdyt diff --title "the parser rewrite"
 
 # Markdown, rendered (GFM: tables, tasklists, footnotes, > [!NOTE] callouts)
-showme docs DESIGN.md --title "design writeup"
+wdyt docs DESIGN.md --title "design writeup"
 
 # A directory of prepared HTML, served with its relative assets
-showme dir ./report --title "benchmark report"
+wdyt dir ./report --title "benchmark report"
 
 # A live server the agent started itself
-PORT=$(showme port)
+PORT=$(wdyt port)
 my-app --port "$PORT" &
-showme demo "$PORT" --title "the new dashboard"
+wdyt demo "$PORT" --title "the new dashboard"
 ```
 
-Each prints the session URL on stdout, so the agent can quote it back to you
-even when a notification went out.
+Every content command waits for a reply by default and prints it as JSON after
+the session URL. Pass `--no-wait` for fire-and-forget (the URL is still printed
+on stdout so the agent can quote it).
 
 ## Getting the reply
 
-Add `--wait` to block until you reply, then print it as JSON:
+Every content command blocks until a reply arrives (or `--timeout` expires), then
+prints the reply as JSON:
 
 ```sh
-showme code src/lib.rs --title "the new parser" --wait
+wdyt code src/lib.rs --title "the new parser"
+# prints: http://localhost:3000/s/<id>
+# then blocks…
 # {"text": "rename the second arg and ship it", "at": 1785287644}
 ```
 
@@ -74,23 +78,54 @@ Exit status is `2` if the wait times out (`--timeout`, default 600s), so a
 script can tell "no answer" from "answered". To send now and collect later:
 
 ```sh
-URL=$(showme docs PLAN.md --title "the plan")
-showme wait "${URL##*/}" --timeout 900
+wdyt docs PLAN.md --title "the plan" --no-wait
+# prints: http://localhost:3000/s/<id>
+wdyt wait "<id>" --timeout 900
 ```
 
 One reply per session, deliberately — it is a note back, not a conversation.
 A second POST is refused and the page says so.
 
-**A reply outlives the wait.** If `--wait` gives up, the session stays open and
+**A reply outlives the wait.** If `--timeout` expires, the session stays open and
 the daemon keeps holding the reply, so a turn hours later can still pick it up:
 
 ```sh
-showme inbox              # replies waiting, as JSON, newest first
-showme inbox --all        # including ones already collected
-showme collect <id>       # take one reply and its line comments
+wdyt inbox              # replies waiting, as JSON, newest first
+wdyt inbox --all        # including ones already collected
+wdyt collect <id>       # take one reply and its line comments
 ```
 
 This is what makes a reply sent a day after the agent stopped waiting still land.
+
+## CLI output as agent skill
+
+The CLI's stdout is strictly machine-readable (the session URL, then optionally
+the reply JSON). All coaching — file anchors, next-step guidance — goes to stderr,
+so piping stdout into another tool or variable never captures noise.
+
+After creating a code, diff, or docs session, stderr prints the available file
+anchors for use in `--brief` guided reviews:
+
+```
+wdyt: file anchors for --brief links:
+  src/lib.rs → #f-src-lib-rs
+  src/main.rs → #f-src-main-rs
+```
+
+These use the exact same helper that renders the page's navigation anchors, so
+the links always match. The anchor rule: prefix `f-`, then replace every
+non-alphanumeric character with `-` and lowercase letters.
+
+Post-session stderr guidance varies by outcome:
+
+| Scenario | Stderr says |
+|---|---|
+| `--no-wait` | Session created; shows `collect` command |
+| Reply received | Shows `collect <id>` (for line comments) and `ack <id>` |
+| Timeout (exit 2) | Session still open; shows `collect` and `inbox` |
+
+The `--help` for the root command and each subcommand is written as a concise
+skill reference for agents, including examples and the stdin caveat for `--brief`.
 
 ## Did the agent actually read it?
 
@@ -107,20 +142,21 @@ call that success. So the page shows three states, not two:
 Only an explicit ack reaches green, and it carries the agent's own words:
 
 ```sh
-showme ack <id> "rerunning the build with your flag"
+wdyt ack <id> "rerunning the build with your flag"
 ```
 
 The note is required — a bare flag could be sent by the same transport that
-merely moved the bytes, so the signal is the sentence. `showme inbox --unread`
-filters on the ack rather than on delivery, which means a reply some dead process
-collected stays in the inbox instead of vanishing from it.
+merely moved the bytes, so the signal is the sentence. `wdyt inbox` shows
+unread replies by default (filtering on the ack rather than on delivery), which
+means a reply some dead process collected stays in the inbox instead of vanishing
+from it. Pass `--all` to include already-acknowledged replies.
 
 The page polls a read-only status route, so watching it never advances your own
 receipt.
 
 ## Reviewing a diff
 
-`showme diff` renders a unified diff — added, removed, and context lines tinted
+`wdyt diff` renders a unified diff — added, removed, and context lines tinted
 and numbered on both sides, highlighted per language. Each hunk side is
 reassembled and highlighted as one document before being split back into lines,
 so a multi-line string or comment colours correctly instead of restarting at
@@ -134,7 +170,7 @@ saves, `Escape` cancels, and several comments can stack on one line. Comments
 survive a reload and come back to the agent alongside the reply:
 
 ```sh
-showme collect <id>
+wdyt collect <id>
 # {"replied": true, "reply": {...}, "comments": [
 #   {"file": "src/lib.rs", "line": 2, "side": "new",
 #    "snippet": "    let x = 2;", "text": "why 2?"},
@@ -157,8 +193,8 @@ what changed, why, and what to look at first. `--brief` takes markdown, or
 `--brief-file` a path:
 
 ```sh
-git diff | showme diff --brief-file REVIEW.md
-showme code src/*.rs --brief "Start with the parser; the rest is mechanical."
+git diff | wdyt diff --brief-file REVIEW.md
+wdyt code src/*.rs --brief "Start with the parser; the rest is mechanical."
 ```
 
 It renders above the content in the same column as the code, with GFM callouts
@@ -174,16 +210,16 @@ non-alphanumerics replaced by dashes — `src/diff.rs` is `#f-src-diff-rs`:
 ```
 
 `--brief -` reads from stdin, so it cannot be combined with a diff that is also
-piped in; showme says so rather than silently eating one of them.
+piped in; wdyt says so rather than silently eating one of them.
 
 ## Colour schemes
 
-`showme themes` lists them; `--theme` picks one for a single session, and
-`showme config --theme` sets the lasting default:
+`wdyt themes` lists them; `--theme` picks one for a single session, and
+`wdyt config --theme` sets the lasting default:
 
 ```sh
-git diff | showme diff --theme GitHub
-showme config --theme "Solarized (light)"
+git diff | wdyt diff --theme GitHub
+wdyt config --theme "Solarized (light)"
 ```
 
 The theme travels with the session, so the page's own colours follow the code:
@@ -197,7 +233,7 @@ is dark.
 With several agents running there is otherwise nothing to say which one sent a
 link. Each session records where it was created — the working directory, and
 under zellij the session and tab name — and shows it in the bar and in the
-notification: `dd-2 › showme cli — /local/home/rcoh/code/showme`. Hovering gives
+notification: `dd-2 › wdyt cli — /local/home/rcoh/code/wdyt`. Hovering gives
 the pane title, which for an agent is usually the task it was handed.
 
 The tab comes from the pane id rather than `zellij action current-tab-info`,
@@ -209,16 +245,16 @@ whenever the agent is in the background.
 Every session page has a **Hide bar** control, and `.` toggles it from the
 keyboard. It collapses the header and file nav to a small pill in the corner, and
 the choice is remembered in `localStorage` — so a framed demo can be reviewed at
-the full height of the window without showme's own furniture in the way, and a
+the full height of the window without wdyt's own furniture in the way, and a
 long diff gets the whole viewport.
 
 ## Other commands
 
 ```sh
-showme port          # a free port for a demo server (never the daemon's)
-showme port --all    # every free port in the range
-showme list          # URL of the session index
-showme serve         # run the daemon in the foreground
+wdyt port          # a free port for a demo server (never the daemon's)
+wdyt port --all    # every free port in the range
+wdyt list          # URL of the session index
+wdyt serve         # run the daemon in the foreground
 ```
 
 Any session page also serves `/s/<id>/raw` — the plain source, or for a diff the

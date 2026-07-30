@@ -1,4 +1,4 @@
-//! Configuration, loaded from `~/.config/showme/config.toml`.
+//! Configuration, loaded from `~/.config/wdyt/config.toml`.
 //!
 //! Every field has an environment-variable override so a one-off run can
 //! change behaviour without editing the file.
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// The default span of ports showme will bind, chosen because the user already
+/// The default span of ports wdyt will bind, chosen because the user already
 /// forwards 3000-3010 from the dev host.
 const DEFAULT_PORT_LOW: u16 = 3000;
 const DEFAULT_PORT_HIGH: u16 = 3010;
@@ -19,14 +19,14 @@ const DEFAULT_PORT_HIGH: u16 = 3010;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Slack (or any) incoming-webhook URL that notifications are POSTed to.
-    /// When unset, showme prints the link instead of sending it, which keeps
+    /// When unset, wdyt prints the link instead of sending it, which keeps
     /// the tool usable before it is configured.
     pub webhook_url: Option<String>,
 
-    /// Lowest port showme will use, inclusive.
+    /// Lowest port wdyt will use, inclusive.
     pub port_low: u16,
 
-    /// Highest port showme will use, inclusive.
+    /// Highest port wdyt will use, inclusive.
     pub port_high: u16,
 
     /// Address the daemon binds. Loopback by default: the ports are reached
@@ -46,7 +46,7 @@ pub struct Config {
     pub webhook_field: String,
 
     /// Syntax-highlighting theme name, as understood by `two_face`.
-    /// See `showme themes` for the list.
+    /// See `wdyt themes` for the list.
     pub theme: String,
 
     /// How long a session's content stays available before it is dropped.
@@ -95,23 +95,23 @@ impl Config {
     /// Environment overrides. These win over the file so that a single command
     /// can be redirected without a config edit.
     fn apply_env(&mut self) -> Result<()> {
-        if let Ok(url) = std::env::var("SHOWME_WEBHOOK_URL") {
+        if let Ok(url) = std::env::var("WDYT_WEBHOOK_URL") {
             // An explicitly empty value disables the webhook rather than
             // setting it to the empty string.
             self.webhook_url = (!url.is_empty()).then_some(url);
         }
-        if let Ok(value) = std::env::var("SHOWME_PORTS") {
+        if let Ok(value) = std::env::var("WDYT_PORTS") {
             let (low, high) = parse_port_range(&value)?;
             self.port_low = low;
             self.port_high = high;
         }
-        if let Ok(value) = std::env::var("SHOWME_THEME") {
+        if let Ok(value) = std::env::var("WDYT_THEME") {
             self.theme = value;
         }
-        if let Ok(value) = std::env::var("SHOWME_WEBHOOK_FIELD") {
+        if let Ok(value) = std::env::var("WDYT_WEBHOOK_FIELD") {
             self.webhook_field = value;
         }
-        if let Ok(value) = std::env::var("SHOWME_PUBLIC_HOST") {
+        if let Ok(value) = std::env::var("WDYT_PUBLIC_HOST") {
             self.public_host = value;
         }
         Ok(())
@@ -146,7 +146,7 @@ impl Config {
 
     pub fn config_dir() -> Result<PathBuf> {
         let dirs = directories::BaseDirs::new().context("could not determine a home directory")?;
-        Ok(dirs.config_dir().join("showme"))
+        Ok(dirs.config_dir().join("wdyt"))
     }
 
     pub fn path() -> Result<PathBuf> {
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn missing_file_yields_defaults() {
-        let config = Config::load_from(Path::new("/nonexistent/showme/config.toml")).unwrap();
+        let config = Config::load_from(Path::new("/nonexistent/wdyt/config.toml")).unwrap();
         assert_eq!(config.port_low, DEFAULT_PORT_LOW);
         assert_eq!(config.port_high, DEFAULT_PORT_HIGH);
     }

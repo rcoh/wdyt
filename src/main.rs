@@ -1,4 +1,4 @@
-//! The `showme` command.
+//! The `wdyt` command.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -6,52 +6,44 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use showme::client::Client;
-use showme::config::Config;
-use showme::notify::Notification;
-use showme::ports;
-use showme::render;
-use showme::session::{Content, Store};
+use wdyt::client::Client;
+use wdyt::config::Config;
+use wdyt::notify::Notification;
+use wdyt::ports;
+use wdyt::render;
+use wdyt::session::{Content, Store};
 
 #[derive(Parser)]
 #[command(
-    name = "showme",
+    name = "wdyt",
     version,
     about = "Show your work: a link in Slack, a reply box on the page.",
     // Agents read `--help` more often than people do, so spell out the flow.
     after_help = "\
-Typical use by an agent:
+WORKFLOW (for coding agents):
 
-  # Show source files
-  showme code src/lib.rs src/main.rs --title \"the new parser\"
+  1. Show your work — the command waits for a reply by default:
+       wdyt code src/lib.rs src/main.rs --title \"the new parser\"
+       git diff | wdyt diff --title \"the parser rewrite\"
+       wdyt docs DESIGN.md --title \"design writeup\"
 
-  # Show a diff for review, with line comments
-  git diff | showme diff --title \"the parser rewrite\" --wait
+  2. In a guided review brief (--brief / --brief-file), link to files with
+     #f-<path> where non-alphanumerics become dashes:
+       src/main.rs  → #f-src-main-rs
+       a-b/c-d.rs   → #f-a-b-c-d-rs
+     After session creation, available anchors are printed to stderr.
 
-  # Show rendered markdown
-  showme docs DESIGN.md --title \"design writeup\"
+  3. stdout is machine-readable: first the session URL, then (if waiting) the
+     reply as JSON. Pass --no-wait for fire-and-forget.
 
-  # Show a directory of prepared HTML
-  showme dir ./report --title \"benchmark report\"
+  4. After a reply arrives (or later via inbox):
+       wdyt collect <id>   # returns reply + line/block comments as JSON
+       wdyt ack <id> \"rerunning the build with your flag\"  # turns receipt green
 
-  # Show a live server: get a port, start the app on it, then notify
-  PORT=$(showme port)
-  my-app --port $PORT &
-  showme demo $PORT --title \"the new dashboard\" --wait
+  5. Exit status 2 means timeout — the session stays open for later collection.
 
-Add --wait to any of these to block until a reply is sent, and print it.
-
-A reply outlives the wait. If --wait times out the session is still open, so a
-later turn can pick the reply up:
-
-  showme inbox              # replies waiting, as JSON
-  showme collect <id>       # take one reply and its line comments
-
-Collecting a reply only moves it to you. Once you have actually read it, say so —
-this is what tells the user a model is really working on it rather than that a
-process fetched some bytes and died:
-
-  showme ack <id> \"rerunning the build with your flag\""
+STDIN CAVEAT: --brief - and a piped diff cannot both read stdin. Use --brief-file
+when piping a diff."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -61,6 +53,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Show source files, syntax highlighted.
+    ///
+    /// Waits for a reply by default. Pass --no-wait for fire-and-forget.
+    /// Example: wdyt code src/lib.rs src/main.rs --title "the new parser"
     Code {
         /// Files to show.
         #[arg(required = true)]
@@ -69,7 +64,11 @@ enum Command {
         show: ShowArgs,
     },
 
-    /// Show a unified diff, reviewable line by line.
+    /// Show a unified diff, reviewable line by line with comments.
+    ///
+    /// Reads from stdin by default: `git diff | wdyt diff --title "..."`.
+    /// Pass a file path instead of `-` to read from a file.
+    /// Note: --brief - cannot be combined with a piped diff; use --brief-file.
     Diff {
         /// A patch file, or `-` to read the diff from stdin.
         #[arg(default_value = "-")]
@@ -78,7 +77,10 @@ enum Command {
         show: ShowArgs,
     },
 
-    /// Show markdown files, rendered.
+    /// Show markdown files, rendered (GFM: tables, tasklists, callouts).
+    ///
+    /// Waits for a reply by default. Pass --no-wait for fire-and-forget.
+    /// Example: wdyt docs DESIGN.md --title "design writeup"
     Docs {
         #[arg(required = true)]
         files: Vec<PathBuf>,
@@ -116,22 +118,38 @@ enum Command {
     },
 
     /// Wait for a reply to a session and print it.
+    /// Wait for a reply to a session and print it.
+    ///
+    /// Blocks until the reply arrives or `--timeout` expires. Exit status 0 means
+    /// a reply was received; exit status 2 means timeout. The session stays open
+    /// after a timeout — recover with `wdyt collect <id>` or check `wdyt inbox`.
     Wait {
         /// Session id, as printed when the session was created.
         id: String,
-        /// Give up after this many seconds.
+        /// Give up after this many seconds (exit status 2 on timeout).
         #[arg(long, default_value_t = 600)]
         timeout: u64,
     },
 
     /// List replies the daemon is holding, including ones sent hours ago.
+    ///
+    /// By default shows unread replies (those not yet acknowledged with `wdyt ack`).
+    /// A reply collected by a dead process stays in the unread inbox until acked.
     Inbox {
-        /// Include replies already collected.
+        /// Include replies already acknowledged.
         #[arg(long)]
         all: bool,
     },
 
     /// Collect a reply that has already arrived, and any line comments.
+    ///
+    /// Returns JSON: {"replied": bool, "reply": {...}, "comments": [...]}
+    /// Each comment has file, line, side, snippet, and text fields.
+    /// For markdown comments (docs/brief), a `target` field identifies where the
+    /// comment was placed: "brief" for the guided review, "doc:<n>" for the nth
+    /// docs file. Code/diff comments omit `target` (file path is sufficient).
+    ///
+    /// After collecting, acknowledge with: wdyt ack <id> "your note"
     Collect {
         /// Session id.
         id: String,
@@ -139,8 +157,9 @@ enum Command {
 
     /// Tell the user you read their reply and what you are doing about it.
     ///
-    /// Collecting a reply only moves bytes. This is what lights up the receipt on
-    /// their page, so send it once you have actually read the reply.
+    /// This is what lights up the receipt on their page (grey → green), so send
+    /// it once you have actually read the reply and know what to do.
+    /// Example: wdyt ack abc123 "rerunning the build with your flag"
     Ack {
         /// Session id.
         id: String,
@@ -166,7 +185,7 @@ enum Command {
         /// Set the port range, e.g. 3000-3010.
         #[arg(long)]
         ports: Option<String>,
-        /// Set the syntax theme. See `showme themes`.
+        /// Set the syntax theme. See `wdyt themes`.
         #[arg(long)]
         theme: Option<String>,
         /// Print the config file path and exit.
@@ -189,22 +208,32 @@ struct ShowArgs {
     #[arg(long, short)]
     note: Option<String>,
 
-    /// Block until a reply arrives, then print it.
-    #[arg(long)]
+    /// Do not wait for a reply — fire and forget.
+    ///
+    /// By default every content command blocks until a reply arrives (or
+    /// `--timeout` expires). Pass `--no-wait` when you only need the link.
+    #[arg(long, conflicts_with = "wait")]
+    no_wait: bool,
+
+    /// Retained for backwards compatibility; waiting is now the default.
+    #[arg(long, hide = true, conflicts_with = "no_wait")]
     wait: bool,
 
-    /// Seconds to wait with --wait.
-    #[arg(long, default_value_t = 600)]
+    /// Seconds to wait before giving up (exit status 2).
+    ///
+    /// The session stays open after a timeout — check later with `wdyt inbox`
+    /// or `wdyt collect <id>`.
+    #[arg(long, default_value_t = 600, conflicts_with = "no_wait")]
     timeout: u64,
 
     /// Print the link instead of sending a notification.
     #[arg(long)]
     no_notify: bool,
 
-    /// Syntax theme for this session only. See `showme themes`.
+    /// Syntax theme for this session only. See `wdyt themes`.
     ///
     /// The page's own colours follow the theme, so a light theme gives a light
-    /// page. Set a lasting default with `showme config --theme`.
+    /// page. Set a lasting default with `wdyt config --theme`.
     #[arg(long)]
     theme: Option<String>,
 
@@ -222,12 +251,19 @@ struct ShowArgs {
 }
 
 impl ShowArgs {
+    /// Whether this invocation should wait for a reply.
+    fn should_wait(&self) -> bool {
+        // `--no-wait` opts out; the old `--wait` is accepted silently (it was
+        // already the default).
+        !self.no_wait
+    }
+
     /// The theme to highlight with: this invocation's, or the configured default.
     fn theme<'a>(&'a self, config: &'a Config) -> Result<&'a str> {
         let name = self.theme.as_deref().unwrap_or(&config.theme);
         anyhow::ensure!(
             render::theme_names().contains(&name),
-            "unknown theme {name:?}. See `showme themes`"
+            "unknown theme {name:?}. See `wdyt themes`"
         );
         Ok(name)
     }
@@ -236,7 +272,7 @@ impl ShowArgs {
     ///
     /// Rendered here rather than in the daemon because this is where the syntax
     /// theme for fenced code blocks is known.
-    fn brief(&self, config: &Config) -> Result<Option<String>> {
+    fn brief(&self, config: &Config) -> Result<Option<(String, Vec<String>)>> {
         let source = match (&self.brief, &self.brief_file) {
             (Some(text), _) if text == "-" => {
                 use std::io::Read as _;
@@ -254,14 +290,15 @@ impl ShowArgs {
             return Ok(None);
         }
         let theme = self.theme(config)?;
-        Ok(Some(render::markdown("brief", &source, theme).html))
+        let doc = render::markdown_commentable("brief", &source, theme);
+        Ok(Some((doc.html, doc.sources)))
     }
 }
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     if let Err(error) = run().await {
-        eprintln!("showme: {error:#}");
+        eprintln!("wdyt: {error:#}");
         return std::process::ExitCode::FAILURE;
     }
     std::process::ExitCode::SUCCESS
@@ -276,7 +313,7 @@ async fn run() -> Result<()> {
             let ttl = config
                 .session_ttl_hours
                 .map(|h| Duration::from_secs(h * 3600));
-            showme::server::serve(&config, Store::new(ttl)).await
+            wdyt::server::serve(&config, Store::new(ttl)).await
         }
 
         Command::Port { all } => {
@@ -334,7 +371,7 @@ async fn run() -> Result<()> {
                 "the diff and the brief cannot both come from stdin. \
                  Use `--brief-file <PATH>`, or pass the patch as a file"
             );
-            // Reading from stdin is the common case: `git diff | showme diff`.
+            // Reading from stdin is the common case: `git diff | wdyt diff`.
             let source = if patch == *"-" {
                 use std::io::Read as _;
                 let mut buffer = String::new();
@@ -344,19 +381,19 @@ async fn run() -> Result<()> {
                 anyhow::ensure!(
                     !buffer.trim().is_empty(),
                     "empty diff on stdin. Pipe one in, as with \
-                     `git diff | showme diff`, or pass a patch file"
+                     `git diff | wdyt diff`, or pass a patch file"
                 );
                 buffer
             } else {
                 read_text(&patch)?
             };
 
-            let mut files = showme::diff::parse(&source, render::theme(show.theme(&config)?))?;
+            let mut files = wdyt::diff::parse(&source, render::theme(show.theme(&config)?))?;
             // A `git diff` lists files alphabetically, floating low-signal files
             // like Cargo.lock and .config/nextest.toml to the top. Order them by
             // review importance instead; the stable sort keeps patch order within
             // a rank.
-            files.sort_by_key(|f| showme::diff::review_rank(&f.label));
+            files.sort_by_key(|f| wdyt::diff::review_rank(&f.label));
             let added: usize = files.iter().map(|f| f.added).sum();
             let removed: usize = files.iter().map(|f| f.removed).sum();
             let title = show
@@ -377,7 +414,7 @@ async fn run() -> Result<()> {
             let mut rendered = Vec::with_capacity(files.len());
             for path in &files {
                 let source = read_text(path)?;
-                rendered.push(render::markdown(
+                rendered.push(render::markdown_commentable(
                     &label(path),
                     &source,
                     show.theme(&config)?,
@@ -405,7 +442,7 @@ async fn run() -> Result<()> {
             anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
             if !root.join(&entry).exists() {
                 eprintln!(
-                    "showme: warning: {} has no {entry}; the page may be blank",
+                    "wdyt: warning: {} has no {entry}; the page may be blank",
                     root.display()
                 );
             }
@@ -430,7 +467,7 @@ async fn run() -> Result<()> {
             anyhow::ensure!(
                 !ports::is_free(config.bind, port),
                 "nothing is listening on port {port}. Start the server first, \
-                 then run `showme demo {port}`"
+                 then run `wdyt demo {port}`"
             );
             let title = show
                 .title
@@ -445,12 +482,16 @@ async fn run() -> Result<()> {
             match client.wait(&id, Duration::from_secs(timeout)).await? {
                 Some(reply) => {
                     println!("{}", serde_json::to_string_pretty(&reply)?);
+                    eprintln!(
+                        "wdyt: reply received. Run `wdyt collect {id}` for line comments, then:\n  \
+                         wdyt ack {id} \"<what you are doing>\""
+                    );
                     Ok(())
                 }
                 None => {
                     eprintln!(
-                        "showme: no reply within {timeout}s. The session stays open — \
-                         check later with `showme inbox`, or `showme collect {id}`."
+                        "wdyt: no reply within {timeout}s. The session stays open — \
+                         check later with `wdyt inbox`, or `wdyt collect {id}`."
                     );
                     std::process::exit(2);
                 }
@@ -464,7 +505,7 @@ async fn run() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&items)?);
             if items.is_empty() {
                 eprintln!(
-                    "showme: no {}replies waiting",
+                    "wdyt: no {}replies waiting",
                     if all { "" } else { "unread " }
                 );
             }
@@ -482,22 +523,30 @@ async fn run() -> Result<()> {
             });
             println!("{}", serde_json::to_string_pretty(&out)?);
             if reply.is_none() && comments.is_empty() {
-                eprintln!("showme: session {id} has no reply yet");
+                eprintln!("wdyt: session {id} has no reply yet");
                 std::process::exit(2);
             }
-            // Collecting is the transport; the user's page still shows this as
-            // merely picked up until something says it was read.
-            eprintln!(
-                "showme: once you have read this, run \
-                 `showme ack {id} \"<what you are doing>\"`"
-            );
+            if reply.is_some() {
+                // A reply was collected — prompt for acknowledgement.
+                eprintln!(
+                    "wdyt: collected. Now run:\n  \
+                     wdyt ack {id} \"<what you are doing>\""
+                );
+            } else {
+                // Comments exist but no reply — ack is not valid yet.
+                eprintln!(
+                    "wdyt: collected {n} comment{s} (no reply to acknowledge yet)",
+                    n = comments.len(),
+                    s = if comments.len() == 1 { "" } else { "s" }
+                );
+            }
             Ok(())
         }
 
         Command::Ack { id, note } => {
             let note = note.join(" ");
             Client::new(&config).ack(&id, &note).await?;
-            eprintln!("showme: acknowledged {id}");
+            eprintln!("wdyt: acknowledged {id}");
             Ok(())
         }
 
@@ -505,7 +554,7 @@ async fn run() -> Result<()> {
             let client = Client::new(&config);
             let port = client.daemon_port().await.with_context(|| {
                 format!(
-                    "no showme daemon on ports {}-{}",
+                    "no wdyt daemon on ports {}-{}",
                     config.port_low, config.port_high
                 )
             })?;
@@ -545,7 +594,7 @@ async fn run() -> Result<()> {
             if let Some(theme) = theme {
                 anyhow::ensure!(
                     render::theme_names().contains(&theme.as_str()),
-                    "unknown theme {theme:?}. See `showme themes`"
+                    "unknown theme {theme:?}. See `wdyt themes`"
                 );
                 config.theme = theme;
                 changed = true;
@@ -558,15 +607,15 @@ async fn run() -> Result<()> {
                 // payload is wrong and only fails inside the workflow, so name
                 // the shape here rather than leaving it to be discovered.
                 if let Some(url) = &config.webhook_url {
-                    match showme::notify::Style::detect(url) {
-                        showme::notify::Style::Trigger => println!(
+                    match wdyt::notify::Style::detect(url) {
+                        wdyt::notify::Style::Trigger => println!(
                             "detected a Slack workflow trigger: sending \
                              {{\"{}\": \"…\"}}.\nIf the workflow declares a \
                              different variable, set it with \
-                             `showme config --webhook-field <NAME>`.",
+                             `wdyt config --webhook-field <NAME>`.",
                             config.webhook_field
                         ),
-                        showme::notify::Style::Blocks => {
+                        wdyt::notify::Style::Blocks => {
                             println!("detected a Slack incoming webhook: sending Block Kit.");
                         }
                     }
@@ -577,7 +626,7 @@ async fn run() -> Result<()> {
                 if config.webhook_url.is_none() {
                     println!(
                         "# no webhook_url set: links are printed instead of sent.\n\
-                         # set one with: showme config --webhook-url <URL>"
+                         # set one with: wdyt config --webhook-url <URL>"
                     );
                 }
             }
@@ -603,22 +652,49 @@ async fn show_content(
 ) -> Result<()> {
     let kind = content.kind();
     let client = Client::new(config);
+    // Extract wait parameters before partial moves of `show`.
+    let do_wait = show.should_wait();
+    let timeout = show.timeout;
+    let no_notify = show.no_notify;
     // The theme travels with the session so the page's chrome agrees with the
     // highlighting the CLI already applied.
     let theme = show.theme(config)?.to_owned();
-    let brief = show.brief(config)?;
+    let brief_pair = show.brief(config)?;
+    let (brief, brief_sources) = match brief_pair {
+        Some((html, sources)) => (Some(html), sources),
+        None => (None, Vec::new()),
+    };
+
+    // Collect file labels for anchor printing (before content is moved).
+    let file_labels: Vec<String> = match &content {
+        Content::Code { files } => files.iter().map(|f| f.label.clone()).collect(),
+        Content::Diff { files } => files.iter().map(|f| f.label.clone()).collect(),
+        Content::Docs { files } => files.iter().map(|f| f.label.clone()).collect(),
+        _ => Vec::new(),
+    };
+
+    // Reject duplicate/colliding anchors before creating the session. Two files
+    // that normalize to the same #f- anchor would break page navigation and
+    // guided-review links.
+    if !file_labels.is_empty()
+        && let Err(msg) = wdyt::validate_file_anchors(&file_labels)
+    {
+        anyhow::bail!("{msg}");
+    }
+
     let id = client
-        .create(showme::server::CreateSession {
+        .create(wdyt::server::CreateSession {
             note: show.note.clone(),
             theme: Some(theme),
             brief,
-            ..showme::server::CreateSession::new(title.clone(), content)
+            brief_sources,
+            ..wdyt::server::CreateSession::new(title.clone(), content)
         })
         .await?;
     // Which agent is asking: with several running there is otherwise nothing in
     // the notification to say which pane to go back to.
     let mut details = details;
-    if let Some(origin) = showme::zellij_origin::Origin::detect().summary() {
+    if let Some(origin) = wdyt::zellij_origin::Origin::detect().summary() {
         details.push(origin);
     }
     // The daemon's port is discovered, not assumed: the range is chosen for
@@ -633,7 +709,7 @@ async fn show_content(
         details,
     };
 
-    let webhook = (!show.no_notify)
+    let webhook = (!no_notify)
         .then_some(config.webhook_url.as_deref())
         .flatten();
     let sent = notification.send(webhook, &config.webhook_field).await?;
@@ -641,21 +717,40 @@ async fn show_content(
     // The URL always goes to stdout so the agent can quote it back to the user
     // even when a notification went out.
     println!("{url}");
+    // Flush stdout before blocking so a downstream reader gets the URL
+    // immediately even when stdout is piped (and therefore fully buffered).
+    use std::io::Write as _;
+    std::io::stdout()
+        .flush()
+        .context("failed to flush session URL to stdout")?;
+
     if !sent {
-        eprintln!("showme: session {id} ready (no notification sent)");
+        if no_notify {
+            eprintln!("wdyt: session {id} ready (notification skipped)");
+        } else {
+            eprintln!("wdyt: session {id} ready (no webhook configured)");
+        }
     }
 
-    if show.wait {
-        eprintln!("showme: waiting up to {}s for a reply…", show.timeout);
-        match client.wait(&id, Duration::from_secs(show.timeout)).await? {
+    // Print file anchors to stderr so agents know how to link in --brief.
+    if !file_labels.is_empty() {
+        eprintln!("wdyt: file anchors for --brief links:");
+        for label in &file_labels {
+            eprintln!("  {} → #{}", label, wdyt::file_anchor(label));
+        }
+    }
+
+    if do_wait {
+        eprintln!("wdyt: waiting up to {timeout}s for a reply…");
+        match client.wait(&id, Duration::from_secs(timeout)).await? {
             Some(reply) => {
                 println!("{}", serde_json::to_string_pretty(&reply)?);
                 // Receiving it is not reading it, and the page says so until an
                 // ack arrives. Prompt for one rather than leaving the user
                 // looking at an amber dot.
                 eprintln!(
-                    "showme: once you have read this, run \
-                     `showme ack {id} \"<what you are doing>\"`"
+                    "wdyt: reply received. Run `wdyt collect {id}` for line comments, then:\n  \
+                     wdyt ack {id} \"<what you are doing>\""
                 );
             }
             None => {
@@ -663,13 +758,19 @@ async fn show_content(
                 // the reply for as long as the session lives, so say where to
                 // find it rather than letting it look lost.
                 eprintln!(
-                    "showme: no reply within {}s. The session stays open — check \
-                     later with `showme inbox`, or `showme collect {id}`.",
-                    show.timeout
+                    "wdyt: no reply within {timeout}s. The session stays open:\n  \
+                     wdyt collect {id}    # check for reply + comments later\n  \
+                     wdyt inbox           # list all pending replies",
                 );
                 std::process::exit(2);
             }
         }
+    } else {
+        // --no-wait: brief guidance on what to do next.
+        eprintln!(
+            "wdyt: session {id} created (not waiting). To collect later:\n  \
+             wdyt collect {id}"
+        );
     }
     Ok(())
 }
@@ -745,5 +846,172 @@ mod tests {
         assert_eq!(parse_range("3000-3010").unwrap(), (3000, 3010));
         assert!(parse_range("3000").is_err());
         assert!(parse_range("3010-3000").is_err());
+    }
+
+    // — Parser tests for --no-wait / --wait on every content command —
+
+    /// Helper: parse CLI args and extract the ShowArgs.
+    fn parse_show(args: &[&str]) -> ShowArgs {
+        let cli = Cli::parse_from(args);
+        match cli.command {
+            Command::Code { show, .. } => show,
+            Command::Diff { show, .. } => show,
+            Command::Docs { show, .. } => show,
+            Command::Dir { show, .. } => show,
+            Command::Demo { show, .. } => show,
+            _ => panic!("not a content command"),
+        }
+    }
+
+    #[test]
+    fn code_waits_by_default() {
+        let show = parse_show(&["wdyt", "code", "f.rs"]);
+        assert!(show.should_wait());
+    }
+
+    #[test]
+    fn code_no_wait_opts_out() {
+        let show = parse_show(&["wdyt", "code", "f.rs", "--no-wait"]);
+        assert!(!show.should_wait());
+    }
+
+    #[test]
+    fn code_legacy_wait_still_accepted() {
+        // --wait is silently accepted for backwards compat (it was the default).
+        let show = parse_show(&["wdyt", "code", "f.rs", "--wait"]);
+        assert!(show.should_wait());
+    }
+
+    #[test]
+    fn diff_waits_by_default() {
+        let show = parse_show(&["wdyt", "diff", "p.patch"]);
+        assert!(show.should_wait());
+    }
+
+    #[test]
+    fn diff_no_wait_opts_out() {
+        let show = parse_show(&["wdyt", "diff", "--no-wait"]);
+        assert!(!show.should_wait());
+    }
+
+    #[test]
+    fn diff_legacy_wait_accepted() {
+        let show = parse_show(&["wdyt", "diff", "--wait"]);
+        assert!(show.should_wait());
+    }
+
+    #[test]
+    fn docs_waits_by_default() {
+        let show = parse_show(&["wdyt", "docs", "README.md"]);
+        assert!(show.should_wait());
+    }
+
+    #[test]
+    fn docs_no_wait_opts_out() {
+        let show = parse_show(&["wdyt", "docs", "README.md", "--no-wait"]);
+        assert!(!show.should_wait());
+    }
+
+    #[test]
+    fn docs_legacy_wait_accepted() {
+        let show = parse_show(&["wdyt", "docs", "README.md", "--wait"]);
+        assert!(show.should_wait());
+    }
+
+    #[test]
+    fn dir_waits_by_default() {
+        let show = parse_show(&["wdyt", "dir", "/tmp"]);
+        assert!(show.should_wait());
+    }
+
+    #[test]
+    fn dir_no_wait_opts_out() {
+        let show = parse_show(&["wdyt", "dir", "/tmp", "--no-wait"]);
+        assert!(!show.should_wait());
+    }
+
+    #[test]
+    fn dir_legacy_wait_accepted() {
+        let show = parse_show(&["wdyt", "dir", "/tmp", "--wait"]);
+        assert!(show.should_wait());
+    }
+
+    #[test]
+    fn demo_waits_by_default() {
+        let show = parse_show(&["wdyt", "demo", "8080"]);
+        assert!(show.should_wait());
+    }
+
+    #[test]
+    fn demo_no_wait_opts_out() {
+        let show = parse_show(&["wdyt", "demo", "8080", "--no-wait"]);
+        assert!(!show.should_wait());
+    }
+
+    #[test]
+    fn demo_legacy_wait_accepted() {
+        let show = parse_show(&["wdyt", "demo", "8080", "--wait"]);
+        assert!(show.should_wait());
+    }
+
+    #[test]
+    fn timeout_is_customisable() {
+        let show = parse_show(&["wdyt", "code", "f.rs", "--timeout", "30"]);
+        assert_eq!(show.timeout, 30);
+        assert!(show.should_wait());
+    }
+
+    #[test]
+    fn no_wait_and_timeout_conflict() {
+        // --timeout explicitly supplied with --no-wait must be rejected.
+        let result = Cli::try_parse_from(["wdyt", "code", "f.rs", "--no-wait", "--timeout", "5"]);
+        assert!(result.is_err(), "--no-wait and --timeout should conflict");
+    }
+
+    #[test]
+    fn wait_and_no_wait_conflict() {
+        // --wait and --no-wait must be rejected.
+        let result = Cli::try_parse_from(["wdyt", "code", "f.rs", "--wait", "--no-wait"]);
+        assert!(result.is_err(), "--wait and --no-wait should conflict");
+    }
+
+    #[test]
+    fn no_wait_is_not_in_help() {
+        // --wait must be hidden; --no-wait must be visible.
+        use clap::CommandFactory;
+        let mut buf = Vec::new();
+        Cli::command()
+            .find_subcommand("code")
+            .unwrap()
+            .clone()
+            .write_help(&mut buf)
+            .unwrap();
+        let help = String::from_utf8(buf).unwrap();
+        assert!(help.contains("--no-wait"), "help should show --no-wait");
+        // --wait is hidden: it should NOT appear as its own option line.
+        // Check that no line starts with a --wait option description (lines
+        // that only mention --no-wait are fine).
+        let has_wait_option_line = help.lines().any(|line| {
+            let trimmed = line.trim();
+            // An option line for --wait would start with "--wait" but NOT
+            // "--wait" as part of "--no-wait".
+            trimmed.starts_with("--wait") && !trimmed.starts_with("--no-wait")
+        });
+        assert!(
+            !has_wait_option_line,
+            "--wait should be hidden from help output:\n{help}"
+        );
+    }
+
+    #[test]
+    fn standalone_wait_command_parses() {
+        let cli = Cli::parse_from(["wdyt", "wait", "abc123", "--timeout", "30"]);
+        match cli.command {
+            Command::Wait { id, timeout } => {
+                assert_eq!(id, "abc123");
+                assert_eq!(timeout, 30);
+            }
+            _ => panic!("expected Wait"),
+        }
     }
 }

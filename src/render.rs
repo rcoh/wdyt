@@ -44,7 +44,7 @@ pub fn theme(name: &str) -> &'static Theme {
         })
 }
 
-/// Theme names, for `showme themes`.
+/// Theme names, for `wdyt themes`.
 pub fn theme_names() -> Vec<&'static str> {
     let mut names: Vec<_> = themes().theme_names().collect();
     names.sort_unstable();
@@ -141,6 +141,10 @@ pub fn highlight(label: &str, source: &str, theme: &Theme) -> Result<CodeFile> {
 
     let mut highlighter = HighlightLines::new(syntax, theme);
     let mut rows = String::new();
+    // Per-line highlighted HTML and plain text, kept parallel so the commentable
+    // page can render one row per line and quote a snippet authoritatively.
+    let mut highlighted = Vec::new();
+    let mut sources = Vec::new();
     let mut lines = 0usize;
 
     for (index, line) in LinesWithEndings::from(source).enumerate() {
@@ -157,9 +161,14 @@ pub fn highlight(label: &str, source: &str, theme: &Theme) -> Result<CodeFile> {
             code.push_str("&nbsp;");
         }
         rows.push_str(&format!(
-            "<tr id=\"L{n}\"><td class=\"ln\"><a href=\"#L{n}\">{n}</a></td><td class=\"code\">{code}</td></tr>",
+            "<tr id=\"{anchor}-L{n}\"><td class=\"ln\"><a href=\"#L{n}\">{n}</a></td><td class=\"code\">{code}</td></tr>",
+            anchor = crate::file_anchor(label),
             n = lines,
         ));
+        highlighted.push(code);
+        // The stored text is the line without its trailing newline, so a quoted
+        // snippet joins cleanly.
+        sources.push(line.strip_suffix('\n').unwrap_or(line).to_owned());
     }
 
     if lines == 0 {
@@ -169,6 +178,8 @@ pub fn highlight(label: &str, source: &str, theme: &Theme) -> Result<CodeFile> {
     Ok(CodeFile {
         label: label.to_owned(),
         html: format!("<table class=\"src\">{rows}</table>"),
+        highlighted,
+        sources,
         lines,
         language: syntax.name.clone(),
     })
@@ -177,6 +188,17 @@ pub fn highlight(label: &str, source: &str, theme: &Theme) -> Result<CodeFile> {
 /// Renders markdown with GFM extensions, highlighting fenced code with
 /// `theme_name`.
 pub fn markdown(label: &str, source: &str, theme_name: &str) -> DocFile {
+    markdown_inner(label, source, theme_name, false)
+}
+
+/// Renders markdown for commenting: includes `data-sourcepos` attributes on
+/// block-level elements and stores per-line source text for authoritative
+/// snippet lookup.
+pub fn markdown_commentable(label: &str, source: &str, theme_name: &str) -> DocFile {
+    markdown_inner(label, source, theme_name, true)
+}
+
+fn markdown_inner(label: &str, source: &str, theme_name: &str, commentable: bool) -> DocFile {
     let mut options = comrak::Options::default();
     options.extension.table = true;
     options.extension.strikethrough = true;
@@ -188,12 +210,20 @@ pub fn markdown(label: &str, source: &str, theme_name: &str) -> DocFile {
     // GitHub-style `> [!NOTE]` callouts, which agents write often.
     options.extension.alerts = true;
     options.extension.description_lists = true;
-    // Raw HTML in the markdown is passed through. The input is a file the
-    // agent produced for the user to read on a loopback-only server, and
-    // stripping it would mangle docs that legitimately contain HTML.
-    options.render.r#unsafe = true;
+    // Raw HTML in the markdown is stripped rather than passed through. The
+    // server is loopback-only, but there is no HTML sanitizer downstream, so
+    // letting `<script>` or `<iframe>` through from an agent-authored markdown
+    // file would be an XSS vector. GFM features (tables, callouts, tasklists,
+    // fences) are all preserved because they go through comrak's own rendering
+    // rather than raw pass-through.
+    options.render.r#unsafe = false;
+    // Emit `data-sourcepos` attributes on block elements so the comment
+    // machinery can address lines by their position in the original markdown.
+    if commentable {
+        options.render.sourcepos = true;
+    }
 
-    // Fenced code blocks get highlighted with the same theme as `showme code`.
+    // Fenced code blocks get highlighted with the same theme as `wdyt code`.
     let adapter = comrak::plugins::syntect::SyntectAdapterBuilder::new()
         .syntax_set(syntaxes().clone())
         .theme_set(themes().into())
@@ -202,9 +232,18 @@ pub fn markdown(label: &str, source: &str, theme_name: &str) -> DocFile {
     let mut plugins = comrak::options::Plugins::default();
     plugins.render.codefence_syntax_highlighter = Some(&adapter);
 
+    let html = comrak::markdown_to_html_with_plugins(source, &options, &plugins);
+
+    let sources = if commentable {
+        source.lines().map(|line| line.to_owned()).collect()
+    } else {
+        Vec::new()
+    };
+
     DocFile {
         label: label.to_owned(),
-        html: comrak::markdown_to_html_with_plugins(source, &options, &plugins),
+        html,
+        sources,
     }
 }
 
@@ -216,9 +255,25 @@ mod tests {
     fn highlights_rust_with_line_numbers() {
         let file = highlight("lib.rs", "fn main() {}\nlet x = 1;\n", theme("Nord")).unwrap();
         assert_eq!(file.lines, 2);
-        assert!(file.html.contains("id=\"L1\""));
-        assert!(file.html.contains("id=\"L2\""));
+        // IDs are namespaced by file anchor to prevent cross-file collisions.
+        assert!(file.html.contains("id=\"f-lib-rs-L1\""));
+        assert!(file.html.contains("id=\"f-lib-rs-L2\""));
         assert_eq!(file.language, "Rust");
+    }
+
+    #[test]
+    fn per_line_sources_and_highlighting_are_stored_for_commenting() {
+        // The plain text of each line is kept so the server can quote a comment's
+        // snippet authoritatively, with the trailing newline stripped. The
+        // highlighted HTML is kept in parallel so the commentable page can render
+        // one row per line without re-highlighting.
+        let file = highlight("lib.rs", "fn main() {}\nlet x = 1;\n", theme("Nord")).unwrap();
+        assert_eq!(file.sources, vec!["fn main() {}", "let x = 1;"]);
+        assert_eq!(file.highlighted.len(), 2);
+        assert_eq!(file.sources.len(), file.highlighted.len());
+        // A file with no trailing newline keeps its last line whole.
+        let no_nl = highlight("lib.rs", "one\ntwo", theme("Nord")).unwrap();
+        assert_eq!(no_nl.sources, vec!["one", "two"]);
     }
 
     #[test]

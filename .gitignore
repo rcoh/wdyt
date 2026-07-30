@@ -1,6 +1,6 @@
 /target
 
-# The real config lives in ~/.config/showme/config.toml and holds the webhook
+# The real config lives in ~/.config/wdyt/config.toml and holds the webhook
 # URL. Nothing config-shaped belongs in the repo.
 config.toml
 *.log

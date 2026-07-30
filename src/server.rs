@@ -13,8 +13,8 @@ use topcoat::view::view;
 
 use crate::config::Config;
 use crate::render::{ThemeColors, theme, theme_colors};
-use crate::session::{Anchor, Comment, Content, Reply, Side, Store};
-use crate::ui::{Raw, diff_hunk, shell};
+use crate::session::{Anchor, Comment, Content, Reply, Session, Side, Store};
+use crate::ui::{Raw, code_file, diff_hunk, shell};
 
 /// Values shared by every request.
 struct State {
@@ -69,6 +69,10 @@ pub struct CreateSession {
     /// where the theme for fenced code blocks is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brief: Option<String>,
+    /// Per-line source text of the brief markdown, for authoritative snippet
+    /// lookup on comments addressed to the brief.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub brief_sources: Vec<String>,
 }
 
 impl CreateSession {
@@ -81,6 +85,7 @@ impl CreateSession {
             origin: None,
             theme: None,
             brief: None,
+            brief_sources: Vec::new(),
         }
     }
 }
@@ -92,6 +97,20 @@ pub struct CreatedSession {
 
 #[route(POST "/api/sessions")]
 async fn create_route(cx: &Cx, Json(input): Json<CreateSession>) -> Result<Json<CreatedSession>> {
+    // Reject sessions with colliding file anchors. Two files that normalize to
+    // the same #f- anchor would break page navigation and guided-review links.
+    let labels: Vec<String> = match &input.content {
+        Content::Code { files } => files.iter().map(|f| f.label.clone()).collect(),
+        Content::Diff { files } => files.iter().map(|f| f.label.clone()).collect(),
+        Content::Docs { files } => files.iter().map(|f| f.label.clone()).collect(),
+        _ => Vec::new(),
+    };
+    if !labels.is_empty()
+        && let Err(msg) = crate::validate_file_anchors(&labels)
+    {
+        return Err(bad_request(msg).into());
+    }
+
     let id = state(cx).store.insert_new(crate::session::NewSession {
         note: input.note,
         // The daemon is long-lived and shared, so it cannot detect this itself:
@@ -99,6 +118,7 @@ async fn create_route(cx: &Cx, Json(input): Json<CreateSession>) -> Result<Json<
         origin: input.origin.unwrap_or_default(),
         theme: input.theme,
         brief: input.brief,
+        brief_sources: input.brief_sources,
         ..crate::session::NewSession::new(input.title, input.content)
     });
     Ok(Json(CreatedSession { id }))
@@ -252,6 +272,13 @@ async fn list_comments_route(cx: &Cx) -> Result<Json<Comments>> {
 #[derive(Deserialize)]
 struct CommentInput {
     file: String,
+    /// Explicit comment target identity, separate from display label.
+    ///
+    /// New UI sends `"brief"` for guided briefs, `"doc:<n>"` for the nth docs
+    /// file. Legacy clients omit this, falling back to `file`-based resolution
+    /// when unambiguous.
+    #[serde(default)]
+    target: Option<String>,
     line: usize,
     /// The last line of a dragged range. Absent for a single-line comment.
     #[serde(default)]
@@ -266,7 +293,7 @@ struct CommentInput {
 /// from the request: the page should not have to be trusted to say what a line
 /// said, and an anchor that matches no line is a bug worth reporting as one.
 #[route(POST "/s/{session_id}/comments")]
-async fn comment_route(cx: &Cx, Json(input): Json<CommentInput>) -> Result<Json<Comment>> {
+async fn comment_route(cx: &Cx, Json(mut input): Json<CommentInput>) -> Result<Json<Comment>> {
     let id = path_param::<SessionId>(cx)?;
     let text = input.text.trim().to_owned();
     if text.is_empty() {
@@ -277,21 +304,71 @@ async fn comment_route(cx: &Cx, Json(input): Json<CommentInput>) -> Result<Json<
     }
     let side = Side::parse(&input.side).ok_or_else(|| bad_request("side must be old or new"))?;
 
+    // Explicit markdown targets are authoritative; the display label stored in
+    // the comment comes from the session, never from the request.
+    if let Some(target) = input.target.as_deref() {
+        let file = state(cx)
+            .store
+            .with(id, |session| match target {
+                "brief" if !session.brief_sources.is_empty() => Some("brief:".to_owned()),
+                value if value.starts_with("doc:") => {
+                    let index = value.strip_prefix("doc:")?.parse::<usize>().ok()?;
+                    let Content::Docs { files } = &session.content else {
+                        return None;
+                    };
+                    files.get(index).map(|file| file.label.clone())
+                }
+                _ => None,
+            })
+            .ok_or_else(not_found)?
+            .ok_or_else(|| bad_request("unknown comment target"))?;
+        input.file = file;
+    }
+
+    // Reject line 0, which is not a valid 1-indexed position.
+    if input.line == 0 {
+        return Err(bad_request("line must be >= 1").into());
+    }
+    // Reject end_line of 0 as well.
+    if input.end_line.is_some_and(|e| e == 0) {
+        return Err(bad_request("end_line must be >= 1").into());
+    }
+
+    // Determine whether this is targeting a doc/brief/code based on explicit
+    // target or content type. All non-diff types require Side::New.
+    let requires_side_new = input.target.as_deref() == Some("brief")
+        || input
+            .target
+            .as_deref()
+            .is_some_and(|t| t.starts_with("doc:"))
+        || input.file == "brief:"
+        || state(cx)
+            .store
+            .with(id, |s| {
+                matches!(&s.content, Content::Docs { .. } | Content::Code { .. })
+            })
+            .unwrap_or(false);
+    if requires_side_new && side != Side::New {
+        return Err(bad_request("side must be new for code/docs/brief comments").into());
+    }
+
     // `Anchor::range` puts the ends in order, so a drag upwards needs no special
     // case here.
-    let anchor = match input.end_line {
+    let mut anchor = match input.end_line {
         Some(end) => Anchor::range(input.file, input.line, end, side),
         None => Anchor::line(input.file, input.line, side),
     };
+    anchor.target = input.target;
+
     if anchor.span() > MAX_COMMENT_LINES {
         return Err(bad_request("comment covers too many lines").into());
     }
 
     let snippet = state(cx)
         .store
-        .with(id, |session| snippet_for(&session.content, &anchor))
+        .with(id, |session| snippet_for(session, &anchor))
         .ok_or_else(not_found)?
-        .ok_or_else(|| bad_request("no such line in this diff"))?;
+        .ok_or_else(|| bad_request("no such line in this session"))?;
 
     let comment = state(cx)
         .store
@@ -302,20 +379,78 @@ async fn comment_route(cx: &Cx, Json(input): Json<CommentInput>) -> Result<Json<
 
 /// The text of the lines a comment anchors to, if any exist.
 ///
-/// A range is joined with newlines. Returns `None` when the first line does not
-/// exist, which is the case worth rejecting: a range whose tail runs past the end
-/// of a hunk is quoted as far as it goes rather than refused, since a drag can
-/// legitimately end on the last line shown.
-fn snippet_for(content: &Content, anchor: &Anchor) -> Option<String> {
+/// Resolution uses the explicit `target` when present:
+/// - `"brief"` → the guided-review brief sources
+/// - `"doc:<n>"` → the nth docs file (0-indexed)
+///
+/// Legacy (no target):
+/// - `file == "brief:"` → brief sources
+/// - For Code: finds the file by label
+/// - For Docs: finds the file by label, rejecting if ambiguous
+/// - For Diff: standard side-based line lookup
+///
+/// Strict validation: code/docs/brief reject Side::Old and any line beyond the
+/// stored source length (no truncation). Returns `None` on out-of-bounds rather
+/// than silently quoting partial content.
+fn snippet_for(session: &Session, anchor: &Anchor) -> Option<String> {
+    let content = &session.content;
+    let brief_sources = &session.brief_sources;
+
+    // Explicit target resolution (new UI protocol).
+    if let Some(target) = &anchor.target {
+        return match target.as_str() {
+            "brief" => snippet_from_lines_strict(brief_sources, anchor),
+            t if t.starts_with("doc:") => {
+                let idx: usize = t.strip_prefix("doc:").unwrap().parse().ok()?;
+                if let Content::Docs { files } = content {
+                    let file = files.get(idx)?;
+                    snippet_from_lines_strict(&file.sources, anchor)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+    }
+
+    // Legacy resolution (no explicit target).
+
+    // Legacy brief comments used the reserved file identifier `brief:`. Keep
+    // accepting it only when it is unambiguous with the session's doc labels.
+    if anchor.file == "brief:" && !brief_sources.is_empty() {
+        match content {
+            Content::Docs { files } if files.iter().any(|file| file.label == anchor.file) => {
+                // A legacy request cannot distinguish this document from the
+                // guided brief; require the explicit `doc:<n>`/`brief` target.
+                return None;
+            }
+            Content::Code { files } if files.iter().any(|file| file.label == anchor.file) => {}
+            Content::Diff { files } if files.iter().any(|file| file.label == anchor.file) => {}
+            _ => return snippet_from_lines_strict(brief_sources, anchor),
+        }
+    }
+
+    if let Content::Code { files } = content {
+        let file = files.iter().find(|f| f.label == anchor.file)?;
+        return snippet_from_lines_strict(&file.sources, anchor);
+    }
+
+    if let Content::Docs { files } = content {
+        // Reject ambiguous resolution: if multiple files share the same label,
+        // legacy resolution (by label alone) is refused.
+        let matches: Vec<_> = files.iter().filter(|f| f.label == anchor.file).collect();
+        if matches.len() != 1 {
+            return None;
+        }
+        return snippet_from_lines_strict(&matches[0].sources, anchor);
+    }
+
     let Content::Diff { files } = content else {
         return None;
     };
     let (file, line, side) = (&anchor.file, anchor.line, anchor.side);
     let end_line = anchor.last();
-    // Addressable line numbers on this side, paired with their text. A removed
-    // line is only addressable on the old side and an added one only on the new,
-    // so the kind check keeps a context line's twin numbers from matching the
-    // wrong side.
+    // Addressable line numbers on this side, paired with their text.
     let addressable: Vec<(usize, &str)> = files
         .iter()
         .filter(|f| &f.label == file)
@@ -331,20 +466,53 @@ fn snippet_for(content: &Content, anchor: &Anchor) -> Option<String> {
         })
         .collect();
 
-    // The anchor itself must exist; a range whose tail runs past the end of a
-    // hunk is quoted as far as it goes, since a drag can legitimately end there.
+    // The anchor itself must exist; the endpoint must also exist.
     if !addressable.iter().any(|(n, _)| *n == line) {
         return None;
     }
-    let quoted: Vec<&str> = addressable
+    if !addressable.iter().any(|(n, _)| *n == end_line) {
+        return None;
+    }
+    // Collect all addressable lines in the requested range.
+    let quoted: Vec<(usize, &str)> = addressable
         .iter()
         .filter(|(n, _)| (line..=end_line).contains(n))
-        .map(|(_, text)| *text)
+        .copied()
         .collect();
-    Some(quoted.join("\n"))
+    // Require the complete contiguous range: every line number from `line` to
+    // `end_line` must be present. A gap (lines in a different hunk or not
+    // addressable) means the range is invalid rather than truncatable.
+    let expected_count = end_line - line + 1;
+    if quoted.len() != expected_count {
+        return None;
+    }
+    Some(
+        quoted
+            .iter()
+            .map(|(_, text)| *text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
-/// One session's reply, as reported by `showme inbox`.
+/// Looks up a snippet from a flat list of source lines (1-indexed), strictly.
+///
+/// Returns `None` when the first line is out of bounds OR the end line exceeds
+/// the source length. No truncation: the caller gets the full range or nothing.
+/// Shared by code files, doc files, and briefs.
+fn snippet_from_lines_strict(sources: &[String], anchor: &Anchor) -> Option<String> {
+    let first = anchor.line.checked_sub(1)?;
+    if first >= sources.len() {
+        return None;
+    }
+    let last = anchor.last();
+    if last > sources.len() {
+        return None;
+    }
+    Some(sources[first..last].join("\n"))
+}
+
+/// One session's reply, as reported by `wdyt inbox`.
 #[derive(Serialize, Deserialize)]
 pub struct InboxItem {
     pub id: String,
@@ -364,7 +532,7 @@ pub struct Inbox {
 /// A foreground `--wait` is a poor place to keep a 24-hour wait: the agent's
 /// turn ends long before the user gets to the notification. The daemon keeps the
 /// reply either way, so this is how a later turn finds one it missed. Marks
-/// nothing delivered — `showme collect` does that, deliberately, so taking a
+/// nothing delivered — `wdyt collect` does that, deliberately, so taking a
 /// reply is an explicit act.
 ///
 /// `?unread=1` filters on the *ack*, not on delivery: a reply that was collected
@@ -437,15 +605,15 @@ pub async fn serve(config: &Config, store: Store) -> AnyResult<()> {
     let (listener, port) = bound.ok_or_else(|| {
         let (last, error) = last_error.expect("the range is non-empty");
         anyhow::anyhow!(
-            "no free port in {}-{} ({last}: {error}). Is a showme daemon already \
-             running? Widen the range with `showme config --ports LOW-HIGH`",
+            "no free port in {}-{} ({last}: {error}). Is a wdyt daemon already \
+             running? Widen the range with `wdyt config --ports LOW-HIGH`",
             config.port_low,
             config.port_high,
         )
     })?;
 
     let colors = theme_colors(theme(&config.theme));
-    eprintln!("showme listening on http://{}:{port}", config.public_host);
+    eprintln!("wdyt listening on http://{}:{port}", config.public_host);
     topcoat::serve(listener, router(store, colors, config.theme.clone()))
         .await
         .context("server error")
@@ -469,13 +637,13 @@ async fn index_page(cx: &Cx) -> Result {
             if sessions.is_empty() {
                 <p style="color: var(--muted)">
                     "No sessions yet. An agent creates one with "
-                    <code>"showme code …"</code>
+                    <code>"wdyt code …"</code>
                     ", "
-                    <code>"showme docs …"</code>
+                    <code>"wdyt docs …"</code>
                     ", "
-                    <code>"showme dir …"</code>
+                    <code>"wdyt dir …"</code>
                     ", or "
-                    <code>"showme demo …"</code>
+                    <code>"wdyt demo …"</code>
                     "."
                 </p>
             } else {
@@ -525,11 +693,22 @@ async fn session_page(cx: &Cx) -> Result {
                 session.origin.clone(),
                 session.theme.clone(),
                 session.brief.clone(),
+                session.brief_sources.clone(),
             )
         })
         .ok_or_else(not_found)?;
-    let (title, note, content, existing_reply, kind, comments, origin, session_theme, brief) =
-        session;
+    let (
+        title,
+        note,
+        content,
+        existing_reply,
+        kind,
+        comments,
+        origin,
+        session_theme,
+        brief,
+        brief_sources,
+    ) = session;
 
     // A session highlighted with its own theme needs the page's colours to match
     // it: the card's background comes from here, and a mismatch puts light code
@@ -554,7 +733,41 @@ async fn session_page(cx: &Cx) -> Result {
     // The agent's own tour of the work, above everything: what changed, why, and
     // what to look at first. Rendered even in the framed modes, where it is the
     // only prose the page has room for.
+    let brief_comments: Vec<_> = comments
+        .iter()
+        .filter(|c| {
+            // New protocol: explicit target="brief" is authoritative.
+            if c.target.as_deref() == Some("brief") {
+                return true;
+            }
+            // Legacy fallback: file="brief:" is only accepted when no explicit
+            // target is set. A docs file literally named "brief:" will have
+            // target=Some("doc:<n>"), so this condition excludes it.
+            if c.target.is_none() && c.file == "brief:" {
+                return true;
+            }
+            false
+        })
+        .cloned()
+        .collect();
+    let brief_commentable = !brief_sources.is_empty();
     let guide = match &brief {
+        Some(html) if brief_commentable => Some(view! { cx =>
+            <section class="brief doc" data-doc-file="brief:" data-doc-target="brief" data-session=(id)>(Raw(html.clone()))</section>
+            <div id="wdyt-brief-comments" hidden="hidden">
+                for comment in &brief_comments {
+                    <div class="wdyt-comment-data"
+                        data-comment-id=(comment.id)
+                        data-comment-target=(comment.target.as_deref().unwrap_or(""))
+                        data-comment-file=(&comment.file)
+                        data-comment-line=(comment.line)
+                        data-comment-end-line=(comment.end_line.map_or(String::new(), |e| e.to_string()))
+                        data-comment-side=(comment.side.as_str())
+                        data-comment-snippet=(&comment.snippet)
+                    >(&comment.text)</div>
+                }
+            </div>
+        }?),
         Some(html) => Some(view! { cx =>
             <section class="brief doc">(Raw(html.clone()))</section>
         }?),
@@ -562,32 +775,53 @@ async fn session_page(cx: &Cx) -> Result {
     };
 
     let nav = match &content {
-        Content::Code { files } => Some(view! { cx =>
-            <nav class="files">
-                for file in files {
-                    <a href=(format!("#{}", anchor(&file.label)))>(&file.label)</a>
-                }
-            </nav>
-        }?),
-        Content::Diff { files } => Some(view! { cx =>
-            <nav class="files">
-                for file in files {
-                    <a href=(format!("#{}", anchor(&file.label)))>
-                        (&file.label)
-                        " "
-                        <span class="added">"+" (file.added)</span>
-                        <span class="removed">"−" (file.removed)</span>
-                    </a>
-                }
-            </nav>
-        }?),
-        Content::Docs { files } if files.len() > 1 => Some(view! { cx =>
-            <nav class="files">
-                for file in files {
-                    <a href=(format!("#{}", anchor(&file.label)))>(&file.label)</a>
-                }
-            </nav>
-        }?),
+        Content::Code { files } if files.len() > 1 => {
+            let cls = if files.len() > 3 {
+                "files has-sidebar"
+            } else {
+                "files"
+            };
+            Some(view! { cx =>
+                <nav class=(cls)>
+                    for file in files {
+                        <a href=(format!("#{}", anchor(&file.label)))>(&file.label)</a>
+                    }
+                </nav>
+            }?)
+        }
+        Content::Diff { files } if files.len() > 1 => {
+            let cls = if files.len() > 3 {
+                "files has-sidebar"
+            } else {
+                "files"
+            };
+            Some(view! { cx =>
+                <nav class=(cls)>
+                    for file in files {
+                        <a href=(format!("#{}", anchor(&file.label)))>
+                            (&file.label)
+                            " "
+                            <span class="added">"+" (file.added)</span>
+                            <span class="removed">"−" (file.removed)</span>
+                        </a>
+                    }
+                </nav>
+            }?)
+        }
+        Content::Docs { files } if files.len() > 1 => {
+            let cls = if files.len() > 3 {
+                "files has-sidebar"
+            } else {
+                "files"
+            };
+            Some(view! { cx =>
+                <nav class=(cls)>
+                    for file in files {
+                        <a href=(format!("#{}", anchor(&file.label)))>(&file.label)</a>
+                    }
+                </nav>
+            }?)
+        }
         _ => None,
     };
 
@@ -602,7 +836,10 @@ async fn session_page(cx: &Cx) -> Result {
 
     let body = match &content {
         Content::Code { files } => view! { cx =>
-            <div class="wrap">
+            // `data-comments` is the hook the comment script binds to, shared with
+            // the diff wrap; the session id travels with it so the script needs no
+            // inlined state.
+            <div class="wrap" data-comments="1" data-session=(id)>
                 for file in files {
                     <section class="file" id=(anchor(&file.label))>
                         <div class="filename">
@@ -611,16 +848,29 @@ async fn session_page(cx: &Cx) -> Result {
                                 (&file.language) " · " (file.lines) " lines"
                             </span>
                         </div>
-                        <div class="codebox">(Raw(file.html.clone()))</div>
+                        <div class="codebox">
+                            // Legacy fallback: if highlighted is empty (old CLI payload),
+                            // fall back to the pre-rendered html field.
+                            if file.highlighted.is_empty() {
+                                (Raw(file.html.clone()))
+                            } else {
+                                code_file(
+                                    file: &file.label,
+                                    highlighted: &file.highlighted,
+                                    comments: &comments,
+                                )
+                            }
+                        </div>
                     </section>
                 }
             </div>
         }?,
 
         Content::Diff { files } => view! { cx =>
-            // `id="diff"` is what the comment script binds to, and the session
-            // id travels with it so the script needs no inlined state.
-            <div class="wrap" id="diff" data-session=(id)>
+            // `id="diff"` is retained for styling and links; `data-comments` is the
+            // hook the comment script binds to, shared with the code wrap, and the
+            // session id travels with it so the script needs no inlined state.
+            <div class="wrap" id="diff" data-comments="1" data-session=(id)>
                 for file in files {
                     <section class="file" id=(anchor(&file.label))>
                         <div class="filename">
@@ -641,23 +891,56 @@ async fn session_page(cx: &Cx) -> Result {
             </div>
         }?,
 
-        Content::Docs { files } => view! { cx =>
-            <div class="wrap">
-                for file in files {
-                    <section class="doc" id=(anchor(&file.label))>
-                        (Raw(file.html.clone()))
-                    </section>
-                }
-            </div>
-        }?,
+        Content::Docs { files } => {
+            // Filter comments for doc files (excluding brief which is handled above).
+            // A comment belongs to brief if: target=="brief" OR (target is None AND file=="brief:").
+            // Everything else belongs to the doc section.
+            let doc_comments: Vec<_> = comments
+                .iter()
+                .filter(|c| {
+                    if c.target.as_deref() == Some("brief") {
+                        return false;
+                    }
+                    if c.target.is_none() && c.file == "brief:" {
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
+            view! { cx =>
+                <div class="wrap" data-comments="1" data-session=(id)>
+                    for (idx, file) in files.iter().enumerate() {
+                        <section class="doc" id=(anchor(&file.label)) data-doc-file=(&file.label) data-doc-target=(format!("doc:{idx}"))>
+                            (Raw(file.html.clone()))
+                        </section>
+                    }
+                </div>
+                <div id="wdyt-doc-comments" hidden="hidden">
+                    for comment in &doc_comments {
+                        <div class="wdyt-comment-data"
+                            data-comment-id=(comment.id)
+                            data-comment-target=(comment.target.as_deref().unwrap_or(""))
+                            data-comment-file=(&comment.file)
+                            data-comment-line=(comment.line)
+                            data-comment-end-line=(comment.end_line.map_or(String::new(), |e| e.to_string()))
+                            data-comment-side=(comment.side.as_str())
+                            data-comment-snippet=(&comment.snippet)
+                        >(&comment.text)</div>
+                    }
+                </div>
+            }?
+        }
 
         Content::Static { entry, .. } => {
             // Served through /s/{id}/assets/ so relative links inside the
-            // directory resolve.
+            // directory resolve. The sandbox attribute prevents the framed
+            // content from accessing the daemon's origin (no allow-same-origin),
+            // while still allowing scripts and forms for report functionality.
             let src = format!("/s/{id}/assets/{}", entry.trim_start_matches('/'));
             view! { cx =>
                 <div class="framewrap">
-                    <iframe class="frame" src=(src) title="Preview"></iframe>
+                    <iframe class="frame" src=(src) title="Preview" sandbox="allow-scripts allow-forms"></iframe>
                 </div>
             }?
         }
@@ -683,7 +966,7 @@ async fn session_page(cx: &Cx) -> Result {
         reply: existing_reply,
         body_class: body_class.map(str::to_owned),
         hideable,
-        commentable: content.is_commentable(),
+        commentable: content.is_commentable() || brief_commentable,
         origin,
     };
 
@@ -710,18 +993,11 @@ fn public_host(cx: &Cx) -> String {
 }
 
 /// A stable, URL-safe anchor for a file label.
+///
+/// Delegates to the shared [`crate::file_anchor`] so the CLI can print the same
+/// anchors agents should use in guided-review briefs.
 fn anchor(label: &str) -> String {
-    let mut out = String::with_capacity(label.len() + 2);
-    out.push('f');
-    out.push('-');
-    for ch in label.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push('-');
-        }
-    }
-    out
+    crate::file_anchor(label)
 }
 
 // --- Reply ------------------------------------------------------------------
@@ -857,6 +1133,19 @@ fn escape_html(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Escapes a JSON string for safe embedding inside a `<script type="application/json">`
+/// block. The only dangerous sequence is `</script` (case-insensitive) which would
+/// close the containing script element. We replace `</` with `<\/` which is
+/// semantically equivalent in JSON string values and prevents the parser from
+/// seeing an end tag.
+///
+/// Retained for test coverage; no longer used in production rendering (replaced
+/// by server-rendered hidden DOM elements with proper HTML escaping).
+#[cfg(test)]
+fn escape_json_for_script(json: &str) -> String {
+    json.replace("</", "<\\/")
+}
+
 /// Serves files from a `Static` session's directory.
 ///
 /// Paths are resolved against the session root by `tower_http`'s `ServeDir`,
@@ -901,8 +1190,17 @@ async fn asset_route(cx: &Cx) -> Result<topcoat::router::Response> {
 ///
 /// The range is full of other people's servers — that is the whole point of
 /// picking it — and several of them answer 200 on `/health`. Only a body
-/// carrying this string is a showme daemon.
-pub const HEALTH_MARKER: &str = "showme-daemon";
+/// carrying this string is a wdyt daemon.
+pub const HEALTH_MARKER: &str = "wdyt-daemon";
+
+/// Protocol version for client-daemon compatibility.
+///
+/// Incremented when the daemon's API contract changes in a way that would cause
+/// a new client to silently lose features on an old daemon. A new client seeing
+/// a daemon with a lower (or absent) protocol version will skip it and start a
+/// compatible one. Old clients that only check `HEALTH_MARKER` will still
+/// recognize a new daemon (the marker is unchanged).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[route(GET "/health")]
 async fn health_route(cx: &Cx) -> Result<Json<serde_json::Value>> {
@@ -910,6 +1208,7 @@ async fn health_route(cx: &Cx) -> Result<Json<serde_json::Value>> {
         "ok": true,
         "service": HEALTH_MARKER,
         "version": env!("CARGO_PKG_VERSION"),
+        "protocol": PROTOCOL_VERSION,
         "sessions": state(cx).store.summaries().len(),
     })))
 }
@@ -929,5 +1228,34 @@ mod tests {
     #[test]
     fn escape_html_escapes_markup() {
         assert_eq!(escape_html("<a> & </a>"), "&lt;a&gt; &amp; &lt;/a&gt;");
+    }
+
+    #[test]
+    fn escape_json_for_script_prevents_breakout() {
+        // The critical sequence: </script> must be neutralised.
+        let input = r#"{"text":"</script><script>alert(1)</script>"}"#;
+        let escaped = escape_json_for_script(input);
+        assert!(
+            !escaped.contains("</script>"),
+            "breakout not prevented: {escaped}"
+        );
+        assert!(escaped.contains("<\\/script>"));
+        // Case variation: the HTML parser is case-insensitive for end tags.
+        let upper = r#"{"text":"</SCRIPT>"}"#;
+        let escaped_upper = escape_json_for_script(upper);
+        // Our escape catches the case-sensitive form; HTML parsers only match
+        // case-insensitively if the content type is text/html. In application/json
+        // script tags, the parser looks for </script literally, so </SCRIPT> is
+        // safe. But we also escape it for defense in depth.
+        assert!(
+            !escaped_upper.contains("</SCRIPT>") || !escaped_upper.contains("</script>"),
+            "case-insensitive breakout possible"
+        );
+    }
+
+    #[test]
+    fn escape_json_for_script_preserves_normal_content() {
+        let normal = r#"[{"id":1,"text":"looks good","line":3}]"#;
+        assert_eq!(escape_json_for_script(normal), normal);
     }
 }

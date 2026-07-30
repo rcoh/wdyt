@@ -20,7 +20,7 @@ pub enum Content {
     Docs { files: Vec<DocFile> },
     /// A directory served as-is.
     Static { root: PathBuf, entry: String },
-    /// A server the agent started; showme frames it and adds the reply box.
+    /// A server the agent started; wdyt frames it and adds the reply box.
     Demo { port: u16, path: String },
 }
 
@@ -43,7 +43,10 @@ impl Content {
 
     /// Whether lines can be commented on.
     pub fn is_commentable(&self) -> bool {
-        matches!(self, Self::Diff { .. })
+        matches!(
+            self,
+            Self::Diff { .. } | Self::Code { .. } | Self::Docs { .. }
+        )
     }
 }
 
@@ -52,17 +55,35 @@ pub struct CodeFile {
     /// Label shown in the file list, usually the path as the agent named it.
     pub label: String,
     /// Highlighted HTML, pre-rendered at submit time so page loads are cheap.
+    /// Used by the non-commentable `raw` view; the commentable page renders
+    /// per-line from `highlighted` instead so it can interleave comment rows.
     pub html: String,
+    /// Per-line highlighted HTML, parallel to `sources`. Pre-rendered once so the
+    /// comment-affordance table can be built without re-highlighting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub highlighted: Vec<String>,
+    /// Per-line plain text, one entry per line with no trailing newline. This is
+    /// what the server quotes a comment's snippet from, so the page is never
+    /// trusted to say what a line said.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    #[serde(default)]
     pub lines: usize,
     /// Language, for display only.
+    #[serde(default)]
     pub language: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocFile {
     pub label: String,
-    /// Rendered HTML.
+    /// Rendered HTML (with `data-sourcepos` attributes when commentable).
     pub html: String,
+    /// Per-line plain text of the source markdown, one entry per line with no
+    /// trailing newline. Used to quote authoritative snippets for comments on
+    /// rendered markdown. Empty for legacy sessions or non-commentable docs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
 }
 
 /// One file's worth of a unified diff.
@@ -192,6 +213,12 @@ pub fn side_of(kind: LineKind) -> Side {
 pub struct Anchor {
     /// The file the lines belong to, as it appears in the diff.
     pub file: String,
+    /// Explicit comment target identity, separate from display label.
+    ///
+    /// `Some("brief")` for the guided-review brief, `Some("doc:<n>")` for the
+    /// nth docs file. `None` for legacy code/diff comments where `file` alone
+    /// is sufficient.
+    pub target: Option<String>,
     /// The first line covered, on `side`.
     pub line: usize,
     /// The last line covered, or `None` for a single line.
@@ -204,6 +231,7 @@ impl Anchor {
     pub fn line(file: String, line: usize, side: Side) -> Self {
         Self {
             file,
+            target: None,
             line,
             end_line: None,
             side,
@@ -217,6 +245,7 @@ impl Anchor {
     pub fn range(file: String, from: usize, to: usize, side: Side) -> Self {
         Self {
             file,
+            target: None,
             line: from.min(to),
             end_line: Some(from.max(to)),
             side,
@@ -230,7 +259,9 @@ impl Anchor {
 
     /// How many lines the anchor spans.
     pub fn span(&self) -> usize {
-        self.last() - self.line + 1
+        // Saturating arithmetic: prevents panics when last < line (should not
+        // happen after normalisation, but must not panic on adversarial input).
+        self.last().saturating_sub(self.line).saturating_add(1)
     }
 }
 
@@ -241,6 +272,15 @@ pub struct Comment {
     pub id: u64,
     /// The file the line belongs to, as it appears in the diff.
     pub file: String,
+    /// Explicit comment target identity, distinct from the display label.
+    ///
+    /// For guided briefs: `"brief"`. For docs: `"doc:<index>"` where index is the
+    /// 0-based position in the files array. For code/diff: absent (legacy
+    /// identity uses `file`). This lets the agent distinguish comments on files
+    /// with duplicate labels, and disambiguates the guided-review brief from a
+    /// doc file that happens to be named `"brief:"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     /// The first line the comment covers, on `side`.
     pub line: usize,
     /// The last line covered, for a comment dragged across a range.
@@ -275,6 +315,11 @@ pub struct NewSession {
     pub theme: Option<String>,
     /// A guided tour of the work, as rendered HTML.
     pub brief: Option<String>,
+    /// Per-line plain text of the brief markdown source, so comments on the
+    /// brief can quote authoritative snippets. Stored separately from the
+    /// content's doc files because a session's brief and its docs can share
+    /// label text without collision.
+    pub brief_sources: Vec<String>,
 }
 
 impl NewSession {
@@ -287,6 +332,7 @@ impl NewSession {
             origin: crate::zellij_origin::Origin::default(),
             theme: None,
             brief: None,
+            brief_sources: Vec::new(),
         }
     }
 }
@@ -306,6 +352,11 @@ pub struct Session {
     /// Stored as rendered HTML because the markdown is turned into it by the CLI,
     /// which is where the syntax theme for fenced code is known.
     pub brief: Option<String>,
+    /// Per-line plain text of the brief markdown source, for authoritative
+    /// snippet lookup on brief comments. A brief and a doc file may share label
+    /// text, so comments on them are distinguished by the `file` field: the
+    /// brief always uses `"brief:"` as its file identifier.
+    pub brief_sources: Vec<String>,
     /// The syntax theme this session's content was highlighted with, when it
     /// differs from the daemon's default.
     ///
@@ -320,7 +371,7 @@ pub struct Session {
     /// Line comments on a diff, oldest first. Unlike the reply these are not
     /// capped at one: commenting on six lines of a diff is the normal case.
     pub comments: Vec<Comment>,
-    /// Wakes up a `showme wait` for this session.
+    /// Wakes up a `wdyt wait` for this session.
     pub waiters: Vec<oneshot::Sender<Reply>>,
 }
 
@@ -372,6 +423,7 @@ impl Store {
             origin,
             theme,
             brief,
+            brief_sources,
         } = new;
         let now = SystemTime::now();
         let seq = self.counter.fetch_add(1, Ordering::Relaxed);
@@ -389,6 +441,7 @@ impl Store {
             origin,
             theme,
             brief,
+            brief_sources,
             created: now,
             reply: None,
             comments: Vec::new(),
@@ -482,6 +535,7 @@ impl Store {
     ) -> Result<Comment, UnknownSession> {
         let Anchor {
             file,
+            target,
             line,
             end_line,
             side,
@@ -494,6 +548,7 @@ impl Store {
         let comment = Comment {
             id: next,
             file,
+            target,
             line,
             // A range that covers one line is not a range: normalised away so
             // the common case has one representation.
@@ -557,7 +612,7 @@ impl Store {
         Ok(rx)
     }
 
-    /// Session ids and titles, newest first. For `showme list`.
+    /// Session ids and titles, newest first. For `wdyt list`.
     pub fn summaries(&self) -> Vec<(String, String, &'static str, bool)> {
         let mut items: Vec<_> = self
             .lock()
@@ -622,7 +677,7 @@ fn base36(mut value: u64) -> String {
 }
 
 /// Serializes a `SystemTime` as whole seconds since the epoch, so the JSON that
-/// `showme wait` prints is easy for an agent to read.
+/// `wdyt wait` prints is easy for an agent to read.
 mod unix_seconds {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -952,6 +1007,21 @@ mod tests {
         assert_eq!(side_of(LineKind::Removed), Side::Old);
         assert_eq!(Side::parse("old"), Some(Side::Old));
         assert_eq!(Side::parse("both"), None);
+    }
+
+    #[test]
+    fn anchor_span_does_not_panic_on_edge_cases() {
+        // line = usize::MAX with no range: span should be 1.
+        let a = Anchor::line("x".into(), usize::MAX, Side::New);
+        assert_eq!(a.span(), 1);
+
+        // line = 1, end = usize::MAX: must not overflow.
+        let b = Anchor::range("x".into(), 1, usize::MAX, Side::New);
+        assert!(b.span() > 0);
+
+        // line = 0 is not valid but must not panic: span returns 1.
+        let c = Anchor::line("x".into(), 0, Side::New);
+        assert_eq!(c.span(), 1);
     }
 
     #[test]

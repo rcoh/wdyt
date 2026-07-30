@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// The terminal context a session was created from.
 ///
-/// Every field is optional: showme runs from plain shells, from CI, and from
+/// Every field is optional: wdyt runs from plain shells, from CI, and from
 /// multiplexers it knows nothing about. A missing field is shown as nothing
 /// rather than guessed at.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +76,7 @@ impl Origin {
         self.cwd.is_none() && self.session.is_none() && self.tab.is_none()
     }
 
-    /// A one-line form for a notification: `dd-2 › showme cli — /path`.
+    /// A one-line form for a notification: `dd-2 › wdyt cli — /path`.
     pub fn summary(&self) -> Option<String> {
         let mut parts = Vec::new();
         match (&self.session, &self.tab) {
@@ -172,8 +172,8 @@ mod tests {
     const TABLE: &str = "\
 TAB_ID  TAB_POS  TAB_NAME  PANE_ID  TYPE  TITLE  COMMAND  CWD  FOCUSED  FLOATING  EXITED  X  Y  ROWS  COLS
 1  0  get new ui deployed  plugin_2  plugin  zellij:tab-bar  zellij:tab-bar  -  false  false  false  0  0  1  243
-10  4  showme cli  terminal_28  terminal  Build showme CLI tool  claude  /local/home/rcoh/code  true  false  false  0  1  68  121
-10  4  showme cli  terminal_29  terminal  a shell  -  /local/home/rcoh/code  false  false  false  122  1  68  121";
+10  4  wdyt cli  terminal_28  terminal  Build wdyt CLI tool  claude  /local/home/rcoh/code  true  false  false  0  1  68  121
+10  4  wdyt cli  terminal_29  terminal  a shell  -  /local/home/rcoh/code  false  false  false  122  1  68  121";
 
     /// A probe that fails the test if it is ever called.
     fn never_probed() -> (Option<String>, Option<String>) {
@@ -202,26 +202,26 @@ TAB_ID  TAB_POS  TAB_NAME  PANE_ID  TYPE  TITLE  COMMAND  CWD  FOCUSED  FLOATING
     #[test]
     fn under_zellij_it_probes_for_tab_and_pane() {
         let origin = Origin::build(Some("/work".to_owned()), Some("dd-2".to_owned()), || {
-            (Some("showme cli".to_owned()), Some("a task".to_owned()))
+            (Some("wdyt cli".to_owned()), Some("a task".to_owned()))
         });
         assert_eq!(origin.session.as_deref(), Some("dd-2"));
-        assert_eq!(origin.tab.as_deref(), Some("showme cli"));
+        assert_eq!(origin.tab.as_deref(), Some("wdyt cli"));
         assert_eq!(origin.pane.as_deref(), Some("a task"));
     }
 
     #[test]
     fn a_pane_resolves_to_its_tab_and_title() {
         let (tab, pane) = parse_panes(TABLE, "28");
-        assert_eq!(tab.as_deref(), Some("showme cli"));
-        assert_eq!(pane.as_deref(), Some("Build showme CLI tool"));
+        assert_eq!(tab.as_deref(), Some("wdyt cli"));
+        assert_eq!(pane.as_deref(), Some("Build wdyt CLI tool"));
     }
 
     #[test]
     fn a_tab_name_containing_a_space_survives() {
-        // Tab names are prose — "showme cli", "get new ui deployed" — so the
+        // Tab names are prose — "wdyt cli", "get new ui deployed" — so the
         // table cannot be split on whitespace.
         let (tab, _) = parse_panes(TABLE, "29");
-        assert_eq!(tab.as_deref(), Some("showme cli"));
+        assert_eq!(tab.as_deref(), Some("wdyt cli"));
     }
 
     #[test]
@@ -240,12 +240,12 @@ TAB_ID  TAB_POS  TAB_NAME  PANE_ID  TYPE  TITLE  COMMAND  CWD  FOCUSED  FLOATING
         let origin = Origin {
             cwd: Some("/local/home/rcoh/code".to_owned()),
             session: Some("dd-2".to_owned()),
-            tab: Some("showme cli".to_owned()),
+            tab: Some("wdyt cli".to_owned()),
             pane: None,
         };
         assert_eq!(
             origin.summary().as_deref(),
-            Some("dd-2 › showme cli — /local/home/rcoh/code")
+            Some("dd-2 › wdyt cli — /local/home/rcoh/code")
         );
     }
 
