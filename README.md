@@ -112,6 +112,7 @@ anchors for use in `--brief` guided reviews:
 wdyt: file anchors for --brief links:
   src/lib.rs → #f-src-lib-rs
   src/main.rs → #f-src-main-rs
+  add -L<start> or -L<start>-L<end> for a line span, e.g. #f-src-lib-rs-L10 or #f-src-lib-rs-L10-L20
 ```
 
 These use the exact same helper that renders the page's navigation anchors, so
@@ -201,13 +202,19 @@ wdyt code src/*.rs --brief "Start with the parser; the rest is mechanical."
 
 It renders above the content in the same column as the code, with GFM callouts
 and highlighted fences. A link to `#f-<path>` jumps to that file, with
-non-alphanumerics replaced by dashes — `src/diff.rs` is `#f-src-diff-rs`:
+non-alphanumerics replaced by dashes — `src/diff.rs` is `#f-src-diff-rs`. To
+point at a line span, append `-L<start>` or `-L<start>-L<end>`, mirroring
+GitHub's `#L10` / `#L10-L20` blob URLs; wdyt scrolls to and highlights the span
+(in `code` and `diff` modes, on the new side, which have real line numbers — in
+`docs` it jumps to the rendered block covering those source lines):
 
 ```markdown
 > [!NOTE]
 > The parser bug is the interesting one.
 
 - [src/diff.rs](#f-src-diff-rs) — the hunk-length fix
+- [the off-by-one](#f-src-diff-rs-L42) — the exact line
+- [the new guard](#f-src-diff-rs-L80-L95) — the whole block
 - [README.md](#f-readme-md) — docs only
 ```
 
