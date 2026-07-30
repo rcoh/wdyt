@@ -74,6 +74,28 @@ wdyt ack <id> "on it"  # turn the user's receipt green
 Always `ack` immediately after collecting — it tells the user you actually read
 their note.
 
+## Sessions, the daemon, and one shared port
+
+One long-lived **daemon** serves **every session on a single port** (chosen from
+`--ports`, e.g. 3007). Each `wdyt code/diff/docs/…` call just registers **another
+session** on that same daemon — you never start a second daemon or pick a new
+port per session. The daemon's **root URL** (`http://localhost:<port>/`) lists all
+live sessions and is the stable entry point; individual `/s/<id>` links point at
+one session.
+
+- **Reuse the running daemon.** Before doing anything drastic, `wdyt list` shows
+  the daemon URL and live sessions. Just run another content command to add a
+  session — they coexist.
+- **Never kill/restart the daemon to "reset" it.** Sessions live in memory, so
+  killing it (`pkill wdyt`) drops *every* session and invalidates all `/s/<id>`
+  links. If you must rebuild/reinstall the binary, expect to **republish** your
+  docs afterward (new session ids).
+- **Don't spawn stray daemons.** Running `wdyt serve` from another checkout or
+  worktree starts a *second* daemon on a *different* port, fragmenting sessions.
+  Stick to the one installed daemon.
+- **Share the root URL, not `/s/<id>`.** If the daemon ever restarts, the root
+  index still works while old per-session links won't.
+
 ## Output contract
 
 - **stdout**: machine-readable only (URL, then reply JSON)
