@@ -56,18 +56,15 @@ available anchors.
 
 ## Waiting and collecting
 
-Every content command waits by default. Unless the user requests one, do not set
-a `--timeout` — run the command with your built-in background-task mechanism (if
-you have one) so you are notified when the reply arrives, instead of blocking.
+Every content command waits by default. This is important. If you are not waiting on the socket, you will not receive the users reply.
+
+You MUST NOT use `--no-wait` unless the user has explicitly given you guidance to use `--no-wait`. This is not negotiable.
+
+You must not use `--timeout` unless the user has explicitly given you guidance to use `--timeout`. This is not negotiable.
+
+If you have a built-in background-task mechanism you SHOULD use it.
 
 ```sh
-# Fire and forget
-wdyt code src/lib.rs --no-wait
-# prints URL, exits immediately
-
-# Collect later
-wdyt inbox              # list pending replies
-wdyt collect <id>       # get reply + line comments as JSON
 wdyt ack <id> "on it"  # turn the user's receipt green
 ```
 
