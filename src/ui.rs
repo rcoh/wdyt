@@ -284,8 +284,16 @@ table.src td.ln {{
   padding: 0 12px 0 10px; user-select: none;
   color: var(--code-muted);
   border-right: 1px solid var(--code-border);
-  position: sticky; left: 0; background: var(--code-bg);
+  background: var(--code-bg);
 }}
+/* The gutter only has anywhere to stick while the code box is panned sideways,
+   and `position: sticky` is not free: two gutter cells a line is 7,200 sticky
+   boxes on a 3,600-line diff, all of which the browser revisits in every
+   pre-paint. Measured on Chromium 131, that costs ~13ms of main-thread work per
+   keystroke in a comment box and per scrolled frame — for a gutter that is not
+   moving. `panned` is put on by NAV_JS the moment a box is scrolled off zero,
+   so the unpanned case, which is nearly all of them, pays nothing. */
+.codebox.panned table.src td.ln {{ position: sticky; left: 0; }}
 table.src td.ln a {{ color: inherit; text-decoration: none; }}
 table.src td.code {{ padding: 0 14px; white-space: pre; }}
 table.src tr:target td {{ background: var(--code-gutter); }}
@@ -320,12 +328,12 @@ table.src.commentable tr:hover .addnote, table.src.commentable .addnote:focus {{
 /* Comments break out of the code card's monospace world: they are prose. Inset
    as a card rather than a full-bleed band, so the listing still reads as one
    continuous block with a note tucked into it. */
-table.src.commentable tr.notes td.code, table.src.commentable tr.pending td.code {{
+table.src.commentable tr.notes td.code {{
   white-space: normal; padding: 6px 14px 6px 22px;
   background: var(--code-gutter);
   font: 13px/1.55 ui-sans-serif, system-ui, sans-serif;
 }}
-table.src.commentable .note, table.src.commentable .notebox {{
+table.src.commentable .note {{
   background: var(--surface); color: var(--fg);
   border: 1px solid var(--border-strong); border-left: 2px solid var(--accent);
   border-radius: 0 8px 8px 0; padding: 7px 12px; max-width: 620px;
@@ -364,25 +372,47 @@ table.src.commentable tr.selecting td {{
 }}
 /* A drag over code would otherwise select text and fight the range. */
 table.src.commentable tr.selecting {{ user-select: none; }}
-table.src.commentable .notebox {{ display: flex; flex-direction: column; gap: 6px; margin: 4px 0; }}
-table.src.commentable .notebox textarea {{
+/* The pending editor floats over the listing instead of being a row inside it.
+   A `<tr>` in the diff table means every character typed dirties a table that
+   holds the whole file, and the browser answers by re-laying-out and repainting
+   all of it: measured on Chromium 131 at 40ms of main-thread work per keystroke
+   on a 3,600-line diff, against 12ms for the same box outside the table. So it
+   is positioned in document coordinates by COMMENT_JS, below the line it is
+   about — covering the lines after it, which are the ones already read. The
+   shadow says it is above the code rather than in it. */
+.notebox {{
+  position: absolute; z-index: 6;
+  display: flex; flex-direction: column; gap: 6px;
+  max-width: 680px;
+  background: var(--surface); color: var(--fg);
+  border: 1px solid var(--border-strong); border-left: 2px solid var(--accent);
+  border-radius: 0 8px 8px 0; padding: 7px 12px;
+  box-shadow: 0 1px 2px rgba(31,30,29,.1), 0 10px 28px rgba(31,30,29,.22);
+  font: 13px/1.55 ui-sans-serif, system-ui, sans-serif;
+}}
+/* What the box is about, when it is more than the line above it. */
+.notebox .about {{
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--muted);
+}}
+.notebox textarea {{
   width: 100%; min-height: 62px; resize: vertical;
   background: var(--bg); color: var(--fg);
   border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 9px;
   font: 13px/1.5 ui-sans-serif, system-ui, sans-serif;
 }}
-table.src.commentable .notebox textarea:focus {{
+.notebox textarea:focus {{
   outline: none; border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }}
-table.src.commentable .notebox .row {{ display: flex; gap: 6px; align-items: center; }}
-table.src.commentable .notebox .msg {{ color: #b3452c; font-size: 12px; margin-right: auto; }}
-table.src.commentable .notebox button {{
+.notebox .row {{ display: flex; gap: 6px; align-items: center; }}
+.notebox .msg {{ color: #b3452c; font-size: 12px; margin-right: auto; }}
+.notebox button {{
   font: 12.5px/1 ui-sans-serif, system-ui, sans-serif;
   padding: 6px 11px; border-radius: 7px; cursor: pointer;
   border: 1px solid var(--border-strong); background: var(--bg); color: var(--fg);
 }}
-table.src.commentable .notebox button.primary {{
+.notebox button.primary {{
   background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600;
 }}
 /* Keyboard shortcut hint in comment editors: visible but unobtrusive. */
@@ -1049,6 +1079,25 @@ const CHROME_JS: &str = r#"
 /// for efficiency.
 pub(crate) const NAV_JS: &str = r##"
 (function () {
+  // --- Sticky gutters, only while panned -----------------------------------
+  // The line-number gutter is `position: sticky` so it survives panning a long
+  // line sideways, but two sticky cells per line is thousands of sticky boxes the
+  // browser revisits in every pre-paint — for a gutter that, unpanned, has
+  // nowhere to go. The class turns the rule on for the box being panned only.
+  var boxes = document.querySelectorAll('.codebox');
+  for (var bi = 0; bi < boxes.length; bi++) {
+    (function (codebox) {
+      codebox.addEventListener('scroll', function () {
+        var panned = codebox.scrollLeft > 0;
+        // Only on the transition: toggling every event would re-invalidate the
+        // gutter's style on every frame of a pan.
+        if (panned !== codebox.classList.contains('panned')) {
+          codebox.classList.toggle('panned', panned);
+        }
+      }, { passive: true });
+    })(boxes[bi]);
+  }
+
   // --- Jump to top ---------------------------------------------------------
   var btn = document.getElementById('jump-top');
   if (btn) {
@@ -1149,9 +1198,17 @@ pub(crate) const COMMENT_JS: &str = r#"
   // Every commentable row on one side of one file, in document order.
   // Uses attribute comparison on actual DOM elements rather than string
   // interpolation into selectors, which is unsafe for paths with quotes.
+  //
+  // Memoised, because the scan is over every `+` in the page — thousands of them
+  // on a real diff — and a drag would otherwise repeat it on every pointermove.
+  // Safe to cache for the session: `.addnote` buttons are rendered once by the
+  // server and never added or removed, only note rows are.
+  var siblingCache = Object.create(null);
   function siblings(button) {
     var file = button.getAttribute('data-file');
     var side = button.getAttribute('data-side');
+    var key = side + '\u0000' + file;
+    if (siblingCache[key]) return siblingCache[key];
     var all = root.querySelectorAll('.addnote');
     var rows = [];
     for (var i = 0; i < all.length; i++) {
@@ -1160,22 +1217,28 @@ pub(crate) const COMMENT_JS: &str = r#"
         rows.push(all[i]);
       }
     }
+    siblingCache[key] = rows;
     return rows;
   }
 
   // Highlight what a range would cover while the pointer is still down.
-  // Iterates actual rendered buttons rather than a numeric span, so a hostile
-  // huge range cannot cause unbounded work.
   function preview(from, to) {
     clearPreview();
     var lo = safeLineNo(from.getAttribute('data-line'));
     var hi = safeLineNo(to.getAttribute('data-line'));
     if (lo == null || hi == null) return;
     if (lo > hi) { var t = lo; lo = hi; hi = t; }
+    mark(from, lo, hi, 'selecting');
+  }
+
+  // Mark every rendered row a range covers. Iterates actual rendered buttons
+  // rather than a numeric span, so a hostile huge range cannot cause unbounded
+  // work.
+  function mark(from, lo, hi, cls) {
     var buttons = siblings(from);
     for (var i = 0; i < buttons.length; i++) {
       var n = safeLineNo(buttons[i].getAttribute('data-line'));
-      if (n != null && n >= lo && n <= hi) buttons[i].closest('tr').classList.add('selecting');
+      if (n != null && n >= lo && n <= hi) buttons[i].closest('tr').classList.add(cls);
     }
   }
 
@@ -1197,6 +1260,9 @@ pub(crate) const COMMENT_JS: &str = r#"
     if (!button
         || button.getAttribute('data-file') !== drag.from.getAttribute('data-file')
         || button.getAttribute('data-side') !== drag.from.getAttribute('data-side')) return;
+    // Still over the row the last move already drew: redrawing it would retint
+    // the same rows and repaint the table for nothing, several times a second.
+    if (button === drag.to) return;
     if (button !== drag.from) drag.moved = true;
     drag.to = button;
     if (drag.moved) preview(drag.from, button);
@@ -1264,6 +1330,25 @@ pub(crate) const COMMENT_JS: &str = r#"
     return 'sel-' + enc + '-' + side + '-' + start;
   }
 
+  // The editor floats over the listing instead of being a row inside it: a `<tr>`
+  // in the diff table means every keystroke dirties a table holding the whole
+  // file, which the browser answers by re-laying-out and repainting all of it
+  // (measured: 40ms a character on a 3,600-line diff, 12ms for the same box
+  // outside the table). Placed in document coordinates rather than fixed ones, so
+  // it travels with the code as the page scrolls without a scroll handler.
+  function place(box, row) {
+    var code = row.querySelector('td.code') || row;
+    var r = code.getBoundingClientRect();
+    box.style.left = (r.left + window.scrollX + 20) + 'px';
+    box.style.top = (r.bottom + window.scrollY + 2) + 'px';
+    box.style.width = Math.max(280, Math.min(660, r.width - 40)) + 'px';
+  }
+
+  // A resize changes the width the box was measured against.
+  window.addEventListener('resize', function () {
+    if (open && open.anchorRow) place(open, open.anchorRow);
+  });
+
   function openBox(from, to) {
     // The box hangs below the last line of the range, so the whole passage it is
     // about stays visible above it.
@@ -1275,7 +1360,7 @@ pub(crate) const COMMENT_JS: &str = r#"
     var line = last.closest('tr');
 
     // Pressing the same line twice closes the box rather than opening a second.
-    var reopen = !open || open.previousElementSibling !== line;
+    var reopen = !open || open.anchorRow !== line;
     close();
     if (!reopen) return;
 
@@ -1287,50 +1372,52 @@ pub(crate) const COMMENT_JS: &str = r#"
 
     var span = hi > lo ? ' (L' + lo + '\u2013L' + hi + ')' : '';
     var label = hi > lo ? 'Comment on lines ' + lo + ' to ' + hi : 'Comment on this line';
-    var row = document.createElement('tr');
-    row.className = 'pending';
-    row.innerHTML =
-      '<td class="ln" colspan="2"></td>' +
-      '<td class="code"><div class="notebox">' +
+    var mac = navigator.platform && navigator.platform.indexOf('Mac') > -1;
+    var chord = mac ? 'Cmd' : 'Ctrl';
+    var box = document.createElement('div');
+    box.className = 'notebox';
+    box.innerHTML =
+      (hi > lo ? '<span class="about">Lines ' + lo + '\u2013' + hi + '</span>' : '') +
       '<textarea aria-label="' + label + '"></textarea>' +
       '<div class="row"><span class="msg"></span>' +
-      '<kbd class="kb-hint" aria-label="Keyboard shortcuts: ' +
-      (navigator.platform && navigator.platform.indexOf("Mac") > -1 ? "Cmd" : "Ctrl") +
+      '<kbd class="kb-hint" aria-label="Keyboard shortcuts: ' + chord +
       '+Enter to send, Escape to cancel">' +
-      '<abbr title="' + (navigator.platform && navigator.platform.indexOf("Mac") > -1 ? "Cmd" : "Ctrl") +
-      '+Enter">' + (navigator.platform && navigator.platform.indexOf("Mac") > -1 ? '\u2318+Enter' : 'Ctrl+Enter') + '</abbr> send \u00B7 <abbr title="Escape">Esc</abbr> cancel</kbd>' +
+      '<abbr title="' + chord + '+Enter">' + (mac ? '\u2318+Enter' : 'Ctrl+Enter') +
+      '</abbr> send \u00B7 <abbr title="Escape">Esc</abbr> cancel</kbd>' +
       '<button type="button" class="cancel">Cancel</button>' +
       '<button type="button" class="primary">Comment</button>' +
-      '</div></div></td>';
-    line.parentNode.insertBefore(row, line.nextElementSibling);
-    row.querySelector('textarea').placeholder =
-      (hi > lo ? 'Comment on these lines' : 'Comment on this line') + span + '\u2026';
-    open = row;
+      '</div>';
+    // The row it is about, for repositioning and for where the saved note goes.
+    box.anchorRow = line;
+    document.body.appendChild(box);
+    place(box, line);
+    open = box;
 
-    // Keep the covered rows tinted while the box is open, so it is unambiguous
+    // Keep the covered rows marked while the box is open, so it is unambiguous
     // what a multi-line comment is about.
-    if (hi > lo) {
-      var buttons = siblings(from);
-      for (var i = 0; i < buttons.length; i++) {
-        var n = safeLineNo(buttons[i].getAttribute('data-line'));
-        if (n != null && n >= lo && n <= hi) buttons[i].closest('tr').classList.add('selecting');
-      }
-    }
+    if (hi > lo) mark(from, lo, hi, 'selecting');
 
-    var box = row.querySelector('textarea');
-    var submit = row.querySelector('button.primary');
-    var msg = row.querySelector('.msg');
-    box.focus();
+    var textbox = box.querySelector('textarea');
+    var submit = box.querySelector('button.primary');
+    var msg = box.querySelector('.msg');
+    textbox.placeholder =
+      (hi > lo ? 'Comment on these lines' : 'Comment on this line') + span + '\u2026';
+    textbox.focus();
 
-    row.querySelector('button.cancel').addEventListener('click', close);
-    box.addEventListener('keydown', function (ev) {
+    // A box opened on the last visible line would hang below the fold. It is in
+    // document coordinates, so scrolling brings it and the code up together.
+    var below = box.getBoundingClientRect().bottom - (window.innerHeight - 12);
+    if (below > 0) window.scrollBy(0, below);
+
+    box.querySelector('button.cancel').addEventListener('click', close);
+    textbox.addEventListener('keydown', function (ev) {
       if (ev.key === 'Escape') { close(); return; }
       if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') submit.click();
     });
 
     submit.addEventListener('click', function () {
-      var text = box.value.trim();
-      if (!text) { box.focus(); return; }
+      var text = textbox.value.trim();
+      if (!text) { textbox.focus(); return; }
       submit.disabled = true;
       msg.textContent = '';
       fetch('/s/' + session + '/comments', {
@@ -1347,18 +1434,11 @@ pub(crate) const COMMENT_JS: &str = r#"
         if (!res.ok) throw new Error('could not save the comment');
         return res.json();
       }).then(function (comment) {
-        // The pending row is replaced by the saved comment, in place.
-        var anchor = row.previousElementSibling;
+        // The editor gives way to the saved comment, under the line it is about.
         close();
-        // The rows the comment covers keep their tint, now permanently.
-        if (hi > lo) {
-          var buttons = siblings(from);
-          for (var i = 0; i < buttons.length; i++) {
-            var n = safeLineNo(buttons[i].getAttribute('data-line'));
-            if (n != null && n >= lo && n <= hi) buttons[i].closest('tr').classList.add('inrange');
-          }
-        }
-        render(comment, noteRow(anchor).querySelector('td.code'));
+        // The rows the comment covers keep their mark, now permanently.
+        if (hi > lo) mark(from, lo, hi, 'inrange');
+        render(comment, noteRow(line).querySelector('td.code'));
         // Update the URL to point at the new comment for deep-linking.
         if (comment.id != null) {
           history.replaceState(null, '', '#comment-' + comment.id);
@@ -2718,6 +2798,74 @@ mod tests {
         // the canonical selection fragment so ranges are copyable.
         assert!(COMMENT_JS.contains("selFragment(filePath, side, lo, hi)"));
         assert!(COMMENT_JS.contains("history.replaceState(null, '', '#' + frag)"));
+    }
+
+    /// The editor must not be a row in the diff table.
+    ///
+    /// A `<tr>` inside it means every keystroke dirties a table holding the whole
+    /// file, and the browser re-lays-out and repaints all of it: measured on
+    /// Chromium 131 at 40ms of main-thread work per character on a 3,600-line
+    /// diff, against 7-11ms for the same box positioned over the table. Typing
+    /// into a review comment is not a place to spend a table relayout.
+    #[test]
+    fn the_comment_editor_floats_rather_than_reflowing_the_table() {
+        // Built as a bare element and hung off the body, not inserted into a row.
+        assert!(COMMENT_JS.contains("box.className = 'notebox'"));
+        assert!(COMMENT_JS.contains("document.body.appendChild(box)"));
+        assert!(
+            !COMMENT_JS.contains("row.className = 'pending'"),
+            "the editor is a pending row again: that is the 40ms-a-keystroke shape"
+        );
+        // Document coordinates, so a vertical scroll carries it with the code and
+        // no scroll handler is needed.
+        assert!(COMMENT_JS.contains("window.scrollX"));
+        assert!(COMMENT_JS.contains("window.scrollY"));
+
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        assert!(css.contains(".notebox {\n  position: absolute;"), "{css}");
+        // And it is styled on its own, not as a descendant of the table it left.
+        assert!(
+            !css.contains("table.src.commentable .notebox"),
+            "the editor's rules still require it to be inside the table: {css}"
+        );
+        assert!(!css.contains("tr.pending"), "dead pending-row rules: {css}");
+    }
+
+    /// The line-number gutter sticks only while a code box is panned sideways.
+    ///
+    /// It is `position: sticky` so panning a long line keeps the numbers in view,
+    /// but two gutter cells a line is 7,200 sticky boxes on a 3,600-line diff, and
+    /// the browser revisits every one of them in each pre-paint: ~13ms of
+    /// main-thread work per keystroke and per scrolled frame, measured, for a
+    /// gutter that unpanned has nowhere to go.
+    #[test]
+    fn the_gutter_sticks_only_while_the_code_is_panned() {
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        assert!(
+            css.contains(".codebox.panned table.src td.ln { position: sticky; left: 0; }"),
+            "{css}"
+        );
+        assert!(
+            !css.contains("position: sticky; left: 0; background: var(--code-bg)"),
+            "the gutter is unconditionally sticky again: {css}"
+        );
+        // Turned on by the scroll that needs it, and only on the transition: a
+        // toggle per scroll event would re-invalidate the gutter every frame.
+        assert!(NAV_JS.contains("classList.toggle('panned', panned)"));
+        assert!(NAV_JS.contains("codebox.scrollLeft > 0"));
+        assert!(NAV_JS.contains("{ passive: true }"));
+    }
+
+    /// A drag redraws only when the row under the pointer changes.
+    ///
+    /// `pointermove` fires many times a second; retinting the same span each time
+    /// repaints the table for no visible change. The button scan is memoised for
+    /// the same reason — it walks every `+` in the page.
+    #[test]
+    fn a_drag_redraws_only_when_the_row_changes() {
+        assert!(COMMENT_JS.contains("if (button === drag.to) return;"));
+        assert!(COMMENT_JS.contains("siblingCache"));
+        assert!(COMMENT_JS.contains("Object.create(null)"));
     }
 
     #[test]

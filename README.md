@@ -172,6 +172,13 @@ deleted line — and the note is labelled with the span it covers. `⌘/Ctrl + E
 saves, `Escape` cancels, and several comments can stack on one line. Comments
 survive a reload and come back to the agent alongside the reply:
 
+The editor floats over the lines below rather than pushing them down. A box that
+sits *in* the diff is a row in the table holding the whole file, and then every
+character typed costs a relayout and repaint of all of it — 40ms a keystroke on a
+3,600-line diff, measured, against 7-11ms for the same box placed over it. A
+saved comment does sit in the flow, under the line it is about, since that costs
+one insertion rather than one per character.
+
 ```sh
 wdyt collect <id>
 # {"replied": true, "reply": {...}, "comments": [
