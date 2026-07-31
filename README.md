@@ -85,8 +85,10 @@ wdyt docs PLAN.md --title "the plan" --no-wait
 wdyt wait "<id>" --timeout 900
 ```
 
-One reply per session, deliberately — it is a note back, not a conversation.
-A second POST is refused and the page says so.
+One reply per session, deliberately — the reply is the verdict on the whole
+thing, and a second POST is refused. Anything that needs going back and forth
+happens on the lines instead: see [threaded
+discussions](#discussing-a-line-with-the-agent).
 
 **A reply outlives the wait.** If `--timeout` expires, the session stays open and
 the daemon keeps holding the reply, so a turn hours later can still pick it up:
@@ -224,6 +226,58 @@ or a `.patch` from elsewhere, simply gets no bands rather than context from a
 file that is not the one it describes. Files above 4 MB are skipped, and one
 click reveals at most a thousand lines.
 
+## Discussing a line with the agent
+
+A comment on a line is usually a question — "why is this a clone?" is not a
+remark — and a question that gets answered tomorrow in a `collect` is not much of
+a question. So a comment is the first message in a thread, and the agent can
+answer it while the page is still open:
+
+```
+┌─ YOU ───────────────────────────────────────┐
+│ why is this a clone?                        │
+│ ┌─ AGENT ─────────────────────────────────┐ │
+│ │ cheap here, and the borrow would leak   │ │
+│ │ into the API                            │ │
+│ └─────────────────────────────────────────┘ │
+│ ● picked up by an agent            [Reply]  │
+└─────────────────────────────────────────────┘
+```
+
+The agent's side is a loop of two commands:
+
+```sh
+wdyt watch <id>          # blocks until the reader says something, then prints it
+# {"asked": true,
+#  "thread": {"id": 4, "file": "src/diff.rs", "line": 97,
+#             "snippet": "    old_first: old_start,", "text": "why is this a clone?"},
+#  "message": {"id": 0, "from": "user", "text": "why is this a clone?"}}
+
+wdyt say <id> 4 "cheap here, and the borrow would leak into the API"
+wdyt watch <id>          # again, for the follow-up
+```
+
+`watch` exits 2 when nothing was asked before `--timeout`, so the loop ends on
+its own. `wdyt threads <id>` prints every thread and everything said in it.
+
+The whole thread comes with the question — the file, the line, the quoted
+snippet, and the exchange so far — because an answer is about the code, not about
+the sentence.
+
+**Each question is taken once.** Two agent processes watching the same session
+cannot answer the same question, and `watch` never returns a question twice.
+Reading (`wdyt threads`, and the page's own polling) takes nothing, so watching
+for an answer never marks the reader's own question as picked up.
+
+**Who is waiting on whom** is the last word in the thread, shown with the same
+three states as the session's receipt: grey while nobody has the question, amber
+once an agent has taken it, and gone once the answer is there — the answer being
+its own acknowledgement. The page polls a read-only route every three seconds
+while the tab is visible, so an answer arrives without a reload.
+
+The reply box for a thread floats over the listing like the comment editor does,
+for the same measured reason. A thread holds at most 100 messages.
+
 ## Guided review
 
 Rather than dropping a diff on someone and hoping, the agent can write the tour:
@@ -298,6 +352,7 @@ long diff gets the whole viewport.
 wdyt port          # a free port for a demo server (never the daemon's)
 wdyt port --all    # every free port in the range
 wdyt list          # URL of the session index
+wdyt threads <id>  # every discussion in a session, and everything said in it
 wdyt serve         # run the daemon in the foreground
 ```
 
@@ -307,7 +362,8 @@ reconstructed patch.
 The daemon starts automatically on first use and persists live sessions to
 `$XDG_STATE_HOME/wdyt/sessions.json` (normally
 `~/.local/state/wdyt/sessions.json`). Restarting restores their content, replies,
-comments, and acknowledgement state. Sessions expire after `session_ttl_hours`
+comments, discussions, and acknowledgement state — a `wdyt watch` has to be rerun
+after a restart, but the questions it had not taken yet are still there. Sessions expire after `session_ttl_hours`
 (24 by default; set it to nothing to keep them indefinitely).
 
 The state file is an atomically replaced, versioned JSON snapshot. An active

@@ -13,7 +13,9 @@ use topcoat::view::view;
 
 use crate::config::Config;
 use crate::render::{ThemeColors, theme, theme_colors};
-use crate::session::{Anchor, Comment, Content, Reply, Session, Side, Store, StoreError};
+use crate::session::{
+    Anchor, Author, Comment, Content, Message, Reply, Session, Side, Store, StoreError,
+};
 use crate::ui::{Raw, code_file, diff_hunk, shell};
 
 /// Values shared by every request.
@@ -78,6 +80,9 @@ impl State {
 #[path_param(error = not_found)]
 struct SessionId(String);
 
+#[path_param(error = not_found)]
+struct CommentId(u64);
+
 /// Builds the router.
 fn router(store: Store, colors: ThemeColors, theme: String) -> Router {
     Router::builder()
@@ -99,6 +104,11 @@ fn router(store: Store, colors: ThemeColors, theme: String) -> Router {
         .route(list_comments_route)
         .route(comment_route)
         .route(context_route)
+        .route(thread_message_route)
+        .route(agent_message_route)
+        .route(threads_route)
+        .route(agent_threads_route)
+        .route(next_question_route)
         .route(inbox_route)
         .route(collect_route)
         .route(ack_route)
@@ -510,6 +520,121 @@ async fn comment_route(cx: &Cx, Json(mut input): Json<CommentInput>) -> Result<J
         .comment(id, anchor, snippet, text)
         .map_err(store_error)?;
     Ok(Json(comment))
+}
+
+/// Adds the reader's own message to a thread.
+///
+/// The page's route, so the author is the user: an agent's answers arrive on
+/// `/api/sessions/…` instead, and nothing in a request body can change that.
+#[route(POST "/s/{session_id}/comments/{comment_id}/messages")]
+async fn thread_message_route(cx: &Cx, Json(input): Json<MessageInput>) -> Result<Json<Message>> {
+    post_message(cx, Author::User, input).await
+}
+
+/// Adds the agent's answer to a thread. The agent's side of `wdyt say`.
+#[route(POST "/api/sessions/{session_id}/comments/{comment_id}/messages")]
+async fn agent_message_route(cx: &Cx, Json(input): Json<MessageInput>) -> Result<Json<Message>> {
+    post_message(cx, Author::Agent, input).await
+}
+
+#[derive(Deserialize)]
+struct MessageInput {
+    text: String,
+}
+
+async fn post_message(cx: &Cx, from: Author, input: MessageInput) -> Result<Json<Message>> {
+    let id = path_param::<SessionId>(cx)?;
+    let comment_id = *path_param::<CommentId>(cx)?;
+    let text = input.text.trim().to_owned();
+    if text.is_empty() {
+        return Err(bad_request("a message must not be empty").into());
+    }
+    if text.len() > MAX_REPLY_BYTES {
+        return Err(bad_request("that message is too long").into());
+    }
+    let message = state(cx)
+        .store
+        .message(id, comment_id, from, text)
+        .map_err(store_error)?;
+    Ok(Json(message))
+}
+
+/// Every thread in a session, for the page to poll.
+///
+/// Read-only on purpose, like the reply's status route: a reader looking at their
+/// own page must not be able to mark their own question as picked up.
+#[route(GET "/s/{session_id}/threads")]
+async fn threads_route(cx: &Cx) -> Result<Json<Threads>> {
+    threads(cx)
+}
+
+/// The same, for an agent catching up on a discussion. Also read-only: taking a
+/// question is what `/threads/next` is for.
+#[route(GET "/api/sessions/{session_id}/threads")]
+async fn agent_threads_route(cx: &Cx) -> Result<Json<Threads>> {
+    threads(cx)
+}
+
+fn threads(cx: &Cx) -> Result<Json<Threads>> {
+    let id = path_param::<SessionId>(cx)?;
+    let comments = state(cx).store.comments(id).map_err(|_| not_found())?;
+    Ok(Json(Threads { threads: comments }))
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Threads {
+    pub threads: Vec<Comment>,
+}
+
+/// Blocks until the reader says something no agent has taken, and takes it.
+#[route(GET "/api/sessions/{session_id}/threads/next")]
+async fn next_question_route(cx: &Cx) -> Result<Json<NextQuestion>> {
+    let id = path_param::<SessionId>(cx)?;
+    let seconds = query_param(cx, "timeout_secs")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(600);
+
+    let waiting = state(cx).store.watch(id).map_err(|_| not_found())?;
+    let woken = tokio::time::timeout(std::time::Duration::from_secs(seconds), waiting)
+        .await
+        .ok()
+        .and_then(|result| result.ok())
+        .is_some();
+
+    // Even when woken, the question may have gone to another agent process that
+    // was watching the same session: taking it is what settles who has it.
+    let taken = if woken {
+        state(cx).store.take_question(id).map_err(store_error)?
+    } else {
+        None
+    };
+    Ok(Json(match taken {
+        Some((thread, message)) => NextQuestion {
+            asked: true,
+            thread: Some(thread),
+            message: Some(message),
+        },
+        None => NextQuestion {
+            asked: false,
+            thread: None,
+            message: None,
+        },
+    }))
+}
+
+/// What an agent gets when it asks for the next question.
+#[derive(Serialize, Deserialize)]
+pub struct NextQuestion {
+    /// Whether anything was waiting.
+    pub asked: bool,
+    /// The thread it belongs to, with the line it is about and the whole exchange
+    /// so far — the agent needs the context, not just the sentence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<Comment>,
+    /// The message itself. `id` is 0 for a comment's own text, which is the first
+    /// thing said in its thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<Message>,
 }
 
 /// The text of the lines a comment anchors to, if any exist.

@@ -3926,3 +3926,216 @@ async fn a_revealed_line_can_be_commented_on() {
         .await;
     assert_eq!(status, 400);
 }
+
+// --- Discussions under a comment --------------------------------------------
+
+/// A diff session with one comment on it, which is a thread with one message.
+async fn asked_diff_session(daemon: &Daemon) -> (String, u64) {
+    let id = diff_session(daemon);
+    let (status, body) = daemon
+        .post_json(
+            &format!("/s/{id}/comments"),
+            serde_json::json!({
+                "file": "src/lib.rs", "line": 2, "side": "new", "text": "why is this a clone?"
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let comment: serde_json::Value = serde_json::from_str(&body).unwrap();
+    (id, comment["id"].as_u64().unwrap())
+}
+
+/// Who said something is decided by the route it arrived on. The page cannot
+/// claim to be the agent whose answers the reader is trusting.
+#[tokio::test]
+async fn the_route_decides_the_author() {
+    let daemon = Daemon::start().await;
+    let (id, thread) = asked_diff_session(&daemon).await;
+
+    let (status, body) = daemon
+        .post_json(
+            &format!("/s/{id}/comments/{thread}/messages"),
+            serde_json::json!({ "text": "one more thing", "from": "agent" }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let message: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        message["from"], "user",
+        "the page spoke as the agent: {body}"
+    );
+
+    let (status, body) = daemon
+        .post_json(
+            &format!("/api/sessions/{id}/comments/{thread}/messages"),
+            serde_json::json!({ "text": "because it is cheap here" }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let message: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(message["from"], "agent");
+}
+
+/// The page polls to hear the answer, and polling must not tell the reader their
+/// own question has been picked up.
+#[tokio::test]
+async fn reading_a_discussion_does_not_take_it() {
+    let daemon = Daemon::start().await;
+    let (id, _) = asked_diff_session(&daemon).await;
+
+    for route in [
+        format!("/s/{id}/threads"),
+        format!("/api/sessions/{id}/threads"),
+    ] {
+        let (status, body) = daemon.get(&route).await;
+        assert_eq!(status, 200, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["threads"][0]["text"], "why is this a clone?");
+        assert!(
+            json["threads"][0]["delivered_at"].is_null(),
+            "{route} marked it delivered: {body}"
+        );
+    }
+}
+
+/// Asking for the next question takes it: a second agent must not answer the same
+/// one, and a second ask finds nothing.
+#[tokio::test]
+async fn the_next_question_is_taken_once() {
+    let daemon = Daemon::start().await;
+    let (id, thread) = asked_diff_session(&daemon).await;
+
+    let (status, body) = daemon
+        .get(&format!("/api/sessions/{id}/threads/next?timeout_secs=5"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["asked"], true);
+    assert_eq!(json["message"]["text"], "why is this a clone?");
+    // The thread comes with it: the line, the quoted code, and the exchange so
+    // far, since an answer is about the code rather than about the sentence.
+    assert_eq!(json["thread"]["line"], 2);
+    assert_eq!(json["thread"]["snippet"], "    let x = 2;");
+
+    let (_, body) = daemon
+        .get(&format!("/api/sessions/{id}/threads/next?timeout_secs=1"))
+        .await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["asked"], false, "the same question came back: {body}");
+
+    // The page can now say an agent has it.
+    let (_, body) = daemon.get(&format!("/s/{id}/threads")).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(!json["threads"][0]["delivered_at"].is_null(), "{body}");
+
+    // An answer is not a question, so nothing is waiting after it.
+    let (status, _) = daemon
+        .post_json(
+            &format!("/api/sessions/{id}/comments/{thread}/messages"),
+            serde_json::json!({ "text": "because it is cheap" }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (_, body) = daemon
+        .get(&format!("/api/sessions/{id}/threads/next?timeout_secs=1"))
+        .await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["asked"], false, "{body}");
+}
+
+/// An agent already waiting is woken by what the reader writes next, rather than
+/// finding out on its next poll.
+#[tokio::test]
+async fn a_waiting_agent_is_woken_by_a_follow_up() {
+    let daemon = Daemon::start().await;
+    let (id, thread) = asked_diff_session(&daemon).await;
+    // Clear the comment itself out of the way.
+    daemon
+        .get(&format!("/api/sessions/{id}/threads/next?timeout_secs=5"))
+        .await;
+
+    let base = daemon.base.clone();
+    let session = id.clone();
+    let waiting = tokio::spawn(async move {
+        reqwest::get(format!(
+            "{base}/api/sessions/{session}/threads/next?timeout_secs=20"
+        ))
+        .await
+        .expect("request sent")
+        .text()
+        .await
+        .expect("body")
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let (status, _) = daemon
+        .post_json(
+            &format!("/s/{id}/comments/{thread}/messages"),
+            serde_json::json!({ "text": "and the one below it?" }),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    let body = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the wait ended when the reader wrote")
+        .expect("task");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["asked"], true, "{body}");
+    assert_eq!(json["message"]["text"], "and the one below it?");
+}
+
+#[tokio::test]
+async fn a_message_is_checked_before_it_is_kept() {
+    let daemon = Daemon::start().await;
+    let (id, thread) = asked_diff_session(&daemon).await;
+
+    let (status, _) = daemon
+        .post_json(
+            &format!("/s/{id}/comments/{thread}/messages"),
+            serde_json::json!({ "text": "   " }),
+        )
+        .await;
+    assert_eq!(status, 400, "an empty message");
+
+    let (status, _) = daemon
+        .post_json(
+            &format!("/s/{id}/comments/{thread}/messages"),
+            serde_json::json!({ "text": "x".repeat(20_000) }),
+        )
+        .await;
+    assert_eq!(status, 400, "too long");
+
+    let (status, _) = daemon
+        .post_json(
+            &format!("/s/{id}/comments/999/messages"),
+            serde_json::json!({ "text": "hello?" }),
+        )
+        .await;
+    assert_eq!(status, 404, "no such thread");
+}
+
+/// The exchange is rendered by the server too, so a reload shows it without
+/// waiting for a poll — and so it is there at all with no script.
+#[tokio::test]
+async fn the_page_renders_the_exchange() {
+    let daemon = Daemon::start().await;
+    let (id, thread) = asked_diff_session(&daemon).await;
+    daemon
+        .post_json(
+            &format!("/api/sessions/{id}/comments/{thread}/messages"),
+            serde_json::json!({ "text": "because the borrow would leak" }),
+        )
+        .await;
+
+    let (status, page) = daemon.get(&format!("/s/{id}")).await;
+    assert_eq!(status, 200);
+    assert!(
+        page.contains(&format!(r#"data-thread="{thread}""#)),
+        "no thread marker: {page}"
+    );
+    assert!(page.contains(r#"class="said agent""#), "{page}");
+    assert!(page.contains("because the borrow would leak"), "{page}");
+    // The foot is the script's to paint, so the server leaves it empty.
+    assert!(page.contains(r#"<div class="threadfoot">"#), "{page}");
+}

@@ -71,6 +71,33 @@ wdyt ack <id> "on it"  # turn the user's receipt green
 Always `ack` immediately after collecting — it tells the user you actually read
 their note.
 
+## Answering their questions (threads)
+
+A line comment is usually a question, not a remark. Once you have the reply,
+**stay in the discussion** until they stop asking:
+
+```sh
+wdyt watch <id>                          # blocks until they say something
+# {"asked": true, "thread": {"id": 4, "file": "src/diff.rs", "line": 97,
+#   "snippet": "old_first: old_start,", "text": "why is this a clone?"},
+#  "message": {"id": 0, "from": "user", "text": "why is this a clone?"}}
+
+wdyt say <id> 4 "cheap here, and the borrow would leak into the API"
+wdyt watch <id>                          # and again, for the follow-up
+```
+
+Loop `watch` → `say` until `watch` exits 2 (nothing asked before `--timeout`).
+Your answer appears under that line on their page while they are still reading it.
+
+- The `thread` id is the comment id. It comes back from `watch`, from
+  `wdyt threads <id>`, and from `wdyt collect <id>`.
+- `watch` takes each question once, so two of your processes cannot answer the
+  same one. `wdyt threads <id>` reads the whole discussion and takes nothing.
+- Answer with what you did, not just what you think: "renamed it, pushed" reads
+  better than "good point".
+- Sending the answer is what tells them you read the question — taking it only
+  turns their dot amber.
+
 ## Sessions, the daemon, and one shared port
 
 One long-lived **daemon** serves **every session on a single port** (chosen from

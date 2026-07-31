@@ -5,8 +5,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::config::Config;
-use crate::server::{Comments, CreateSession, CreatedSession, Inbox, InboxItem};
-use crate::session::{Comment, Reply};
+use crate::server::{
+    Comments, CreateSession, CreatedSession, Inbox, InboxItem, NextQuestion, Threads,
+};
+use crate::session::{Comment, Message, Reply};
 
 pub struct Client {
     /// The port the daemon was last seen on. Cached because every call would
@@ -183,8 +185,86 @@ impl Client {
         Ok(response.json::<Response>().await?.reply)
     }
 
-    /// Every reply the daemon is holding, optionally only the unread ones.
+    /// Waits for the reader's next word in a discussion, up to `timeout`.
     ///
+    /// A reply ends a session's wait for good; a discussion goes on, so this can
+    /// be called again and again and returns the questions in the order they were
+    /// asked. Taking a question marks it as picked up — the page says so — while
+    /// what turns a thread green is the answer sent back.
+    pub async fn next_question(&self, id: &str, timeout: Duration) -> Result<NextQuestion> {
+        let base = self.require_base().await?;
+        let response = self
+            .http
+            .get(format!(
+                "{base}/api/sessions/{id}/threads/next?timeout_secs={}",
+                timeout.as_secs()
+            ))
+            // Outlast the daemon's own window, so it decides when time is up.
+            .timeout(timeout + Duration::from_secs(15))
+            .send()
+            .await
+            .context("could not reach the wdyt daemon")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!("no such session: {id}");
+        }
+        anyhow::ensure!(
+            response.status().is_success(),
+            "daemon returned {}",
+            response.status()
+        );
+        Ok(response.json::<NextQuestion>().await?)
+    }
+
+    /// Every thread in a session, with the whole exchange under each.
+    ///
+    /// Reading changes nothing: an agent can look at a discussion without
+    /// claiming to have picked anything up.
+    pub async fn threads(&self, id: &str) -> Result<Vec<Comment>> {
+        let base = self.require_base().await?;
+        let response = self
+            .http
+            .get(format!("{base}/api/sessions/{id}/threads"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .context("could not reach the wdyt daemon")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!("no such session: {id}");
+        }
+        anyhow::ensure!(
+            response.status().is_success(),
+            "daemon returned {}",
+            response.status()
+        );
+        Ok(response.json::<Threads>().await?.threads)
+    }
+
+    /// Answers one thread.
+    pub async fn say(&self, id: &str, thread: u64, text: &str) -> Result<Message> {
+        let base = self.require_base().await?;
+        let response = self
+            .http
+            .post(format!(
+                "{base}/api/sessions/{id}/comments/{thread}/messages"
+            ))
+            .json(&serde_json::json!({ "text": text }))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .context("could not reach the wdyt daemon")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!("no such session or thread: {id} #{thread}");
+        }
+        anyhow::ensure!(
+            response.status().is_success(),
+            "daemon returned {}: {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        );
+        Ok(response.json::<Message>().await?)
+    }
+
+    /// Every reply the daemon is holding, optionally only the unread ones.    ///
     /// Does not start a daemon: an empty inbox and no daemon at all mean the
     /// same thing to the caller, and starting one to ask would be surprising.
     pub async fn inbox(&self, unread_only: bool) -> Result<Vec<InboxItem>> {

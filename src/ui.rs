@@ -6,7 +6,7 @@ use topcoat::view::{NodeViewParts, PartsWriter, component, view};
 
 use crate::diff::Gap;
 use crate::render::ThemeColors;
-use crate::session::{Comment, Hunk, LineKind, Reply, Side};
+use crate::session::{Author, Comment, Hunk, LineKind, Reply, Side};
 
 /// Pre-rendered HTML injected verbatim.
 ///
@@ -395,6 +395,46 @@ table.src.commentable tr.selecting td {{
 }}
 /* A drag over code would otherwise select text and fight the range. */
 table.src.commentable tr.selecting {{ user-select: none; }}
+/* A discussion under a comment: the agent's answers and the reader's follow-ups.
+   Indented under the note they belong to and marked by who said them, since the
+   whole point is that two parties are talking. */
+.note .said {{
+  margin: 6px 0 0; padding: 5px 9px;
+  border-left: 2px solid var(--border-strong);
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
+  border-radius: 0 6px 6px 0;
+}}
+.note .said.agent {{ border-left-color: var(--accent); }}
+.note .said .who {{
+  display: block; font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: .07em; color: var(--muted);
+}}
+.note .said.agent .who {{ color: var(--accent); }}
+/* The receipt and the reply control, painted by THREAD_JS. */
+.note .threadfoot {{
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 7px; font-size: 11.5px; color: var(--muted);
+}}
+.note .threadfoot .receipt {{ display: inline-flex; align-items: center; gap: 5px; }}
+.note .threadfoot .dot {{
+  width: 7px; height: 7px; border-radius: 50%; background: var(--border-strong);
+}}
+.note .threadfoot .waiting .dot {{
+  background: var(--border-strong); animation: wdyt-pulse 1.8s ease-in-out infinite;
+}}
+.note .threadfoot .delivered .dot {{
+  background: #b8860b; animation: wdyt-pulse 1.8s ease-in-out infinite;
+}}
+@media (prefers-reduced-motion: reduce) {{
+  .note .threadfoot .waiting .dot, .note .threadfoot .delivered .dot {{ animation: none; }}
+}}
+.note .threadfoot button {{
+  font: 11.5px/1 ui-sans-serif, system-ui, sans-serif;
+  margin-left: auto; padding: 4px 9px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border-strong); background: var(--bg); color: var(--fg);
+}}
+.note .threadfoot button:hover {{ border-color: var(--accent); color: var(--accent); }}
+
 /* The pending editor floats over the listing instead of being a row inside it.
    A `<tr>` in the diff table means every character typed dirties a table that
    holds the whole file, and the browser answers by re-laying-out and repainting
@@ -1324,6 +1364,9 @@ pub(crate) const COMMENT_JS: &str = r#"
     note.className = 'note';
     // Stable anchor so the fragment script can scroll to it.
     if (comment.id != null) note.id = 'comment-' + comment.id;
+    // Marks it as the head of a discussion, which is what THREAD_JS looks for:
+    // the comment just made can be answered without reloading the page.
+    if (comment.id != null) note.setAttribute('data-thread', comment.id);
     var who = document.createElement('span');
     who.className = 'who';
     who.textContent = 'you';
@@ -1469,6 +1512,10 @@ pub(crate) const COMMENT_JS: &str = r#"
         // The rows the comment covers keep their mark, now permanently.
         if (hi > lo) mark(from, lo, hi, 'inrange');
         render(comment, noteRow(line).querySelector('td.code'));
+        // A comment is the head of a discussion: the thread script paints its
+        // receipt and reply control, and should not wait for its next poll to
+        // notice a thread the reader is looking at right now.
+        root.dispatchEvent(new CustomEvent('wdyt:commented'));
         // Update the URL to point at the new comment for deep-linking.
         if (comment.id != null) {
           history.replaceState(null, '', '#comment-' + comment.id);
@@ -1652,6 +1699,223 @@ pub(crate) const EXPAND_JS: &str = r##"
 
   var bands = root.querySelectorAll('tr.gap');
   for (var i = 0; i < bands.length; i++) paint(bands[i]);
+})();
+"##;
+
+/// The discussion under a comment: the agent's answers, and answering back.
+///
+/// A comment used to be a note the agent read once, hours later, in a `collect`.
+/// The thing a reader actually wants at that line is an answer — "why is this a
+/// clone?" is a question, not a remark — so a comment is the first message in a
+/// thread the agent can reply to while the page is still open.
+///
+/// The page polls rather than holding a socket open: the exchange is a few
+/// sentences a minute at its busiest, a poll survives a daemon restart with no
+/// reconnection logic, and it costs nothing while the tab is in the background.
+/// It also polls a read-only route, so watching for an answer never marks the
+/// reader's own question as picked up.
+pub(crate) const THREAD_JS: &str = r##"
+(function () {
+  var root = document.querySelector('[data-comments]');
+  if (!root) return;
+  var session = root.getAttribute('data-session');
+  // Often enough that an answer feels like an answer, rarely enough that a page
+  // left open all afternoon is not a load on the daemon.
+  var EVERY = 3000;
+  var timer = null;
+  // The reply box, if one is open. One at a time, like the comment editor.
+  var box = null;
+
+  function notes() { return root.querySelectorAll('.note[data-thread]'); }
+
+  function foot(note) {
+    var found = note.querySelector('.threadfoot');
+    if (!found) {
+      found = document.createElement('div');
+      found.className = 'threadfoot';
+      note.appendChild(found);
+    }
+    return found;
+  }
+
+  // What the reader is owed. Null when the agent has spoken last; otherwise
+  // whether anything has picked the question up yet.
+  function pending(thread) {
+    var replies = thread.replies || [];
+    var last = replies.length ? replies[replies.length - 1] : null;
+    if (last) {
+      if (last.from !== 'user') return null;
+      return { delivered: !!last.delivered_at };
+    }
+    return { delivered: !!thread.delivered_at };
+  }
+
+  function said(message) {
+    var div = document.createElement('div');
+    div.className = 'said ' + (message.from === 'agent' ? 'agent' : 'user');
+    div.setAttribute('data-message', message.id);
+    var who = document.createElement('span');
+    who.className = 'who';
+    who.textContent = message.from === 'agent' ? 'agent' : 'you';
+    div.appendChild(who);
+    div.appendChild(document.createTextNode(message.text));
+    return div;
+  }
+
+  // Whatever this note has not shown yet, in order, above the foot.
+  function catchUp(note, thread) {
+    var known = {};
+    var shown = note.querySelectorAll('[data-message]');
+    for (var i = 0; i < shown.length; i++) known[shown[i].getAttribute('data-message')] = true;
+    var replies = thread.replies || [];
+    var mark = foot(note);
+    var added = 0;
+    for (var j = 0; j < replies.length; j++) {
+      if (known[String(replies[j].id)]) continue;
+      note.insertBefore(said(replies[j]), mark);
+      added++;
+    }
+    return added;
+  }
+
+  // The three states the session's own receipt uses, per thread: nobody has this
+  // yet, an agent has it, the agent has answered — and the answer is the message
+  // above, which is why an answered thread says nothing here.
+  //
+  // Repainted only when it would say something different. A poll that rebuilds
+  // the foot of every thread dirties the table it sits in, and the whole diff is
+  // relaid out and repainted for a receipt that has not changed — several times a
+  // minute, for as long as the page is open.
+  function paint(note, thread) {
+    var owed = pending(thread);
+    var state = !owed ? 'answered' : owed.delivered ? 'delivered' : 'waiting';
+    if (note.getAttribute('data-state') === state) return;
+    note.setAttribute('data-state', state);
+    var mark = foot(note);
+    mark.textContent = '';
+    if (owed) {
+      var receipt = document.createElement('span');
+      receipt.className = 'receipt ' + (owed.delivered ? 'delivered' : 'waiting');
+      var dot = document.createElement('span');
+      dot.className = 'dot';
+      receipt.appendChild(dot);
+      receipt.appendChild(document.createTextNode(
+        owed.delivered ? 'picked up by an agent' : 'waiting for an agent'));
+      mark.appendChild(receipt);
+    }
+    var reply = document.createElement('button');
+    reply.type = 'button';
+    reply.className = 'threadreply';
+    reply.textContent = 'Reply';
+    reply.title = 'Say something else about this line';
+    mark.appendChild(reply);
+  }
+
+  function close() {
+    if (box) { box.remove(); box = null; }
+  }
+
+  // Anchored under the note, in document coordinates, and outside the table for
+  // the same reason the comment editor is: typing must not relayout the diff.
+  function openReply(note) {
+    var already = box && box.forNote === note;
+    close();
+    if (already) return;
+    var thread = note.getAttribute('data-thread');
+    var rect = note.getBoundingClientRect();
+    box = document.createElement('div');
+    box.className = 'notebox';
+    box.forNote = note;
+    box.innerHTML =
+      '<textarea aria-label="Reply in this discussion"></textarea>' +
+      '<div class="row"><span class="msg"></span>' +
+      '<button type="button" class="cancel">Cancel</button>' +
+      '<button type="button" class="primary">Send</button>' +
+      '</div>';
+    box.style.left = (rect.left + window.scrollX) + 'px';
+    box.style.top = (rect.bottom + window.scrollY + 4) + 'px';
+    box.style.width = Math.max(280, Math.min(620, rect.width)) + 'px';
+    document.body.appendChild(box);
+    var text = box.querySelector('textarea');
+    var send = box.querySelector('button.primary');
+    var msg = box.querySelector('.msg');
+    text.placeholder = 'Reply\u2026';
+    text.focus();
+    var below = box.getBoundingClientRect().bottom - (window.innerHeight - 12);
+    if (below > 0) window.scrollBy(0, below);
+
+    box.querySelector('button.cancel').addEventListener('click', close);
+    text.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') { close(); return; }
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') send.click();
+    });
+    send.addEventListener('click', function () {
+      var body = text.value.trim();
+      if (!body) { text.focus(); return; }
+      send.disabled = true;
+      msg.textContent = '';
+      fetch('/s/' + session + '/comments/' + encodeURIComponent(thread) + '/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: body })
+      }).then(function (res) {
+        if (!res.ok) throw new Error('could not send that');
+        return res.json();
+      }).then(function (message) {
+        close();
+        note.insertBefore(said(message), foot(note));
+        // Said by the reader, so the thread is waiting on an agent again.
+        paint(note, { replies: [message] });
+        refresh();
+      }).catch(function (err) {
+        msg.textContent = String(err.message || err);
+        send.disabled = false;
+      });
+    });
+  }
+
+  root.addEventListener('click', function (e) {
+    var button = e.target.closest ? e.target.closest('.threadreply') : null;
+    if (!button) return;
+    var note = button.closest('.note[data-thread]');
+    if (note) openReply(note);
+  });
+
+  function refresh() {
+    var live = notes();
+    // Nothing to hear about yet: a page with no comments on it is not waiting for
+    // anything, and the request would be an empty answer either way.
+    if (!live.length) return Promise.resolve();
+    return fetch('/s/' + session + '/threads')
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (data) {
+        if (!data || !data.threads) return;
+        var byId = {};
+        for (var i = 0; i < data.threads.length; i++) byId[String(data.threads[i].id)] = data.threads[i];
+        var current = notes();
+        for (var j = 0; j < current.length; j++) {
+          var thread = byId[current[j].getAttribute('data-thread')];
+          if (!thread) continue;
+          catchUp(current[j], thread);
+          paint(current[j], thread);
+        }
+      })
+      .catch(function () { /* a daemon restart is not worth a broken page */ });
+  }
+
+  function start() { if (!timer) timer = setInterval(refresh, EVERY); }
+  function stop() { if (timer) { clearInterval(timer); timer = null; } }
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') { refresh(); start(); } else { stop(); }
+  });
+
+  // A comment just made is a thread just started.
+  root.addEventListener('wdyt:commented', function () { refresh(); });
+
+  // Paint what the server already rendered, then keep it current.
+  refresh();
+  start();
 })();
 "##;
 
@@ -2054,6 +2318,9 @@ pub(crate) const DOC_COMMENT_JS: &str = r##"
         var note = document.createElement('div');
         note.className = 'note';
         if (comment.id != null) note.id = 'comment-' + comment.id;
+        // The head of a discussion, so THREAD_JS can hang the exchange under a
+        // markdown comment as it does under one on a line.
+        if (comment.id != null) note.setAttribute('data-thread', comment.id);
         var who = document.createElement('span');
         who.className = 'who';
         who.textContent = 'you';
@@ -2182,6 +2449,10 @@ pub(crate) const DOC_COMMENT_JS: &str = r##"
               }).then(function (comment) {
                 closeBox();
                 renderNote(comment, noteContainer(block));
+                // Same announcement the line-comment script makes: a new thread
+                // for THREAD_JS to hang the discussion under.
+                var hook = document.querySelector('[data-comments]');
+                if (hook) hook.dispatchEvent(new CustomEvent('wdyt:commented'));
                 if (comment.id != null) {
                   history.replaceState(null, '', '#comment-' + comment.id);
                 }
@@ -2343,6 +2614,71 @@ pub(crate) fn diff_blocks(files: &[crate::session::DiffFile]) -> Vec<FileBlock<'
         .collect()
 }
 
+/// One comment and the discussion under it.
+///
+/// The comment is the first thing said. The agent's answers, and any follow-up
+/// from the reader, hang below it in the flow of the code, because a discussion
+/// about a line is only legible next to the line it is about.
+///
+/// The foot of the thread — the receipt and the reply control — is painted by
+/// `THREAD_JS` rather than rendered here: it changes while the page is open, and
+/// having one implementation of those states beats having a server-rendered one
+/// that the script must then agree with.
+#[component]
+pub async fn thread(comment: &Comment) -> Result {
+    struct Said {
+        id: u64,
+        class: &'static str,
+        who: &'static str,
+        text: String,
+    }
+    let said: Vec<Said> = comment
+        .replies
+        .iter()
+        .map(|message| Said {
+            id: message.id,
+            class: match message.from {
+                Author::Agent => "said agent",
+                Author::User => "said user",
+            },
+            who: match message.from {
+                Author::Agent => "agent",
+                Author::User => "you",
+            },
+            text: message.text.clone(),
+        })
+        .collect();
+    view! {
+        <div
+            class="note"
+            id=(format!("comment-{}", comment.id))
+            data-thread=(comment.id)
+        >
+            <span class="who">
+                "you"
+                // Says what the note is about when it covers more than the line
+                // above it.
+                if let Some(span) = span_label(comment) {
+                    <span class="span">(span)</span>
+                }
+            </span>
+            <a
+                class="permalink"
+                href=(format!("#{}", crate::fragment::comment_fragment(comment.id)))
+                title="Link to this comment"
+            >"#"</a>
+            (&comment.text)
+            for message in said {
+                <div class=(message.class) data-message=(message.id)>
+                    <span class="who">(message.who)</span>
+                    (message.text)
+                </div>
+            }
+            <div class="threadfoot"></div>
+        </div>
+    }
+}
+
 /// One hunk of a diff, with a comment affordance on every line.
 ///
 /// The line number cells are buttons rather than links: clicking one opens an
@@ -2478,18 +2814,7 @@ pub async fn diff_hunk(
                             <td class="ln" colspan="2"></td>
                             <td class="code">
                                 for comment in row.comments.clone() {
-                                    <div class="note" id=(format!("comment-{}", comment.id))>
-                                        <span class="who">
-                                            "you"
-                                            // Says what the note is about when it
-                                            // covers more than the line above it.
-                                            if let Some(span) = span_label(&comment) {
-                                                <span class="span">(span)</span>
-                                            }
-                                        </span>
-                                        <a class="permalink" href=(format!("#{}", crate::fragment::comment_fragment(comment.id))) title="Link to this comment">"#"</a>
-                                        (&comment.text)
-                                    </div>
+                                    thread(comment: &comment)
                                 }
                             </td>
                         </tr>
@@ -2584,16 +2909,7 @@ pub async fn code_file(file: &str, highlighted: &[String], comments: &[Comment])
                             <td class="ln" colspan="2"></td>
                             <td class="code">
                                 for comment in row.comments.clone() {
-                                    <div class="note" id=(format!("comment-{}", comment.id))>
-                                        <span class="who">
-                                            "you"
-                                            if let Some(span) = span_label(&comment) {
-                                                <span class="span">(span)</span>
-                                            }
-                                        </span>
-                                        <a class="permalink" href=(format!("#{}", crate::fragment::comment_fragment(comment.id))) title="Link to this comment">"#"</a>
-                                        (&comment.text)
-                                    </div>
+                                    thread(comment: &comment)
                                 }
                             </td>
                         </tr>
@@ -2907,6 +3223,7 @@ pub async fn shell(
                 if commentable {
                     <script>(Raw(COMMENT_JS))</script>
                     <script>(Raw(EXPAND_JS))</script>
+                    <script>(Raw(THREAD_JS))</script>
                     <script>(Raw(DOC_COMMENT_JS))</script>
                     <script>(Raw(FRAGMENT_JS))</script>
                 }
@@ -3209,6 +3526,39 @@ mod tests {
         assert!(EXPAND_JS.contains("window.scrollBy"));
     }
 
+    /// A comment is the start of a discussion, not a note left in a box.
+    #[test]
+    fn a_thread_shows_who_said_what_and_who_is_waiting() {
+        // The exchange is server-rendered, so a reload shows it without a poll.
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        assert!(css.contains(".note .said.agent"), "{css}");
+        assert!(css.contains(".note .threadfoot"), "{css}");
+        // The same three states the session's own receipt uses.
+        assert!(css.contains(".note .threadfoot .waiting .dot"), "{css}");
+        assert!(css.contains(".note .threadfoot .delivered .dot"), "{css}");
+
+        // The page polls a read-only route: watching for an answer must not mark
+        // the reader's own question as picked up.
+        assert!(THREAD_JS.contains("'/s/' + session + '/threads'"));
+        assert!(
+            !THREAD_JS.contains("threads/next"),
+            "the page must not take questions from the agent"
+        );
+        // Answering back posts to the page's own route, which is what makes the
+        // message the reader's rather than the agent's.
+        assert!(THREAD_JS.contains("'/messages'"));
+        // Polling stops with the tab.
+        assert!(THREAD_JS.contains("visibilitychange"));
+        // The reply box is outside the table, for the same reason the comment
+        // editor is: typing must not relayout the diff.
+        assert!(THREAD_JS.contains("document.body.appendChild(box)"));
+        assert!(THREAD_JS.contains("box.className = 'notebox'"));
+        // A comment made just now is a thread just started.
+        assert!(COMMENT_JS.contains("CustomEvent('wdyt:commented')"));
+        assert!(THREAD_JS.contains("addEventListener('wdyt:commented'"));
+        assert!(COMMENT_JS.contains("setAttribute('data-thread'"));
+    }
+
     #[test]
     fn comment_js_renders_permalink_on_saved_comments() {
         // Saved comments should include a discoverable permalink.
@@ -3253,6 +3603,8 @@ mod tests {
             snippet: String::new(),
             text: String::new(),
             at: std::time::SystemTime::now(),
+            replies: Vec::new(),
+            delivered_at: None,
         };
         assert_eq!(span_label(&ranged).as_deref(), Some("L4–L9"));
         // A single line is already identified by the row the note hangs under.

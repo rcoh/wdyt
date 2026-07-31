@@ -44,7 +44,13 @@ WORKFLOW (for coding agents):
        wdyt collect <id>   # returns reply + line/block comments as JSON
        wdyt ack <id> \"rerunning the build with your flag\"  # turns receipt green
 
-  5. Exit status 2 means timeout — the session stays open for later collection.
+  5. Answer the questions left on lines, while they are still reading:
+       wdyt watch <id>            # blocks until they ask something; JSON on stdout
+       wdyt say <id> <thread> \"because the borrow would leak\"
+       wdyt threads <id>          # the whole discussion, changing nothing
+     Loop watch → say until watch exits 2 (nothing asked in --timeout).
+
+  6. Exit status 2 means timeout — the session stays open for later collection.
 
 STDIN CAVEAT: --brief - and a piped diff cannot both read stdin. Use --brief-file
 when piping a diff."
@@ -170,6 +176,53 @@ enum Command {
         /// What you are doing about the reply, in a sentence.
         #[arg(required = true)]
         note: Vec<String>,
+    },
+
+    /// Wait for the reader's next word in a discussion, and print it.
+    ///
+    /// Where `wait` waits once for the session's reply, this is the conversation:
+    /// it returns each comment and follow-up as it is written, oldest first, and
+    /// can be called again for the next one. Answer with `wdyt say`.
+    ///
+    /// Prints JSON: {"asked": true, "thread": {...}, "message": {...}}. The thread
+    /// carries the file, line, quoted snippet and everything said so far, so the
+    /// answer can be about the code rather than about the sentence. Exit status 2
+    /// means nothing was asked before `--timeout`.
+    ///
+    /// Taking a question marks it as picked up on the page; sending the answer is
+    /// what tells the reader it was actually read.
+    Watch {
+        /// Session id, as printed when the session was created.
+        id: String,
+        /// Give up after this many seconds (exit status 2 on timeout).
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+
+    /// Answer one thread in a discussion.
+    ///
+    /// The thread number is the comment id, which `wdyt watch` and `wdyt threads`
+    /// both print. The answer appears under that line on the page, in the reader's
+    /// own view of the diff.
+    /// Example: wdyt say abc123 4 "renamed it; the old name was from the prototype"
+    Say {
+        /// Session id.
+        id: String,
+        /// Which thread to answer.
+        thread: u64,
+        /// What to say.
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
+
+    /// Print every thread in a session and everything said in it.
+    ///
+    /// Reading changes nothing: use it to catch up on a discussion, or after a
+    /// restart, without claiming to have picked anything up. `wdyt watch` is the
+    /// one that takes a question.
+    Threads {
+        /// Session id.
+        id: String,
     },
 
     /// Run the daemon in the foreground.
@@ -523,6 +576,62 @@ async fn run() -> Result<()> {
             }
         }
 
+        Command::Watch { id, timeout } => {
+            let client = Client::new(&config);
+            let next = client
+                .next_question(&id, Duration::from_secs(timeout))
+                .await?;
+            if !next.asked {
+                eprintln!(
+                    "wdyt: nothing asked within {timeout}s. The session stays open — \
+                     watch again, or read the discussion with `wdyt threads {id}`."
+                );
+                std::process::exit(2);
+            }
+            println!("{}", serde_json::to_string_pretty(&next)?);
+            if let Some(thread) = &next.thread {
+                eprintln!(
+                    "wdyt: {} asked about {}:{}. Answer it with:\n  \
+                     wdyt say {id} {} \"<your answer>\"",
+                    if thread.replies.is_empty() {
+                        "a new comment"
+                    } else {
+                        "a follow-up"
+                    },
+                    thread.file,
+                    thread.line,
+                    thread.id,
+                );
+            }
+            Ok(())
+        }
+
+        Command::Say { id, thread, text } => {
+            let text = text.join(" ");
+            anyhow::ensure!(!text.trim().is_empty(), "the answer must not be empty");
+            let message = Client::new(&config).say(&id, thread, &text).await?;
+            println!("{}", serde_json::to_string_pretty(&message)?);
+            eprintln!(
+                "wdyt: answered thread {thread}. Wait for the next question with:\n  \
+                 wdyt watch {id}"
+            );
+            Ok(())
+        }
+
+        Command::Threads { id } => {
+            let threads = Client::new(&config).threads(&id).await?;
+            println!("{}", serde_json::to_string_pretty(&threads)?);
+            let waiting = threads.iter().filter(|t| t.awaiting_agent()).count();
+            if waiting > 0 {
+                eprintln!(
+                    "wdyt: {waiting} thread{} waiting on you. Take the next with:\n  \
+                     wdyt watch {id}",
+                    if waiting == 1 { "" } else { "s" }
+                );
+            }
+            Ok(())
+        }
+
         Command::Inbox { all } => {
             let items = Client::new(&config).inbox(!all).await?;
             // JSON, because the caller is an agent: one array to parse rather
@@ -785,7 +894,8 @@ async fn show_content(
                 // looking at an amber dot.
                 eprintln!(
                     "wdyt: reply received. Run `wdyt collect {id}` for line comments, then:\n  \
-                     wdyt ack {id} \"<what you are doing>\""
+                     wdyt ack {id} \"<what you are doing>\"\n  \
+                     wdyt watch {id}      # answer questions left on lines, as they come"
                 );
             }
             None => {
@@ -795,6 +905,7 @@ async fn show_content(
                 eprintln!(
                     "wdyt: no reply within {timeout}s. The session stays open:\n  \
                      wdyt collect {id}    # check for reply + comments later\n  \
+                     wdyt watch {id}      # wait for a question on a line\n  \
                      wdyt inbox           # list all pending replies",
                 );
                 std::process::exit(2);
@@ -803,8 +914,9 @@ async fn show_content(
     } else {
         // --no-wait: brief guidance on what to do next.
         eprintln!(
-            "wdyt: session {id} created (not waiting). To collect later:\n  \
-             wdyt collect {id}"
+            "wdyt: session {id} created (not waiting). Later:\n  \
+             wdyt collect {id}    # the reply and any line comments\n  \
+             wdyt watch {id}      # block until a question is asked, then `wdyt say`"
         );
     }
     Ok(())
@@ -1092,5 +1204,38 @@ mod tests {
             }
             _ => panic!("expected Wait"),
         }
+    }
+
+    /// The discussion commands, which are what an agent runs in a loop: wait for
+    /// a question, answer it, wait again.
+    #[test]
+    fn the_discussion_commands_parse() {
+        match Cli::parse_from(["wdyt", "watch", "abc123", "--timeout", "45"]).command {
+            Command::Watch { id, timeout } => {
+                assert_eq!(id, "abc123");
+                assert_eq!(timeout, 45);
+            }
+            _ => panic!("expected Watch"),
+        }
+        // The answer is taken as words rather than one quoted argument, so an
+        // agent that forgets the quotes still says what it meant.
+        match Cli::parse_from(["wdyt", "say", "abc123", "4", "because", "it", "is", "cheap"])
+            .command
+        {
+            Command::Say { id, thread, text } => {
+                assert_eq!(id, "abc123");
+                assert_eq!(thread, 4);
+                assert_eq!(text.join(" "), "because it is cheap");
+            }
+            _ => panic!("expected Say"),
+        }
+        match Cli::parse_from(["wdyt", "threads", "abc123"]).command {
+            Command::Threads { id } => assert_eq!(id, "abc123"),
+            _ => panic!("expected Threads"),
+        }
+        // A thread number is required and must be a number: silently answering
+        // thread 0 would put the words in the wrong place.
+        assert!(Cli::try_parse_from(["wdyt", "say", "abc123", "notanumber", "hi"]).is_err());
+        assert!(Cli::try_parse_from(["wdyt", "say", "abc123", "4"]).is_err());
     }
 }

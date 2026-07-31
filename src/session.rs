@@ -289,6 +289,56 @@ impl Anchor {
     }
 }
 
+/// The most messages one thread will hold.
+///
+/// A discussion this long has stopped being a comment on a line, and the cap
+/// keeps a runaway agent from growing a session without bound.
+const MAX_THREAD_MESSAGES: usize = 100;
+
+/// Who said something in a thread.
+///
+/// Decided by the route it arrived on, never by the request body: the page posts
+/// to `/s/…` and an agent to `/api/sessions/…`, so a page cannot claim to be the
+/// agent whose answers the reader is trusting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Author {
+    /// The person reviewing.
+    User,
+    /// The agent that made the session.
+    Agent,
+}
+
+impl Author {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+/// One thing said in the discussion under a comment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    /// Assigned by the store, monotonic within the thread.
+    pub id: u64,
+    pub from: Author,
+    pub text: String,
+    #[serde(with = "unix_seconds")]
+    pub at: SystemTime,
+    /// When an agent process took this message, for the reader's receipt.
+    ///
+    /// Only ever set on a message from the user: it is the answer to "has anything
+    /// picked up my question", and the agent's own messages need no such record.
+    #[serde(
+        default,
+        with = "unix_seconds_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub delivered_at: Option<SystemTime>,
+}
+
 /// A comment on one line of a diff.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Comment {
@@ -320,6 +370,36 @@ pub struct Comment {
     pub text: String,
     #[serde(with = "unix_seconds")]
     pub at: SystemTime,
+    /// The discussion under this comment, oldest first.
+    ///
+    /// The comment's own `text` is the first thing said and is not repeated here;
+    /// a comment with no replies is a question nobody has answered yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replies: Vec<Message>,
+    /// When an agent process took the comment itself, as `Message::delivered_at`
+    /// records for the rest of the thread.
+    #[serde(
+        default,
+        with = "unix_seconds_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub delivered_at: Option<SystemTime>,
+}
+
+impl Comment {
+    /// The last thing said in the thread, and by whom.
+    pub fn last(&self) -> (Author, &str) {
+        match self.replies.last() {
+            Some(message) => (message.from, message.text.as_str()),
+            None => (Author::User, self.text.as_str()),
+        }
+    }
+
+    /// Whether the reader is waiting on an answer: the thread's last word is
+    /// theirs.
+    pub fn awaiting_agent(&self) -> bool {
+        self.last().0 == Author::User
+    }
 }
 
 /// Everything needed to create a session.
@@ -420,6 +500,10 @@ struct StoreInner {
     sessions: HashMap<String, Session>,
     /// Waiters belong to this daemon process and are deliberately not persisted.
     waiters: HashMap<String, Vec<oneshot::Sender<Reply>>>,
+    /// Agents blocked on the next question in a session's threads. Separate from
+    /// `waiters` because a reply ends the wait for good while a discussion goes
+    /// on: these are woken repeatedly, once per thing the reader says.
+    watchers: HashMap<String, Vec<oneshot::Sender<()>>>,
 }
 
 #[derive(Deserialize)]
@@ -448,6 +532,7 @@ impl Store {
             inner: Arc::new(Mutex::new(StoreInner {
                 sessions: HashMap::new(),
                 waiters: HashMap::new(),
+                watchers: HashMap::new(),
             })),
             counter: Arc::new(AtomicU64::new(0)),
             ttl,
@@ -483,6 +568,7 @@ impl Store {
             inner: Arc::new(Mutex::new(StoreInner {
                 sessions,
                 waiters: HashMap::new(),
+                watchers: HashMap::new(),
             })),
             counter: Arc::new(AtomicU64::new(0)),
             ttl,
@@ -654,7 +740,7 @@ impl Store {
             end_line,
             side,
         } = anchor;
-        self.mutate(|sessions| {
+        let made = self.mutate(|sessions| {
             let session = sessions.get_mut(id).ok_or(UnknownSession)?;
             // Ids are per session and monotonic, so a page can address the comment
             // it just made without a round trip for a name.
@@ -671,10 +757,132 @@ impl Store {
                 snippet,
                 text,
                 at: SystemTime::now(),
+                replies: Vec::new(),
+                delivered_at: None,
             };
             session.comments.push(comment.clone());
             Ok(comment)
+        });
+        // A new comment is a new question, and an agent watching the session is
+        // waiting for exactly that.
+        if made.is_ok() {
+            self.wake_watchers(id);
+        }
+        made
+    }
+
+    /// Adds a message to the discussion under a comment.
+    ///
+    /// The author comes from the caller — the route the message arrived on — not
+    /// from anything in the message itself.
+    pub fn message(
+        &self,
+        id: &str,
+        comment_id: u64,
+        from: Author,
+        text: String,
+    ) -> Result<Message, StoreError> {
+        let message = self.mutate(|sessions| {
+            let session = sessions.get_mut(id).ok_or(UnknownSession)?;
+            let comment = session
+                .comments
+                .iter_mut()
+                .find(|comment| comment.id == comment_id)
+                .ok_or(UnknownSession)?;
+            if comment.replies.len() >= MAX_THREAD_MESSAGES {
+                return Err(UnknownSession);
+            }
+            let next = comment.replies.last().map_or(1, |last| last.id + 1);
+            let message = Message {
+                id: next,
+                from,
+                text,
+                at: SystemTime::now(),
+                delivered_at: None,
+            };
+            comment.replies.push(message.clone());
+            Ok(message)
+        })?;
+        // Only the reader's own words are something an agent is waiting for.
+        if from == Author::User {
+            self.wake_watchers(id);
+        }
+        Ok(message)
+    }
+
+    /// The oldest thing the reader has said that no agent has taken yet, stamped
+    /// as taken.
+    ///
+    /// The comment's own text counts as the first message in its thread, so a
+    /// comment nobody has answered is what this returns first. Stamping here is
+    /// the same discipline as `mark_delivered`: the bytes are going out now, and
+    /// the page can say so — while what the agent *said* about it is the reply it
+    /// posts back, which is the only thing that turns the thread green.
+    pub fn take_question(&self, id: &str) -> Result<Option<(Comment, Message)>, StoreError> {
+        self.mutate(|sessions| {
+            let session = sessions.get_mut(id).ok_or(UnknownSession)?;
+            let now = SystemTime::now();
+            for comment in &mut session.comments {
+                if comment.delivered_at.is_none() {
+                    comment.delivered_at = Some(now);
+                    // The head of the thread, presented as its first message so a
+                    // caller has one shape to handle.
+                    let head = Message {
+                        id: 0,
+                        from: Author::User,
+                        text: comment.text.clone(),
+                        at: comment.at,
+                        delivered_at: Some(now),
+                    };
+                    return Ok(Some((comment.clone(), head)));
+                }
+                if let Some(message) = comment
+                    .replies
+                    .iter_mut()
+                    .find(|m| m.from == Author::User && m.delivered_at.is_none())
+                {
+                    message.delivered_at = Some(now);
+                    let taken = message.clone();
+                    return Ok(Some((comment.clone(), taken)));
+                }
+            }
+            Ok(None)
         })
+    }
+
+    /// Whether the reader is waiting on an answer anywhere in this session.
+    fn has_question(session: &Session) -> bool {
+        session.comments.iter().any(|comment| {
+            comment.delivered_at.is_none()
+                || comment
+                    .replies
+                    .iter()
+                    .any(|m| m.from == Author::User && m.delivered_at.is_none())
+        })
+    }
+
+    /// Registers interest in the next thing the reader says.
+    ///
+    /// Resolves immediately when something is already waiting, so an agent that
+    /// starts watching after the question was asked does not hang.
+    pub fn watch(&self, id: &str) -> Result<oneshot::Receiver<()>, UnknownSession> {
+        let (tx, rx) = oneshot::channel();
+        let mut inner = self.lock();
+        let session = inner.sessions.get(id).ok_or(UnknownSession)?;
+        if Self::has_question(session) {
+            let _ = tx.send(());
+        } else {
+            inner.watchers.entry(id.to_owned()).or_default().push(tx);
+        }
+        Ok(rx)
+    }
+
+    fn wake_watchers(&self, id: &str) {
+        let watchers = self.lock().watchers.remove(id).unwrap_or_default();
+        for watcher in watchers {
+            // A dropped receiver just means that `watch` gave up.
+            let _ = watcher.send(());
+        }
     }
 
     /// Every session that has a reply, newest first.
@@ -782,8 +990,14 @@ impl Store {
             change(&mut inner.sessions)?
         };
 
-        let StoreInner { sessions, waiters } = &mut *inner;
+        let StoreInner {
+            sessions,
+            waiters,
+            watchers,
+        } = &mut *inner;
+        // A session that has gone takes its waiters and watchers with it.
         waiters.retain(|id, _| sessions.contains_key(id));
+        watchers.retain(|id, _| sessions.contains_key(id));
         Ok(output)
     }
 
@@ -1009,6 +1223,170 @@ mod tests {
             port: 3005,
             path: "/".to_owned(),
         }
+    }
+
+    /// A session with one comment on a line, which is a question nobody has
+    /// answered yet.
+    fn asked() -> (Store, String, u64) {
+        let store = Store::new(None);
+        let id = store.insert("t".into(), None, demo());
+        let comment = store
+            .comment(
+                &id,
+                Anchor::line("a.rs".into(), 3, Side::New),
+                "let x = y.clone();".into(),
+                "why is this a clone?".into(),
+            )
+            .unwrap();
+        (store, id, comment.id)
+    }
+
+    /// A comment is the first message in its thread: an agent asking for the next
+    /// question gets the comment itself, once, and then nothing.
+    #[test]
+    fn a_comment_is_a_question_until_an_agent_takes_it() {
+        let (store, id, thread) = asked();
+        let (comment, message) = store.take_question(&id).unwrap().expect("a question");
+        assert_eq!(comment.id, thread);
+        assert_eq!(message.text, "why is this a clone?");
+        // Id 0 marks the comment's own text rather than a reply to it.
+        assert_eq!(message.id, 0);
+        assert_eq!(message.from, Author::User);
+        assert!(message.delivered_at.is_some(), "taking it is delivery");
+        // Taken once: a second agent process must not answer the same question.
+        assert!(store.take_question(&id).unwrap().is_none());
+    }
+
+    /// The agent's answer is not something the agent is waiting for; the reader's
+    /// follow-up is.
+    #[test]
+    fn only_the_readers_words_are_questions() {
+        let (store, id, thread) = asked();
+        store.take_question(&id).unwrap().expect("the comment");
+
+        store
+            .message(&id, thread, Author::Agent, "because it is cheap".into())
+            .unwrap();
+        assert!(
+            store.take_question(&id).unwrap().is_none(),
+            "an agent's own answer came back as a question"
+        );
+
+        store
+            .message(&id, thread, Author::User, "fair enough".into())
+            .unwrap();
+        let (_, taken) = store.take_question(&id).unwrap().expect("the follow-up");
+        assert_eq!(taken.text, "fair enough");
+        assert!(taken.id > 0, "a follow-up is not the comment itself");
+        assert!(store.take_question(&id).unwrap().is_none());
+    }
+
+    /// Who has the last word says who is waiting on whom, which is what the
+    /// page's receipt shows.
+    #[test]
+    fn the_last_word_says_who_is_waiting() {
+        let (store, id, thread) = asked();
+        let waiting = &store.comments(&id).unwrap()[0];
+        assert!(waiting.awaiting_agent());
+        assert_eq!(waiting.last(), (Author::User, "why is this a clone?"));
+
+        store
+            .message(&id, thread, Author::Agent, "because it is cheap".into())
+            .unwrap();
+        let answered = &store.comments(&id).unwrap()[0];
+        assert!(!answered.awaiting_agent());
+        assert_eq!(answered.last(), (Author::Agent, "because it is cheap"));
+    }
+
+    /// An agent that starts watching after the question was asked must not hang:
+    /// the question is already there to be had.
+    #[tokio::test]
+    async fn watching_resolves_for_a_question_already_asked() {
+        let (store, id, _) = asked();
+        store
+            .watch(&id)
+            .unwrap()
+            .await
+            .expect("resolved without waiting");
+    }
+
+    /// And one that starts first is woken by the comment.
+    #[tokio::test]
+    async fn watching_is_woken_by_a_new_comment() {
+        let store = Store::new(None);
+        let id = store.insert("t".into(), None, demo());
+        let watching = store.watch(&id).unwrap();
+
+        let writer = store.clone();
+        let session = id.clone();
+        tokio::spawn(async move {
+            writer
+                .comment(
+                    &session,
+                    Anchor::line("a.rs".into(), 1, Side::New),
+                    "x".into(),
+                    "and this?".into(),
+                )
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), watching)
+            .await
+            .expect("woken within five seconds")
+            .expect("sender not dropped");
+    }
+
+    /// A follow-up wakes a watcher too: a discussion is not one question.
+    #[tokio::test]
+    async fn watching_is_woken_again_by_a_follow_up() {
+        let (store, id, thread) = asked();
+        store.take_question(&id).unwrap().expect("the comment");
+
+        let watching = store.watch(&id).unwrap();
+        let writer = store.clone();
+        let session = id.clone();
+        tokio::spawn(async move {
+            writer
+                .message(&session, thread, Author::User, "one more thing".into())
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), watching)
+            .await
+            .expect("woken within five seconds")
+            .expect("sender not dropped");
+    }
+
+    #[test]
+    fn a_thread_cannot_grow_without_bound() {
+        let (store, id, thread) = asked();
+        for n in 0..MAX_THREAD_MESSAGES {
+            store
+                .message(&id, thread, Author::Agent, format!("{n}"))
+                .expect("within the cap");
+        }
+        assert!(
+            store
+                .message(&id, thread, Author::Agent, "one too many".into())
+                .is_err()
+        );
+        assert_eq!(
+            store.comments(&id).unwrap()[0].replies.len(),
+            MAX_THREAD_MESSAGES
+        );
+    }
+
+    #[test]
+    fn a_message_needs_a_thread_that_exists() {
+        let (store, id, _) = asked();
+        assert!(
+            store
+                .message(&id, 99, Author::Agent, "hello?".into())
+                .is_err()
+        );
+        assert!(
+            store
+                .message("nope", 1, Author::Agent, "hello?".into())
+                .is_err()
+        );
     }
 
     #[test]
