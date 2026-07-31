@@ -101,6 +101,15 @@ pub struct DiffFile {
     pub removed: usize,
     /// Language, for display only.
     pub language: String,
+    /// The new-side file in full, one entry per line without the newline.
+    ///
+    /// A unified diff carries only the lines inside its hunks; the context
+    /// between them is what the reader wants next and what the patch does not
+    /// contain. This is the file the CLI found in the working tree, kept only
+    /// when it agreed with every line the diff already shows — so a session
+    /// whose patch describes some other revision simply has nothing to expand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source: Vec<String>,
 }
 
 /// A `@@` hunk.
@@ -109,6 +118,17 @@ pub struct Hunk {
     /// The `@@ … @@` line, including any trailing section heading.
     pub header: String,
     pub lines: Vec<DiffLine>,
+    /// The old-side line the header declares the hunk starts at.
+    #[serde(default)]
+    pub old_start: usize,
+    /// The new-side line the header declares the hunk starts at.
+    ///
+    /// Needed on its own because a hunk that only removes lines has no new-side
+    /// numbers at all, and its position is then only knowable from the header:
+    /// `@@ -6,3 +5,0 @@` deletes old 6-8 from after new line 5. Without it the
+    /// hidden lines around such a hunk cannot be told apart.
+    #[serde(default)]
+    pub new_start: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

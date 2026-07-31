@@ -3784,3 +3784,145 @@ fn js_parser_has_same_bounds_as_rust_parser() {
         "JS parser missing empty path rejection"
     );
 }
+
+// --- Expanding the context a patch leaves out -------------------------------
+
+/// A patch over a ten-line file, with the file attached so its hidden lines can
+/// be served. The patch touches line 5 only, so lines 1-3 and 7-10 are hidden.
+fn expandable_diff_session(daemon: &Daemon) -> String {
+    const PATCH: &str = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -4,3 +4,3 @@
+ four
+-five
++FIVE
+ six
+";
+    let mut files = wdyt::diff::parse(PATCH, theme("Nord")).unwrap();
+    let source: Vec<String> = (1..=10)
+        .map(|n| match n {
+            4 => "four".to_owned(),
+            5 => "FIVE".to_owned(),
+            6 => "six".to_owned(),
+            other => format!("line {other}"),
+        })
+        .collect();
+    assert!(
+        wdyt::diff::attach_source(&mut files[0], source),
+        "the file must agree with the patch"
+    );
+    daemon.insert(Content::Diff { files })
+}
+
+#[tokio::test]
+async fn hidden_context_is_served_with_both_line_numbers() {
+    let daemon = Daemon::start().await;
+    let id = expandable_diff_session(&daemon);
+
+    let (status, body) = daemon
+        .get(&format!("/s/{id}/context?file=0&from=1&to=3"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["file"], "src/lib.rs");
+    let lines = json["lines"].as_array().expect("lines");
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["new"], 1);
+    // Nothing has shifted before the change, so the sides agree.
+    assert_eq!(lines[0]["old"], 1);
+    // Highlighted by the daemon, so the text arrives inside syntect's spans.
+    let html = lines[0]["html"].as_str().unwrap();
+    assert!(html.contains("line ") && html.contains(">1"), "{body}");
+}
+
+/// The page renders a band per hidden run, carrying the range it covers; the
+/// script paints the controls, so the row is where the two agree.
+#[tokio::test]
+async fn the_page_marks_each_hidden_run() {
+    let daemon = Daemon::start().await;
+    let id = expandable_diff_session(&daemon);
+    let (status, page) = daemon.get(&format!("/s/{id}")).await;
+    assert_eq!(status, 200);
+    assert!(
+        page.contains(r#"data-from="1" data-to="3" data-place="before""#),
+        "no leading band: {page}"
+    );
+    assert!(
+        page.contains(r#"data-from="7" data-to="10" data-place="after""#),
+        "no trailing band: {page}"
+    );
+    // The `@@` header row gives way to the band that replaces it.
+    assert!(!page.contains(r#"<tr class="hunk">"#), "{page}");
+}
+
+/// Without a captured file there is nothing to reveal, and the page must go back
+/// to showing the hunk header rather than an expander that cannot work.
+#[tokio::test]
+async fn a_diff_with_no_captured_file_has_no_bands() {
+    let daemon = Daemon::start().await;
+    let id = diff_session(&daemon);
+    let (_, page) = daemon.get(&format!("/s/{id}")).await;
+    assert!(!page.contains(r#"class="gap""#), "{page}");
+    assert!(page.contains(r#"<tr class="hunk">"#), "{page}");
+
+    let (status, body) = daemon
+        .get(&format!("/s/{id}/context?file=0&from=1&to=2"))
+        .await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn a_context_request_is_bounded() {
+    let daemon = Daemon::start().await;
+    let id = expandable_diff_session(&daemon);
+    let cases = [
+        ("file=0&from=0&to=2", "line 0 is not a line"),
+        ("file=0&from=5&to=2", "backwards range"),
+        ("file=0&from=1&to=9999", "past the end of the file"),
+        ("file=0&from=1&to=3000", "more than one request may ask for"),
+        ("file=7&from=1&to=2", "no such file"),
+        ("from=1&to=2", "no file"),
+        ("file=x&from=1&to=2", "file is not a number"),
+    ];
+    for (query, why) in cases {
+        let (status, body) = daemon.get(&format!("/s/{id}/context?{query}")).await;
+        assert_eq!(status, 400, "{why}: {query} gave {status} {body}");
+    }
+}
+
+/// A line the reader revealed is in no hunk, but it is in the file the session
+/// captured — and that file was only accepted because it agreed with the patch,
+/// so a comment on it can be quoted with the same confidence.
+#[tokio::test]
+async fn a_revealed_line_can_be_commented_on() {
+    let daemon = Daemon::start().await;
+    let id = expandable_diff_session(&daemon);
+
+    let (status, body) = daemon
+        .post_json(
+            &format!("/s/{id}/comments"),
+            serde_json::json!({
+                "file": "src/lib.rs",
+                "line": 9,
+                "side": "new",
+                "text": "why is this here?"
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let comment: serde_json::Value = serde_json::from_str(&body).unwrap();
+    // Quoted from the daemon's own copy of the file, not from the request.
+    assert_eq!(comment["snippet"], "line 9");
+
+    // Past the end of the file is still refused.
+    let (status, _) = daemon
+        .post_json(
+            &format!("/s/{id}/comments"),
+            serde_json::json!({
+                "file": "src/lib.rs", "line": 99, "side": "new", "text": "nope"
+            }),
+        )
+        .await;
+    assert_eq!(status, 400);
+}

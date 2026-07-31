@@ -411,6 +411,9 @@ async fn run() -> Result<()> {
             };
 
             let mut files = wdyt::diff::parse(&source, render::theme(show.theme(&config)?))?;
+            // The lines between the hunks are not in the patch. Read them from the
+            // tree while we are still standing in it, so the page can offer them.
+            wdyt::diff::capture_sources(&mut files);
             // A `git diff` lists files alphabetically, floating low-signal files
             // like Cargo.lock and .config/nextest.toml to the top. Order them by
             // review importance instead; the stable sort keeps patch order within

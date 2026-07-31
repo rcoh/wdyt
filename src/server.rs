@@ -22,6 +22,57 @@ struct State {
     colors: ThemeColors,
     /// The daemon's configured theme, used when a session names none.
     theme: String,
+    /// Whole diffed files, highlighted, for serving hidden context.
+    ///
+    /// A range cannot be highlighted on its own — syntect's state carries across
+    /// lines — so revealing twenty lines means highlighting the file they are in.
+    /// The page asks one range at a time, so the second click on the same file
+    /// would pay for it again.
+    highlighted: std::sync::Mutex<Vec<HighlightedFile>>,
+}
+
+/// One highlighted file, keyed by the session and index it came from.
+struct HighlightedFile {
+    session: String,
+    index: usize,
+    lines: std::sync::Arc<Vec<String>>,
+}
+
+/// How many highlighted files to keep. Reviewing walks through a diff rather than
+/// jumping around it, so a short window of recently expanded files is enough, and
+/// the memory is bounded by it rather than by the size of the diff.
+const HIGHLIGHT_CACHE: usize = 4;
+
+impl State {
+    /// The highlighted lines of one diffed file, from the cache or freshly made.
+    fn highlighted(
+        &self,
+        session: &str,
+        index: usize,
+        file: &crate::session::DiffFile,
+        theme_name: Option<&str>,
+    ) -> Result<std::sync::Arc<Vec<String>>> {
+        let mut cache = self.highlighted.lock().expect("not poisoned");
+        if let Some(hit) = cache
+            .iter()
+            .find(|entry| entry.session == session && entry.index == index)
+        {
+            return Ok(hit.lines.clone());
+        }
+        let theme = theme(theme_name.unwrap_or(&self.theme));
+        let lines = crate::diff::highlight_source(&file.label, &file.source, theme)
+            .map_err(internal_server_error)?;
+        let lines = std::sync::Arc::new(lines);
+        cache.push(HighlightedFile {
+            session: session.to_owned(),
+            index,
+            lines: lines.clone(),
+        });
+        if cache.len() > HIGHLIGHT_CACHE {
+            cache.remove(0);
+        }
+        Ok(lines)
+    }
 }
 
 #[path_param(error = not_found)]
@@ -34,6 +85,7 @@ fn router(store: Store, colors: ThemeColors, theme: String) -> Router {
             store,
             colors,
             theme,
+            highlighted: std::sync::Mutex::new(Vec::new()),
         })
         .page(session_page)
         .page(index_page)
@@ -46,6 +98,7 @@ fn router(store: Store, colors: ThemeColors, theme: String) -> Router {
         .route(status_route)
         .route(list_comments_route)
         .route(comment_route)
+        .route(context_route)
         .route(inbox_route)
         .route(collect_route)
         .route(ack_route)
@@ -284,6 +337,91 @@ struct CommentInput {
     text: String,
 }
 
+/// A run of lines from a diffed file that the patch itself does not show.
+#[derive(Serialize)]
+pub struct ContextLines {
+    /// The file's display label, so the page can address comments on these lines.
+    pub file: String,
+    pub lines: Vec<ContextLine>,
+}
+
+#[derive(Serialize)]
+pub struct ContextLine {
+    /// New-side line number.
+    pub new: usize,
+    /// Old-side number, absent when the diff shows no context line to take the
+    /// offset from — a file that was rewritten end to end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old: Option<usize>,
+    pub html: String,
+}
+
+/// The most lines one expansion may ask for.
+///
+/// A gap can be thousands of lines long, and revealing all of them inserts that
+/// many rows into the page in one go. The page asks for a bounded run and can ask
+/// again; the limit is here as well so a hand-made request cannot make the daemon
+/// highlight and serialise a whole large file at once.
+const MAX_CONTEXT_LINES: usize = 2000;
+
+/// Serves the lines between a diff's hunks, so the page can reveal them.
+///
+/// The file is named by its index in the session's diff rather than by its label:
+/// the index cannot be ambiguous between two files with the same label, and it
+/// needs no escaping in a query string.
+#[route(GET "/s/{session_id}/context")]
+async fn context_route(cx: &Cx) -> Result<Json<ContextLines>> {
+    let id = path_param::<SessionId>(cx)?;
+    let number = |name: &str| {
+        query_param(cx, name)
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| bad_request("from, to and file must be numbers"))
+    };
+    let index = number("file")?;
+    let from = number("from")?;
+    let to = number("to")?;
+    if from == 0 || to < from {
+        return Err(bad_request("from must be >= 1 and to must be >= from").into());
+    }
+    if to + 1 - from > MAX_CONTEXT_LINES {
+        return Err(bad_request("too many lines requested").into());
+    }
+
+    // The session is cloned out rather than highlighted under the store's lock:
+    // highlighting a file is real work and no other request should wait on it.
+    let (file, theme_name) = state(cx)
+        .store
+        .with(id, |session| match &session.content {
+            Content::Diff { files } => files
+                .get(index)
+                .filter(|file| !file.source.is_empty())
+                .map(|file| (file.clone(), session.theme.clone())),
+            _ => None,
+        })
+        .ok_or_else(not_found)?
+        .ok_or_else(|| bad_request("that file has no captured source"))?;
+    if to > file.source.len() {
+        return Err(bad_request("beyond the end of the file").into());
+    }
+
+    let highlighted = state(cx).highlighted(id, index, &file, theme_name.as_deref())?;
+    let offset = crate::diff::old_offset_at(&file, from);
+    let lines = (from..=to)
+        .map(|number| ContextLine {
+            new: number,
+            old: offset.and_then(|by| usize::try_from(number as i64 + by).ok()),
+            html: highlighted
+                .get(number - 1)
+                .cloned()
+                .unwrap_or_else(String::new),
+        })
+        .collect();
+    Ok(Json(ContextLines {
+        file: file.label,
+        lines,
+    }))
+}
+
 /// Adds a line comment.
 ///
 /// The quoted snippet is looked up from the session's own diff rather than taken
@@ -446,6 +584,19 @@ fn snippet_for(session: &Session, anchor: &Anchor) -> Option<String> {
         return None;
     };
     let (file, line, side) = (&anchor.file, anchor.line, anchor.side);
+
+    // A line the reader revealed is not in any hunk, but it is in the file the
+    // session captured — and that file was accepted only because it agreed with
+    // every line the diff shows, so quoting from it is as trustworthy as quoting
+    // from a hunk. Without this, commenting on context you just expanded would be
+    // refused as "no such line".
+    if side == Side::New
+        && let Some(captured) = files
+            .iter()
+            .find(|f| &f.label == file && !f.source.is_empty())
+    {
+        return snippet_from_lines_strict(&captured.source, anchor);
+    }
     let end_line = anchor.last();
     // Addressable line numbers on this side, paired with their text.
     let addressable: Vec<(usize, &str)> = files
@@ -887,19 +1038,26 @@ async fn session_page(cx: &Cx) -> Result {
             // hook the comment script binds to, shared with the code wrap, and the
             // session id travels with it so the script needs no inlined state.
             <div class="wrap" id="diff" data-comments="1" data-session=(id)>
-                for file in files {
-                    <section class="file" id=(anchor(&file.label))>
+                for block in crate::ui::diff_blocks(files) {
+                    <section class="file" id=(anchor(&block.file.label))>
                         <div class="filename">
-                            <span>(&file.label)</span>
+                            <span>(&block.file.label)</span>
                             <span class="meta">
-                                <span class="added">"+" (file.added)</span>
+                                <span class="added">"+" (block.file.added)</span>
                                 " "
-                                <span class="removed">"−" (file.removed)</span>
+                                <span class="removed">"−" (block.file.removed)</span>
                             </span>
                         </div>
                         <div class="codebox">
-                            for hunk in &file.hunks {
-                                diff_hunk(file: &file.label, hunk: hunk, comments: &comments)
+                            for at in &block.hunks {
+                                diff_hunk(
+                                    file: &block.file.label,
+                                    index: block.index,
+                                    hunk: at.hunk,
+                                    comments: &comments,
+                                    gap_before: at.before,
+                                    gap_after: at.after,
+                                )
                             }
                         </div>
                     </section>

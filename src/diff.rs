@@ -94,6 +94,8 @@ fn parse_file(lines: &[&str], theme: &Theme) -> Result<Option<DiffFile>> {
                 .with_context(|| format!("could not parse hunk header {line:?}"))?;
             hunks.push(RawHunk {
                 header: (*line).to_owned(),
+                old_first: old_start,
+                new_first: new_start,
                 old_next: old_start,
                 new_next: new_start,
                 lines: Vec::new(),
@@ -176,11 +178,18 @@ fn parse_file(lines: &[&str], theme: &Theme) -> Result<Option<DiffFile>> {
         added,
         removed,
         language: syntax.name.clone(),
+        // Filled in by `capture_sources`, which needs the working tree and so
+        // belongs to the CLI rather than to parsing.
+        source: Vec::new(),
     }))
 }
 
 struct RawHunk {
     header: String,
+    /// The starts the header declares, kept as the hunk's position even after
+    /// `old_next`/`new_next` have walked past them.
+    old_first: usize,
+    new_first: usize,
     old_next: usize,
     new_next: usize,
     lines: Vec<RawLine>,
@@ -191,6 +200,245 @@ struct RawLine {
     old: Option<usize>,
     new: Option<usize>,
     text: String,
+}
+
+/// The largest file kept for expansion. Beyond this the session state file grows
+/// faster than the context is worth: a diff of fifty large files would carry all
+/// fifty in full.
+const MAX_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Attaches each file's working-tree text, which is what makes a diff's hidden
+/// context expandable.
+///
+/// A unified diff quotes only the lines inside its hunks. Everything between them
+/// — the code the reader wants when a hunk stops making sense on its own — exists
+/// nowhere in the patch, and the CLI is the one process standing in the tree the
+/// patch came from, so it is the one that can go and read it.
+///
+/// The text is kept only when it agrees with every line the diff already shows.
+/// A patch describing another revision (`git diff HEAD~5 HEAD`, a `.patch` from
+/// elsewhere) is about a file that is not the one on disk, and offering the
+/// working copy's lines as that patch's context would be a quiet lie. On any
+/// disagreement the file is simply not expandable, which the page then does not
+/// offer.
+pub fn capture_sources(files: &mut [DiffFile]) {
+    // The toplevel is only asked for if some file is not where the label says,
+    // and then only once: `git diff` names paths from the repository root, so a
+    // patch made in a subdirectory needs it, and a patch that is not from git at
+    // all must not pay for it.
+    let mut toplevel = Toplevel::Unasked;
+    for file in files {
+        if let Some(lines) = read_source(&file.label, &mut toplevel) {
+            attach_source(file, lines);
+        }
+    }
+}
+
+/// Keeps a file's text as the diff's hidden context, if it is that file's text.
+///
+/// Returns whether it was kept, which is the answer to "can this be expanded".
+pub fn attach_source(file: &mut DiffFile, lines: Vec<String>) -> bool {
+    let agrees = agrees_with_hunks(file, &lines);
+    if agrees {
+        file.source = lines;
+    }
+    agrees
+}
+
+enum Toplevel {
+    Unasked,
+    Known(Option<std::path::PathBuf>),
+}
+
+impl Toplevel {
+    fn get(&mut self) -> Option<&std::path::Path> {
+        if let Self::Unasked = self {
+            let found = std::process::Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| {
+                    std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+                })
+                .filter(|path| path.is_dir());
+            *self = Self::Known(found);
+        }
+        match self {
+            Self::Known(path) => path.as_deref(),
+            Self::Unasked => None,
+        }
+    }
+}
+
+/// Reads a diffed file's lines, from the label as given or from the repository
+/// root the label is relative to.
+fn read_source(label: &str, toplevel: &mut Toplevel) -> Option<Vec<String>> {
+    // A path that climbs out of the tree, or an absolute one, is not something a
+    // diff of this repository should be naming; refuse rather than read it.
+    let relative = Path::new(label);
+    if relative.is_absolute() || relative.components().any(|c| c.as_os_str() == "..") {
+        return None;
+    }
+    let direct = relative.metadata().ok().filter(|m| m.is_file());
+    let (path, meta) = match direct {
+        Some(meta) => (relative.to_path_buf(), meta),
+        None => {
+            let root = toplevel.get()?.join(relative);
+            let meta = root.metadata().ok().filter(|m| m.is_file())?;
+            (root, meta)
+        }
+    };
+    if meta.len() > MAX_SOURCE_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some(text.lines().map(str::to_owned).collect())
+}
+
+/// Whether a file's text says the same thing the diff's own new-side lines do.
+///
+/// Every line the diff shows on the new side is checked, not a sample: the point
+/// is to be sure the surrounding lines are the ones this patch was made against,
+/// and a file that agrees at the edges of a hunk but not inside it is not that
+/// file. A diff with nothing on the new side (a pure deletion) is not expandable
+/// either, since nothing was verified.
+fn agrees_with_hunks(file: &DiffFile, lines: &[String]) -> bool {
+    let mut checked = 0usize;
+    for line in file.hunks.iter().flat_map(|hunk| &hunk.lines) {
+        let Some(number) = line.new else { continue };
+        let Some(actual) = number.checked_sub(1).and_then(|i| lines.get(i)) else {
+            return false;
+        };
+        if actual != &line.text {
+            return false;
+        }
+        checked += 1;
+    }
+    checked > 0
+}
+
+/// A run of new-side lines the diff does not show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gap {
+    /// First hidden line, 1-indexed, inclusive.
+    pub from: usize,
+    /// Last hidden line, inclusive.
+    pub to: usize,
+}
+
+impl Gap {
+    fn new(from: usize, to: usize) -> Option<Self> {
+        (from >= 1 && to >= from).then_some(Self { from, to })
+    }
+
+    /// How many lines are hidden. Not `len`: a `Gap` is a span rather than a
+    /// collection, and one always covers at least one line.
+    pub fn lines(&self) -> usize {
+        self.to + 1 - self.from
+    }
+}
+
+/// Where a file's hidden lines are: one run before each hunk, and one after the
+/// last.
+///
+/// `before[i]` is `None` when hunk `i` continues straight on from hunk `i - 1`,
+/// which is the common case in a diff with default context.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Gaps {
+    pub before: Vec<Option<Gap>>,
+    pub after: Option<Gap>,
+}
+
+/// Works out which new-side lines a file's hunks leave unshown.
+///
+/// Positions come from the line numbers the hunks actually carry, falling back to
+/// the header's declared start for a hunk that removes lines and shows none — that
+/// hunk still sits at a place in the new file, and the hidden runs on either side
+/// of it are different runs.
+pub fn gaps(file: &DiffFile) -> Gaps {
+    let total = file.source.len();
+    if total == 0 {
+        // Nothing was captured, so nothing can be revealed.
+        return Gaps {
+            before: vec![None; file.hunks.len()],
+            after: None,
+        };
+    }
+    let mut before = Vec::with_capacity(file.hunks.len());
+    // The last new-side line shown so far.
+    let mut shown_to = 0usize;
+    for hunk in &file.hunks {
+        let numbers: Vec<usize> = hunk.lines.iter().filter_map(|line| line.new).collect();
+        let (first, last) = match (numbers.iter().min(), numbers.iter().max()) {
+            (Some(&first), Some(&last)) => (first, last),
+            // A hunk that only removes lines: it shows nothing on the new side and
+            // sits after the line its header names.
+            _ => (hunk.new_start + 1, hunk.new_start),
+        };
+        before.push(Gap::new(shown_to + 1, first.saturating_sub(1)));
+        shown_to = shown_to.max(last);
+    }
+    Gaps {
+        before,
+        after: Gap::new(shown_to + 1, total),
+    }
+}
+
+/// The difference between old-side and new-side numbering at a new-side line.
+///
+/// An unchanged run shifts by a constant, so the offset is read off the nearest
+/// context line the diff does show: the last one at or before the line, or the
+/// first one after it for a line that precedes every hunk. `None` when the file
+/// has no context lines at all, in which case a revealed line has no old-side
+/// number to show.
+pub fn old_offset_at(file: &DiffFile, new_line: usize) -> Option<i64> {
+    let pairs = || {
+        file.hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .filter(|line| line.kind == LineKind::Context)
+            .filter_map(|line| Some((line.new?, line.old?)))
+    };
+    let offset = |(new, old): (usize, usize)| old as i64 - new as i64;
+    pairs()
+        .filter(|(new, _)| *new <= new_line)
+        .max_by_key(|(new, _)| *new)
+        .or_else(|| {
+            pairs()
+                .filter(|(new, _)| *new > new_line)
+                .min_by_key(|(new, _)| *new)
+        })
+        .map(offset)
+}
+
+/// Highlights a captured file and returns one HTML string per line.
+///
+/// The whole file is highlighted even when a few lines were asked for: syntect
+/// carries state across lines, so a range that begins inside a block comment or a
+/// multi-line string can only be coloured correctly by having read what came
+/// before it. This is the same reason each diff side is reassembled before being
+/// split back apart.
+pub fn highlight_source(label: &str, source: &[String], theme: &Theme) -> Result<Vec<String>> {
+    let syntaxes = crate::render::syntaxes();
+    let syntax = syntax_for(label, syntaxes);
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut out = Vec::with_capacity(source.len());
+    for line in source {
+        let with_newline = format!("{line}\n");
+        let regions = highlighter
+            .highlight_line(&with_newline, syntaxes)
+            .context("highlighting a file line failed")?;
+        out.push(
+            styled_line_to_highlighted_html(&regions, IncludeBackground::No)
+                .context("rendering a highlighted line failed")?
+                .trim_end_matches('\n')
+                .to_owned(),
+        );
+    }
+    Ok(out)
 }
 
 /// Highlights each hunk by reconstructing its two sides.
@@ -246,6 +494,8 @@ fn highlight_hunks(
         out.push(Hunk {
             header: hunk.header.clone(),
             lines,
+            old_start: hunk.old_first,
+            new_start: hunk.new_first,
         });
     }
     Ok(out)
@@ -479,6 +729,163 @@ index 1111111..2222222 100644
         assert_eq!(file.removed, 1);
         assert_eq!(file.language, "Rust");
         assert_eq!(file.hunks.len(), 1);
+    }
+
+    /// A two-hunk patch over a twelve-line file, with the file itself.
+    fn two_hunks() -> (DiffFile, Vec<String>) {
+        let patch = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,3 +3,3 @@
+ three
+-four
++FOUR
+ five
+@@ -9,3 +9,3 @@
+ nine
+-ten
++TEN
+ eleven
+";
+        let source: Vec<String> = [
+            "one", "two", "three", "FOUR", "five", "six", "seven", "eight", "nine", "TEN",
+            "eleven", "twelve",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        let mut file = parse(patch, theme("Nord")).unwrap().remove(0);
+        assert!(attach_source(&mut file, source.clone()), "should agree");
+        (file, source)
+    }
+
+    /// The lines a reader would want next are the ones the patch does not carry:
+    /// before the first hunk, between the hunks, and after the last.
+    #[test]
+    fn the_hidden_runs_are_the_ones_between_the_hunks() {
+        let (file, _) = two_hunks();
+        let gaps = gaps(&file);
+        assert_eq!(gaps.before.len(), 2);
+        // Lines 1-2, before the first hunk's context line 3.
+        assert_eq!(gaps.before[0], Some(Gap { from: 1, to: 2 }));
+        // Lines 6-8, between the hunks.
+        assert_eq!(gaps.before[1], Some(Gap { from: 6, to: 8 }));
+        assert_eq!(gaps.before[1].unwrap().lines(), 3);
+        // Line 12, after the last hunk.
+        assert_eq!(gaps.after, Some(Gap { from: 12, to: 12 }));
+    }
+
+    /// With no file to read from there is nothing to reveal, and the page must
+    /// not offer it: the `@@` headers stay as they were.
+    #[test]
+    fn without_a_captured_file_there_are_no_runs() {
+        let mut file = parse(SAMPLE, theme("Nord")).unwrap().remove(0);
+        file.source.clear();
+        let gaps = gaps(&file);
+        assert_eq!(gaps.before, vec![None]);
+        assert_eq!(gaps.after, None);
+    }
+
+    /// A patch about a different revision of the file must not be given the
+    /// working copy's lines as its context: they are not the same file, and the
+    /// reader would be shown something the diff was never made against.
+    #[test]
+    fn a_file_that_disagrees_with_the_patch_is_refused() {
+        let mut file = parse(SAMPLE, theme("Nord")).unwrap().remove(0);
+        let wrong: Vec<String> = ["fn main() {", "    let x = 99;", "    let y = 3;", "}"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert!(!attach_source(&mut file, wrong), "line 2 differs");
+        assert!(file.source.is_empty(), "nothing kept");
+
+        // Truncated: the hunk names lines the file does not have.
+        let short = vec!["fn main() {".to_owned()];
+        assert!(!attach_source(&mut file, short));
+
+        // And the file the patch was actually made against is kept.
+        let right: Vec<String> = ["fn main() {", "    let x = 2;", "    let y = 3;", "}"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert!(attach_source(&mut file, right.clone()));
+        assert_eq!(file.source, right);
+    }
+
+    /// A hunk that only removes lines has no new-side numbers of its own, so the
+    /// runs on either side of it can only be told apart by its header.
+    #[test]
+    fn a_deletion_only_hunk_still_has_a_place_in_the_new_file() {
+        // Old lines 6-7 removed from after new line 5, out of a ten-line result.
+        let patch = "\
+--- a/f.txt
++++ b/f.txt
+@@ -6,2 +5,0 @@
+-six
+-seven
+";
+        let mut file = parse(patch, theme("Nord")).unwrap().remove(0);
+        assert_eq!(file.hunks[0].new_start, 5);
+        // Nothing on the new side was shown, so nothing could be verified; the
+        // file is attached by hand to test the geometry.
+        file.source = (1..=10).map(|n| format!("line {n}")).collect();
+        let gaps = gaps(&file);
+        assert_eq!(gaps.before[0], Some(Gap { from: 1, to: 5 }));
+        assert_eq!(gaps.after, Some(Gap { from: 6, to: 10 }));
+    }
+
+    /// A revealed line needs an old-side number too, and an unchanged run shifts
+    /// by a constant that the diff's own context lines give away.
+    #[test]
+    fn old_side_numbers_follow_the_nearest_context_line() {
+        let (file, _) = two_hunks();
+        // Before and inside the first hunk nothing has shifted.
+        assert_eq!(old_offset_at(&file, 1), Some(0));
+        assert_eq!(old_offset_at(&file, 7), Some(0));
+        // A patch that adds a line shifts everything after it by one.
+        let patch = "\
+--- a/f.txt
++++ b/f.txt
+@@ -1,2 +1,3 @@
+ one
++inserted
+ two
+";
+        let mut file = parse(patch, theme("Nord")).unwrap().remove(0);
+        file.source = vec![
+            "one".to_owned(),
+            "inserted".to_owned(),
+            "two".to_owned(),
+            "three".to_owned(),
+        ];
+        // New line 4 is old line 3.
+        assert_eq!(old_offset_at(&file, 4), Some(-1));
+    }
+
+    /// Syntect carries state between lines, so a range cannot be highlighted on
+    /// its own: the file is highlighted and then sliced.
+    #[test]
+    fn a_captured_file_is_highlighted_line_for_line() {
+        let source: Vec<String> = vec![
+            "/* a comment".to_owned(),
+            "   still the comment */".to_owned(),
+            "let x = 1;".to_owned(),
+        ];
+        let html = highlight_source("a.rs", &source, theme("Nord")).unwrap();
+        assert_eq!(html.len(), 3);
+        // The second line is inside the comment opened on the first, and is
+        // coloured as comment rather than as code.
+        let comment_colour = html[0]
+            .split("color:")
+            .nth(1)
+            .map(|rest| rest[..7].to_owned())
+            .expect("first line is coloured");
+        assert!(
+            html[1].contains(&comment_colour),
+            "line 2 lost the comment state: {:?}",
+            html[1]
+        );
+        assert!(!html[2].contains(&comment_colour), "line 3 is code again");
     }
 
     #[test]

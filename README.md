@@ -196,6 +196,34 @@ taken from the request, so the page is never trusted to say what a line said. A
 context line is addressable only by its new-side number, so the same line cannot
 collect two independent comment threads.
 
+## Seeing what the patch left out
+
+A unified diff shows three lines around each change, which is fine until a hunk
+stops making sense on its own — and then you are opening the file in another
+window, which is where the review stops. So wdyt reads the files while it is
+still standing in the tree they came from, and the space between hunks becomes a
+band you can open:
+
+```
+↓ 20   ⋯ 93 lines   ↑ 20    fn parse_file(lines: &[&str], theme: &Theme)
+```
+
+`↓` takes twenty lines off the top of the run, `↑` twenty off the bottom, and the
+middle button takes the lot. What is left stays as a band between the two
+revealed sides; when nothing is left the band goes and the code reads
+continuously. The band replaces the `@@` header, keeping the section heading it
+carried — the ranges it also carried are what the gutter already shows.
+
+Revealed lines are ordinary context lines: numbered on both sides, highlighted by
+the same pass, and commentable. The snippet for a comment on one is quoted from
+the daemon's copy of the file, like any other.
+
+**A patch about another revision has nothing to expand.** The file is kept only
+if it agrees with every line the diff already shows, so `git diff HEAD~5 HEAD`,
+or a `.patch` from elsewhere, simply gets no bands rather than context from a
+file that is not the one it describes. Files above 4 MB are skipped, and one
+click reveals at most a thousand lines.
+
 ## Guided review
 
 Rather than dropping a diff on someone and hoping, the agent can write the tour:

@@ -4,6 +4,7 @@ use topcoat::Result;
 use topcoat::context::Cx;
 use topcoat::view::{NodeViewParts, PartsWriter, component, view};
 
+use crate::diff::Gap;
 use crate::render::ThemeColors;
 use crate::session::{Comment, Hunk, LineKind, Reply, Side};
 
@@ -310,6 +311,28 @@ table.src.diff tr.hunk td {{
   padding: 3px 14px; white-space: pre; user-select: none;
 }}
 table.src.diff .marker {{ user-select: none; opacity: .65; }}
+/* A run of lines the patch left out, and the way to get them. The row reads as a
+   seam rather than as code, because what matters about it is that something is
+   missing here. Its controls are painted by EXPAND_JS. */
+table.src.diff tr.gap td {{
+  background: var(--code-gutter); color: var(--code-muted);
+  padding: 3px 14px; white-space: pre; user-select: none;
+}}
+table.src.diff tr.gap .expanders {{ display: inline-flex; gap: 4px; align-items: center; }}
+table.src.diff tr.gap button {{
+  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--code-fg);
+  background: color-mix(in srgb, var(--code-fg) 8%, transparent);
+  border: 1px solid var(--code-border); border-radius: 5px;
+  padding: 3px 7px; cursor: pointer;
+}}
+table.src.diff tr.gap button:hover, table.src.diff tr.gap button:focus-visible {{
+  background: var(--accent); border-color: var(--accent); color: #fff;
+}}
+table.src.diff tr.gap button[disabled] {{ opacity: .5; cursor: default; }}
+/* The one part of the `@@` header worth keeping: which function the hunk is in. */
+table.src.diff tr.gap .section {{ margin-left: 10px; opacity: .75; }}
+table.src.diff tr.gap .msg {{ margin-left: 10px; color: #e08a7a; }}
 /* Comment affordances are shared by the diff and the plain-code listing: both
    carry `commentable`, so one set of rules drives the `+` button, the inline
    note box, and the range highlight in either mode. The diff-only tints above
@@ -1221,6 +1244,13 @@ pub(crate) const COMMENT_JS: &str = r#"
     return rows;
   }
 
+  // Revealed context brings `+` buttons the memo has never seen, so it must not
+  // outlive a reveal. Announced by EXPAND_JS rather than watched for, since a
+  // MutationObserver over a whole diff is a poor way to learn one fact.
+  root.addEventListener('wdyt:revealed', function () {
+    siblingCache = Object.create(null);
+  });
+
   // Highlight what a range would cover while the pointer is still down.
   function preview(from, to) {
     clearPreview();
@@ -1451,6 +1481,179 @@ pub(crate) const COMMENT_JS: &str = r#"
   }
 })();
 "#;
+
+/// Revealing the lines a patch leaves out.
+///
+/// A unified diff shows a few lines around each change and nothing in between,
+/// which is fine until a hunk stops making sense on its own — and then the reader
+/// has to go and open the file, which is the moment the review stops. The daemon
+/// has the whole file (see `DiffFile::source`), so the gap between two hunks can
+/// be asked for and dropped into the listing.
+///
+/// The band the server renders carries only the range it covers; its controls and
+/// counts are painted here so those labels have one implementation rather than
+/// one in Rust and one in JavaScript, and so a page without script shows no
+/// buttons that cannot work.
+pub(crate) const EXPAND_JS: &str = r##"
+(function () {
+  var root = document.querySelector('[data-comments]');
+  if (!root) return;
+  var session = root.getAttribute('data-session');
+  // About a screenful, and what a reviewer means by "a bit more"; the whole gap
+  // is one click away for when it is not.
+  var STEP = 20;
+  // A gap can be thousands of lines long. One click inserts at most this many
+  // rows, and the daemon caps the request as well.
+  var MAX_AT_ONCE = 1000;
+
+  function range(band) {
+    var from = parseInt(band.getAttribute('data-from'), 10);
+    var to = parseInt(band.getAttribute('data-to'), 10);
+    if (!Number.isFinite(from) || !Number.isFinite(to) || from < 1 || to < from) return null;
+    return { from: from, to: to, count: to - from + 1 };
+  }
+
+  function control(take, label, title) {
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'expand';
+    button.setAttribute('data-take', take);
+    button.textContent = label;
+    button.title = title;
+    return button;
+  }
+
+  function paint(band) {
+    var cell = band.querySelector('td.code');
+    if (!cell) return;
+    // The `@@` line's section heading, which the server put here and which
+    // outlives every reveal.
+    var section = cell.querySelector('.section');
+    cell.textContent = '';
+    var left = range(band);
+    if (!left) { if (section) cell.appendChild(section); return; }
+    var group = document.createElement('span');
+    group.className = 'expanders';
+    // At the end of a file there is nothing below the band, so growing upward
+    // from below it would leave the revealed lines stranded under a gap.
+    var trailing = band.getAttribute('data-place') === 'after';
+    if (left.count > STEP) {
+      group.appendChild(control('head', '\u2193 ' + STEP,
+        'Show ' + STEP + ' lines from line ' + left.from));
+    }
+    group.appendChild(control('all',
+      '\u22EF ' + left.count + (left.count === 1 ? ' line' : ' lines'),
+      'Show all the hidden lines, ' + left.from + ' to ' + left.to));
+    if (left.count > STEP && !trailing) {
+      group.appendChild(control('tail', '\u2191 ' + STEP,
+        'Show ' + STEP + ' lines up to line ' + left.to));
+    }
+    cell.appendChild(group);
+    if (section) cell.appendChild(section);
+  }
+
+  // A revealed line looks exactly like a context line the patch did include,
+  // because that is what it is: same columns, same comment affordance.
+  function contextRow(line, file) {
+    var row = document.createElement('tr');
+    row.className = 'ctx';
+    var old = document.createElement('td');
+    old.className = 'ln old';
+    if (line.old != null) old.textContent = line.old;
+    var current = document.createElement('td');
+    current.className = 'ln new';
+    current.textContent = line.new;
+    var code = document.createElement('td');
+    code.className = 'code';
+    var add = document.createElement('button');
+    add.type = 'button';
+    add.className = 'addnote';
+    add.title = 'Comment on this line, or drag to cover more';
+    add.setAttribute('data-file', file);
+    add.setAttribute('data-line', line.new);
+    add.setAttribute('data-side', 'new');
+    add.textContent = '+';
+    code.appendChild(add);
+    var marker = document.createElement('span');
+    marker.className = 'marker';
+    marker.textContent = ' ';
+    code.appendChild(marker);
+    var text = document.createElement('span');
+    // Highlighted by the daemon, from the same syntect pass the diff came from.
+    text.innerHTML = line.html;
+    code.appendChild(text);
+    row.appendChild(old);
+    row.appendChild(current);
+    row.appendChild(code);
+    return row;
+  }
+
+  function reveal(band, take) {
+    var left = range(band);
+    if (!left) return;
+    var from = left.from;
+    var to = left.to;
+    if (take === 'head') to = Math.min(to, from + STEP - 1);
+    else if (take === 'tail') from = Math.max(from, to - STEP + 1);
+    else to = Math.min(to, from + MAX_AT_ONCE - 1);
+
+    var buttons = band.querySelectorAll('button');
+    for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
+
+    // Every revealed row lands above this one, whichever end was taken, so it is
+    // the thing to keep still: inserting lines above the fold would otherwise
+    // carry off whatever the reader was looking at.
+    var anchor = band.nextElementSibling || band.previousElementSibling || band;
+    var wasAt = anchor.getBoundingClientRect().top;
+
+    fetch('/s/' + session + '/context?file=' + encodeURIComponent(band.getAttribute('data-index')) +
+          '&from=' + from + '&to=' + to)
+      .then(function (res) {
+        if (!res.ok) throw new Error('could not load those lines');
+        return res.json();
+      })
+      .then(function (data) {
+        var rows = document.createDocumentFragment();
+        for (var i = 0; i < data.lines.length; i++) {
+          rows.appendChild(contextRow(data.lines[i], data.file));
+        }
+        // The band stays inside what is still hidden: lines taken from the top go
+        // above it, lines taken from the bottom go below.
+        if (take === 'tail') {
+          band.parentNode.insertBefore(rows, band.nextSibling);
+          band.setAttribute('data-to', from - 1);
+        } else {
+          band.parentNode.insertBefore(rows, band);
+          band.setAttribute('data-from', to + 1);
+        }
+        if (range(band)) paint(band); else band.remove();
+        // The comment script memoises the `+` buttons a drag can run between, and
+        // there are new ones now.
+        root.dispatchEvent(new CustomEvent('wdyt:revealed'));
+        window.scrollBy(0, anchor.getBoundingClientRect().top - wasAt);
+      })
+      .catch(function (err) {
+        paint(band);
+        var cell = band.querySelector('td.code');
+        if (!cell) return;
+        var msg = document.createElement('span');
+        msg.className = 'msg';
+        msg.textContent = String(err.message || err);
+        cell.appendChild(msg);
+      });
+  }
+
+  root.addEventListener('click', function (e) {
+    var button = e.target.closest ? e.target.closest('.expand') : null;
+    if (!button) return;
+    var band = button.closest('tr.gap');
+    if (band) reveal(band, button.getAttribute('data-take'));
+  });
+
+  var bands = root.querySelectorAll('tr.gap');
+  for (var i = 0; i < bands.length; i++) paint(bands[i]);
+})();
+"##;
 
 /// Deep-link fragment handling.
 ///
@@ -2096,14 +2299,80 @@ pub(crate) const DOC_COMMENT_JS: &str = r##"
 })();
 "##;
 
+/// A file's hunks paired with the hidden runs around them.
+///
+/// Worked out before the view rather than inside it: the view needs each file's
+/// index (to address it in a context request) and each hunk's neighbours, and
+/// `view!`'s `for` gives neither.
+pub(crate) struct FileBlock<'a> {
+    pub file: &'a crate::session::DiffFile,
+    pub index: usize,
+    pub hunks: Vec<HunkBlock<'a>>,
+}
+
+pub(crate) struct HunkBlock<'a> {
+    pub hunk: &'a Hunk,
+    /// The lines hidden between this hunk and the one before it.
+    pub before: Option<Gap>,
+    /// The lines hidden after this hunk, only ever set on a file's last one.
+    pub after: Option<Gap>,
+}
+
+pub(crate) fn diff_blocks(files: &[crate::session::DiffFile]) -> Vec<FileBlock<'_>> {
+    files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            let gaps = crate::diff::gaps(file);
+            let last = file.hunks.len().saturating_sub(1);
+            FileBlock {
+                file,
+                index,
+                hunks: file
+                    .hunks
+                    .iter()
+                    .enumerate()
+                    .map(|(at, hunk)| HunkBlock {
+                        hunk,
+                        before: gaps.before.get(at).copied().flatten(),
+                        after: (at == last).then_some(gaps.after).flatten(),
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
 /// One hunk of a diff, with a comment affordance on every line.
 ///
 /// The line number cells are buttons rather than links: clicking one opens an
 /// inline comment box anchored to that line. A line already commented on shows
 /// the comment underneath, in the flow of the diff, which is where it is
 /// actually useful when re-reading.
+///
+/// Where the patch skips lines, the `@@` header row is replaced by a band that
+/// reveals them (`EXPAND_JS`). The header's own text is not worth the row once
+/// there is something better to put there: it says which lines the hunk covers,
+/// which the gutter already shows, and the reason to look at that row is to get
+/// the code the patch left out. Its trailing section heading — the function the
+/// hunk is in — is kept, since nothing else says that.
 #[component]
-pub async fn diff_hunk(file: &str, hunk: &Hunk, comments: &[Comment]) -> Result {
+pub async fn diff_hunk(
+    file: &str,
+    index: usize,
+    hunk: &Hunk,
+    comments: &[Comment],
+    gap_before: Option<Gap>,
+    gap_after: Option<Gap>,
+) -> Result {
+    // The section heading a `@@` line can carry — `@@ -1,5 +1,7 @@ fn foo()` — is
+    // the one part of the header the gutter does not already say, so it survives
+    // when an expander takes the row.
+    let section = hunk
+        .header
+        .rsplit_once("@@")
+        .map(|(_, tail)| tail.trim().to_owned())
+        .filter(|tail| !tail.is_empty());
     // The anchor and its comments are worked out here rather than inside the
     // view: `view!` takes expressions, not `let` bindings with types.
     let rows: Vec<Row> = hunk
@@ -2145,10 +2414,31 @@ pub async fn diff_hunk(file: &str, hunk: &Hunk, comments: &[Comment]) -> Result 
     view! {
         <table class="src diff commentable">
             <tbody>
-                <tr class="hunk">
-                    <td class="ln" colspan="2"></td>
-                    <td class="code">(&hunk.header)</td>
-                </tr>
+                if let Some(gap) = gap_before {
+                    <tr
+                        class="gap"
+                        data-file=(file)
+                        data-index=(index)
+                        data-from=(gap.from)
+                        data-to=(gap.to)
+                        data-place="before"
+                    >
+                        <td class="ln" colspan="2"></td>
+                        // Painted by EXPAND_JS: the controls and the count have one
+                        // implementation, and a page with no script gets no dead buttons.
+                        <td class="code">
+                            if let Some(section) = &section {
+                                <span class="section">(section)</span>
+                            }
+                        </td>
+                    </tr>
+                }
+                if gap_before.is_none() {
+                    <tr class="hunk">
+                        <td class="ln" colspan="2"></td>
+                        <td class="code">(&hunk.header)</td>
+                    </tr>
+                }
                 for row in rows {
                     <tr class=(row_class(&row))>
                         <td class="ln old">
@@ -2204,6 +2494,20 @@ pub async fn diff_hunk(file: &str, hunk: &Hunk, comments: &[Comment]) -> Result 
                             </td>
                         </tr>
                     }
+                }
+                // The run after the last hunk, which is the rest of the file.
+                if let Some(gap) = gap_after {
+                    <tr
+                        class="gap"
+                        data-file=(file)
+                        data-index=(index)
+                        data-from=(gap.from)
+                        data-to=(gap.to)
+                        data-place="after"
+                    >
+                        <td class="ln" colspan="2"></td>
+                        <td class="code"></td>
+                    </tr>
                 }
             </tbody>
         </table>
@@ -2602,6 +2906,7 @@ pub async fn shell(
 
                 if commentable {
                     <script>(Raw(COMMENT_JS))</script>
+                    <script>(Raw(EXPAND_JS))</script>
                     <script>(Raw(DOC_COMMENT_JS))</script>
                     <script>(Raw(FRAGMENT_JS))</script>
                 }
@@ -2866,6 +3171,42 @@ mod tests {
         assert!(COMMENT_JS.contains("if (button === drag.to) return;"));
         assert!(COMMENT_JS.contains("siblingCache"));
         assert!(COMMENT_JS.contains("Object.create(null)"));
+    }
+
+    /// The lines a patch leaves out can be asked for.
+    ///
+    /// A diff shows a few lines around each change and nothing in between, and
+    /// when a hunk stops making sense on its own the reader otherwise has to go
+    /// and open the file — which is the moment the review stops.
+    #[test]
+    fn the_hidden_lines_can_be_revealed() {
+        // The band carries only the range; the script paints the labels, so there
+        // is one implementation of them rather than one per language.
+        assert!(EXPAND_JS.contains("function paint(band)"));
+        assert!(EXPAND_JS.contains("/context?file="));
+        // Lines from the top of the run go above the band, lines from the bottom
+        // below it, so what is still hidden stays between the two shown sides.
+        assert!(EXPAND_JS.contains("insertBefore(rows, band.nextSibling)"));
+        assert!(EXPAND_JS.contains("insertBefore(rows, band)"));
+        // One click cannot insert an unbounded number of rows.
+        assert!(EXPAND_JS.contains("MAX_AT_ONCE"));
+        // A revealed line is commentable like any other context line.
+        assert!(EXPAND_JS.contains("add.className = 'addnote'"));
+        // And the comment script is told, since its memo of those buttons is now
+        // out of date.
+        assert!(EXPAND_JS.contains("CustomEvent('wdyt:revealed')"));
+        assert!(COMMENT_JS.contains("addEventListener('wdyt:revealed'"));
+
+        let css = stylesheet(&theme_colors(theme("Nord")));
+        assert!(css.contains("table.src.diff tr.gap td"), "{css}");
+        assert!(css.contains("table.src.diff tr.gap button"), "{css}");
+    }
+
+    /// Nothing moves under the reader when lines appear above the fold.
+    #[test]
+    fn revealing_lines_keeps_the_page_still() {
+        assert!(EXPAND_JS.contains("getBoundingClientRect().top"));
+        assert!(EXPAND_JS.contains("window.scrollBy"));
     }
 
     #[test]
