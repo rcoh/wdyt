@@ -97,7 +97,8 @@ the daemon keeps holding the reply, so a turn hours later can still pick it up:
 ```sh
 wdyt inbox              # replies waiting, as JSON, newest first
 wdyt inbox --all        # including ones already collected
-wdyt collect <id>       # take one reply and its line comments
+wdyt collect <id>       # block until the reply lands, then take it + line comments
+wdyt collect <id> --no-wait   # take whatever is there right now, don't block
 ```
 
 This is what makes a reply sent a day after the agent stopped waiting still land.

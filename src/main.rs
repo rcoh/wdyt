@@ -40,7 +40,7 @@ WORKFLOW (for coding agents):
   3. stdout is machine-readable: first the session URL, then (if waiting) the
      reply as JSON. Pass --no-wait for fire-and-forget.
 
-  4. After a reply arrives (or later via inbox):
+  4. Collect the reply + line/block comments (blocks until one arrives):
        wdyt collect <id>   # returns reply + line/block comments as JSON
        wdyt ack <id> \"rerunning the build with your flag\"  # turns receipt green
 
@@ -153,7 +153,10 @@ enum Command {
         all: bool,
     },
 
-    /// Collect a reply that has already arrived, and any line comments.
+    /// Collect a session's reply and any line comments.
+    ///
+    /// Blocks until a reply arrives (forever unless `--timeout` is set); pass
+    /// `--no-wait` to return whatever is there right now instead.
     ///
     /// Returns JSON: {"replied": bool, "reply": {...}, "comments": [...]}
     /// Each comment has file, line, side, snippet, and text fields.
@@ -165,6 +168,13 @@ enum Command {
     Collect {
         /// Session id.
         id: String,
+        /// Return immediately even if no reply has arrived yet.
+        #[arg(long)]
+        no_wait: bool,
+        /// Give up after this many seconds (exit status 2 on timeout). Waits
+        /// forever if unset.
+        #[arg(long, conflicts_with = "no_wait")]
+        timeout: Option<u64>,
     },
 
     /// Tell the user you read their reply and what you are doing about it.
@@ -650,9 +660,25 @@ async fn run() -> Result<()> {
             Ok(())
         }
 
-        Command::Collect { id } => {
+        Command::Collect {
+            id,
+            no_wait,
+            timeout,
+        } => {
             let client = Client::new(&config);
-            let reply = client.collect(&id).await?;
+            // Waiting is the default: block on the reply so an agent has one
+            // command that sits open until the user acts. `--no-wait` keeps the
+            // old poll-and-return recovery behaviour. Either way, both the reply
+            // and the line comments come back.
+            let reply = if no_wait {
+                client.collect(&id).await?
+            } else {
+                match timeout {
+                    Some(seconds) => eprintln!("wdyt: waiting up to {seconds}s for a reply…"),
+                    None => eprintln!("wdyt: waiting for a reply…"),
+                }
+                client.wait(&id, timeout_duration(timeout)).await?
+            };
             let comments = client.comments(&id).await?;
             let out = serde_json::json!({
                 "replied": reply.is_some(),
@@ -1234,6 +1260,41 @@ mod tests {
             }
             _ => panic!("expected Wait"),
         }
+    }
+
+    #[test]
+    fn collect_waits_by_default() {
+        // A bare `collect` blocks: no --no-wait, no --timeout.
+        match Cli::parse_from(["wdyt", "collect", "abc123"]).command {
+            Command::Collect {
+                id,
+                no_wait,
+                timeout,
+            } => {
+                assert_eq!(id, "abc123");
+                assert!(!no_wait);
+                assert_eq!(timeout, None);
+            }
+            _ => panic!("expected Collect"),
+        }
+    }
+
+    #[test]
+    fn collect_no_wait_and_timeout_parse() {
+        match Cli::parse_from(["wdyt", "collect", "abc123", "--no-wait"]).command {
+            Command::Collect { no_wait, .. } => assert!(no_wait),
+            _ => panic!("expected Collect"),
+        }
+        match Cli::parse_from(["wdyt", "collect", "abc123", "--timeout", "5"]).command {
+            Command::Collect { timeout, .. } => assert_eq!(timeout, Some(5)),
+            _ => panic!("expected Collect"),
+        }
+    }
+
+    #[test]
+    fn collect_no_wait_and_timeout_conflict() {
+        let result = Cli::try_parse_from(["wdyt", "collect", "abc123", "--no-wait", "--timeout", "5"]);
+        assert!(result.is_err(), "--no-wait and --timeout should conflict");
     }
 
     /// The discussion commands, which are what an agent runs in a loop: wait for

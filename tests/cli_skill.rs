@@ -1024,10 +1024,12 @@ async fn collect_comments_only_does_not_suggest_ack() {
         )
         .unwrap();
 
+    // --no-wait: collect blocks for a reply by default, and this session has
+    // only comments, so poll for what is there right now instead.
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
-            .args(["collect", &id])
+            .args(["collect", &id, "--no-wait"])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
