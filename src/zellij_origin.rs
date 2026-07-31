@@ -36,7 +36,22 @@ impl Origin {
     /// Outside zellij this is just the working directory: the `ZELLIJ_SESSION_NAME`
     /// guard means a plain shell, tmux, or CI never shells out to a `zellij`
     /// binary that may not exist, and simply reports its cwd.
+    ///
+    /// Detected once per process. `zellij action list-panes --all` is a
+    /// plugin-served query and slow in proportion to the session — measured at
+    /// 3.0s on a 32-pane session — and the CLI asks for the origin twice, once
+    /// for the session record and once for the notification. Doing the query
+    /// twice made `wdyt code --no-wait` take 6.9s of which 6.0s was waiting on
+    /// zellij to say the same thing again. The context cannot change within one
+    /// invocation, so the answer is kept.
     pub fn detect() -> Self {
+        static CACHED: std::sync::OnceLock<Origin> = std::sync::OnceLock::new();
+        CACHED.get_or_init(Self::probe_now).clone()
+    }
+
+    /// The uncached read, for the one caller that populates the cache and for
+    /// tests that need to observe the probing itself.
+    fn probe_now() -> Self {
         let cwd = std::env::current_dir()
             .ok()
             .map(|path| path.display().to_string());
