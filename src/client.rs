@@ -10,6 +10,15 @@ use crate::server::{
 };
 use crate::session::{Comment, Message, Reply};
 
+/// The `timeout_secs` query string for a long-poll, or an empty string when no
+/// timeout is set. Leaving it off tells the daemon to wait indefinitely.
+fn timeout_query(timeout: Option<Duration>) -> String {
+    match timeout {
+        Some(timeout) => format!("timeout_secs={}", timeout.as_secs()),
+        None => String::new(),
+    }
+}
+
 pub struct Client {
     /// The port the daemon was last seen on. Cached because every call would
     /// otherwise rescan the range.
@@ -153,23 +162,26 @@ impl Client {
         Ok(created.id)
     }
 
-    /// Waits for a reply, up to `timeout`.
-    pub async fn wait(&self, id: &str, timeout: Duration) -> Result<Option<Reply>> {
+    /// Waits for a reply. With `timeout` set, gives up after it; without one,
+    /// waits forever.
+    pub async fn wait(&self, id: &str, timeout: Option<Duration>) -> Result<Option<Reply>> {
         #[derive(serde::Deserialize)]
         struct Response {
             reply: Option<Reply>,
         }
 
         let base = self.require_base().await?;
-        let response = self
-            .http
-            .get(format!(
-                "{base}/api/sessions/{id}/reply?timeout_secs={}",
-                timeout.as_secs()
-            ))
-            // Outlast the server's own long-poll window so the server, not the
-            // client, decides when the wait is over.
-            .timeout(timeout + Duration::from_secs(15))
+        let mut request = self.http.get(format!(
+            "{base}/api/sessions/{id}/reply?{}",
+            timeout_query(timeout)
+        ));
+        // Outlast the server's own long-poll window so the server, not the
+        // client, decides when the wait is over. With no timeout the request
+        // has none either, so it blocks until the reply lands.
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout + Duration::from_secs(15));
+        }
+        let response = request
             .send()
             .await
             .context("could not reach the wdyt daemon")?;
@@ -191,16 +203,18 @@ impl Client {
     /// be called again and again and returns the questions in the order they were
     /// asked. Taking a question marks it as picked up — the page says so — while
     /// what turns a thread green is the answer sent back.
-    pub async fn next_question(&self, id: &str, timeout: Duration) -> Result<NextQuestion> {
+    pub async fn next_question(&self, id: &str, timeout: Option<Duration>) -> Result<NextQuestion> {
         let base = self.require_base().await?;
-        let response = self
-            .http
-            .get(format!(
-                "{base}/api/sessions/{id}/threads/next?timeout_secs={}",
-                timeout.as_secs()
-            ))
-            // Outlast the daemon's own window, so it decides when time is up.
-            .timeout(timeout + Duration::from_secs(15))
+        let mut request = self.http.get(format!(
+            "{base}/api/sessions/{id}/threads/next?{}",
+            timeout_query(timeout)
+        ));
+        // Outlast the daemon's own window, so it decides when time is up. With
+        // no timeout the request has none either, so it blocks until a question.
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout + Duration::from_secs(15));
+        }
+        let response = request
             .send()
             .await
             .context("could not reach the wdyt daemon")?;

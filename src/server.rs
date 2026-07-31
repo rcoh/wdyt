@@ -199,23 +199,36 @@ pub struct AwaitedReply {
 
 /// Long-polls for a session's reply.
 ///
-/// `timeout_secs` bounds the wait so a caller cannot hang forever; the response
-/// says whether a reply actually arrived. Receiving it marks it *delivered* and
-/// nothing more: whether anything read it is for the agent to say by acking.
+/// Awaits a long-poll oneshot, bounding it by `timeout` seconds when set.
+///
+/// With no timeout it waits indefinitely — the caller (an agent) has asked to
+/// sit open until the reader acts. Returns `Some(value)` if the channel fired,
+/// `None` if it timed out or the sender was dropped.
+async fn wait_for<T>(
+    timeout: Option<u64>,
+    receiver: tokio::sync::oneshot::Receiver<T>,
+) -> Option<T> {
+    match timeout {
+        Some(seconds) => tokio::time::timeout(std::time::Duration::from_secs(seconds), receiver)
+            .await
+            .ok()
+            .and_then(|result| result.ok()),
+        None => receiver.await.ok(),
+    }
+}
+
+/// `timeout_secs` bounds the wait when supplied; without it the long-poll
+/// blocks until a reply lands. The response says whether a reply actually
+/// arrived. Receiving it marks it *delivered* and nothing more: whether
+/// anything read it is for the agent to say by acking.
 #[route(GET "/api/sessions/{session_id}/reply")]
 async fn await_reply_route(cx: &Cx) -> Result<Json<AwaitedReply>> {
     let id = path_param::<SessionId>(cx)?;
-    let seconds = query_param(cx, "timeout_secs")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(600);
+    let timeout = query_param(cx, "timeout_secs").and_then(|value| value.parse::<u64>().ok());
 
     let receiver = state(cx).store.subscribe(id).map_err(|_| not_found())?;
 
-    let arrived = tokio::time::timeout(std::time::Duration::from_secs(seconds), receiver)
-        .await
-        .ok()
-        .and_then(|result| result.ok())
-        .is_some();
+    let arrived = wait_for(timeout, receiver).await.is_some();
 
     // Stamped only once the bytes are actually going out: a peek that times out
     // has delivered nothing.
@@ -590,16 +603,10 @@ pub struct Threads {
 #[route(GET "/api/sessions/{session_id}/threads/next")]
 async fn next_question_route(cx: &Cx) -> Result<Json<NextQuestion>> {
     let id = path_param::<SessionId>(cx)?;
-    let seconds = query_param(cx, "timeout_secs")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(600);
+    let timeout = query_param(cx, "timeout_secs").and_then(|value| value.parse::<u64>().ok());
 
     let waiting = state(cx).store.watch(id).map_err(|_| not_found())?;
-    let woken = tokio::time::timeout(std::time::Duration::from_secs(seconds), waiting)
-        .await
-        .ok()
-        .and_then(|result| result.ok())
-        .is_some();
+    let woken = wait_for(timeout, waiting).await.is_some();
 
     // Even when woken, the question may have gone to another agent process that
     // was watching the same session: taking it is what settles who has it.

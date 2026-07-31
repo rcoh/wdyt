@@ -130,15 +130,17 @@ enum Command {
     /// Wait for a reply to a session and print it.
     /// Wait for a reply to a session and print it.
     ///
-    /// Blocks until the reply arrives or `--timeout` expires. Exit status 0 means
-    /// a reply was received; exit status 2 means timeout. The session stays open
+    /// Blocks until the reply arrives, or until `--timeout` expires if one is
+    /// set. Exit status 0 means a reply was received; exit status 2 means
+    /// timeout. Without `--timeout` it waits forever. The session stays open
     /// after a timeout — recover with `wdyt collect <id>` or check `wdyt inbox`.
     Wait {
         /// Session id, as printed when the session was created.
         id: String,
-        /// Give up after this many seconds (exit status 2 on timeout).
-        #[arg(long, default_value_t = 600)]
-        timeout: u64,
+        /// Give up after this many seconds (exit status 2 on timeout). Waits
+        /// forever if unset.
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 
     /// List replies the daemon is holding, including ones sent hours ago.
@@ -187,16 +189,18 @@ enum Command {
     /// Prints JSON: {"asked": true, "thread": {...}, "message": {...}}. The thread
     /// carries the file, line, quoted snippet and everything said so far, so the
     /// answer can be about the code rather than about the sentence. Exit status 2
-    /// means nothing was asked before `--timeout`.
+    /// means nothing was asked before `--timeout` (if one is set; otherwise it
+    /// waits forever).
     ///
     /// Taking a question marks it as picked up on the page; sending the answer is
     /// what tells the reader it was actually read.
     Watch {
         /// Session id, as printed when the session was created.
         id: String,
-        /// Give up after this many seconds (exit status 2 on timeout).
-        #[arg(long, default_value_t = 600)]
-        timeout: u64,
+        /// Give up after this many seconds (exit status 2 on timeout). Waits
+        /// forever if unset.
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 
     /// Answer one thread in a discussion.
@@ -291,12 +295,12 @@ struct ShowArgs {
     #[arg(long, hide = true, conflicts_with = "no_wait")]
     wait: bool,
 
-    /// Seconds to wait before giving up (exit status 2).
+    /// Seconds to wait before giving up (exit status 2). Waits forever if unset.
     ///
     /// The session stays open after a timeout — check later with `wdyt inbox`
     /// or `wdyt collect <id>`.
-    #[arg(long, default_value_t = 600, conflicts_with = "no_wait")]
-    timeout: u64,
+    #[arg(long, conflicts_with = "no_wait")]
+    timeout: Option<u64>,
 
     /// Print the link instead of sending a notification.
     #[arg(long)]
@@ -557,7 +561,7 @@ async fn run() -> Result<()> {
 
         Command::Wait { id, timeout } => {
             let client = Client::new(&config);
-            match client.wait(&id, Duration::from_secs(timeout)).await? {
+            match client.wait(&id, timeout_duration(timeout)).await? {
                 Some(reply) => {
                     println!("{}", serde_json::to_string_pretty(&reply)?);
                     eprintln!(
@@ -568,8 +572,9 @@ async fn run() -> Result<()> {
                 }
                 None => {
                     eprintln!(
-                        "wdyt: no reply within {timeout}s. The session stays open — \
-                         check later with `wdyt inbox`, or `wdyt collect {id}`."
+                        "wdyt: no reply within {}. The session stays open — \
+                         check later with `wdyt inbox`, or `wdyt collect {id}`.",
+                        timeout_label(timeout)
                     );
                     std::process::exit(2);
                 }
@@ -578,13 +583,12 @@ async fn run() -> Result<()> {
 
         Command::Watch { id, timeout } => {
             let client = Client::new(&config);
-            let next = client
-                .next_question(&id, Duration::from_secs(timeout))
-                .await?;
+            let next = client.next_question(&id, timeout_duration(timeout)).await?;
             if !next.asked {
                 eprintln!(
-                    "wdyt: nothing asked within {timeout}s. The session stays open — \
-                     watch again, or read the discussion with `wdyt threads {id}`."
+                    "wdyt: nothing asked within {}. The session stays open — \
+                     watch again, or read the discussion with `wdyt threads {id}`.",
+                    timeout_label(timeout)
                 );
                 std::process::exit(2);
             }
@@ -885,8 +889,11 @@ async fn show_content(
     }
 
     if do_wait {
-        eprintln!("wdyt: waiting up to {timeout}s for a reply…");
-        match client.wait(&id, Duration::from_secs(timeout)).await? {
+        match timeout {
+            Some(seconds) => eprintln!("wdyt: waiting up to {seconds}s for a reply…"),
+            None => eprintln!("wdyt: waiting for a reply…"),
+        }
+        match client.wait(&id, timeout_duration(timeout)).await? {
             Some(reply) => {
                 println!("{}", serde_json::to_string_pretty(&reply)?);
                 // Receiving it is not reading it, and the page says so until an
@@ -903,10 +910,11 @@ async fn show_content(
                 // the reply for as long as the session lives, so say where to
                 // find it rather than letting it look lost.
                 eprintln!(
-                    "wdyt: no reply within {timeout}s. The session stays open:\n  \
+                    "wdyt: no reply within {}. The session stays open:\n  \
                      wdyt collect {id}    # check for reply + comments later\n  \
                      wdyt watch {id}      # wait for a question on a line\n  \
                      wdyt inbox           # list all pending replies",
+                    timeout_label(timeout)
                 );
                 std::process::exit(2);
             }
@@ -920,6 +928,20 @@ async fn show_content(
         );
     }
     Ok(())
+}
+
+/// A CLI `--timeout` in seconds as a `Duration`, or `None` to wait forever.
+fn timeout_duration(timeout: Option<u64>) -> Option<Duration> {
+    timeout.map(Duration::from_secs)
+}
+
+/// How the wait is described in progress and give-up messages: a bounded number
+/// of seconds, or "forever" when no timeout is set.
+fn timeout_label(timeout: Option<u64>) -> String {
+    match timeout {
+        Some(seconds) => format!("{seconds}s"),
+        None => "forever".to_string(),
+    }
 }
 
 fn read_text(path: &Path) -> Result<String> {
@@ -1148,7 +1170,15 @@ mod tests {
     #[test]
     fn timeout_is_customisable() {
         let show = parse_show(&["wdyt", "code", "f.rs", "--timeout", "30"]);
-        assert_eq!(show.timeout, 30);
+        assert_eq!(show.timeout, Some(30));
+        assert!(show.should_wait());
+    }
+
+    #[test]
+    fn timeout_defaults_to_none_so_the_wait_sits_open() {
+        // No `--timeout` means wait forever, not the old 600s default.
+        let show = parse_show(&["wdyt", "code", "f.rs"]);
+        assert_eq!(show.timeout, None);
         assert!(show.should_wait());
     }
 
@@ -1200,7 +1230,7 @@ mod tests {
         match cli.command {
             Command::Wait { id, timeout } => {
                 assert_eq!(id, "abc123");
-                assert_eq!(timeout, 30);
+                assert_eq!(timeout, Some(30));
             }
             _ => panic!("expected Wait"),
         }
@@ -1213,7 +1243,7 @@ mod tests {
         match Cli::parse_from(["wdyt", "watch", "abc123", "--timeout", "45"]).command {
             Command::Watch { id, timeout } => {
                 assert_eq!(id, "abc123");
-                assert_eq!(timeout, 45);
+                assert_eq!(timeout, Some(45));
             }
             _ => panic!("expected Watch"),
         }

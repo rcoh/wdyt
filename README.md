@@ -76,8 +76,9 @@ wdyt code src/lib.rs --title "the new parser"
 # {"text": "rename the second arg and ship it", "at": 1785287644}
 ```
 
-Exit status is `2` if the wait times out (`--timeout`, default 600s), so a
-script can tell "no answer" from "answered". To send now and collect later:
+By default the wait sits open until a reply arrives. Pass `--timeout <secs>` to
+give up after a bound, in which case exit status is `2` on timeout so a script
+can tell "no answer" from "answered". To send now and collect later:
 
 ```sh
 wdyt docs PLAN.md --title "the plan" --no-wait
@@ -90,7 +91,7 @@ thing, and a second POST is refused. Anything that needs going back and forth
 happens on the lines instead: see [threaded
 discussions](#discussing-a-line-with-the-agent).
 
-**A reply outlives the wait.** If `--timeout` expires, the session stays open and
+**A reply outlives the wait.** If a `--timeout` expires, the session stays open and
 the daemon keeps holding the reply, so a turn hours later can still pick it up:
 
 ```sh
