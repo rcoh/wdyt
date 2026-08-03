@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::server::{
-    Comments, CreateSession, CreatedSession, Inbox, InboxItem, NextQuestion, Threads,
+    Comments, CreateSession, CreatedSession, Inbox, InboxItem, Received, Threads,
 };
 use crate::session::{Comment, Message, Reply};
 
@@ -197,20 +197,20 @@ impl Client {
         Ok(response.json::<Response>().await?.reply)
     }
 
-    /// Waits for the reader's next word in a discussion, up to `timeout`.
+    /// Subscribes to the reader's next event — a reply or a line comment alike.
     ///
-    /// A reply ends a session's wait for good; a discussion goes on, so this can
-    /// be called again and again and returns the questions in the order they were
-    /// asked. Taking a question marks it as picked up — the page says so — while
-    /// what turns a thread green is the answer sent back.
-    pub async fn next_question(&self, id: &str, timeout: Option<Duration>) -> Result<NextQuestion> {
+    /// This is the one long-poll an agent loops on: it blocks until the reader
+    /// does something the agent has not seen, takes it (marking it picked up, so
+    /// the page says so), and can be called again for the next one. What turns a
+    /// thread green is still the answer sent back, not the taking.
+    pub async fn recv(&self, id: &str, timeout: Option<Duration>) -> Result<Received> {
         let base = self.require_base().await?;
         let mut request = self.http.get(format!(
-            "{base}/api/sessions/{id}/threads/next?{}",
+            "{base}/api/sessions/{id}/recv?{}",
             timeout_query(timeout)
         ));
         // Outlast the daemon's own window, so it decides when time is up. With
-        // no timeout the request has none either, so it blocks until a question.
+        // no timeout the request has none either, so it blocks until an event.
         if let Some(timeout) = timeout {
             request = request.timeout(timeout + Duration::from_secs(15));
         }
@@ -226,7 +226,7 @@ impl Client {
             "daemon returned {}",
             response.status()
         );
-        Ok(response.json::<NextQuestion>().await?)
+        Ok(response.json::<Received>().await?)
     }
 
     /// Every thread in a session, with the whole exchange under each.

@@ -680,11 +680,32 @@ impl Store {
         if accepted {
             let waiters = self.lock().waiters.remove(id).unwrap_or_default();
             for waiter in waiters {
-                // A dropped receiver just means that `wait` gave up.
+                // A dropped receiver just means the reply-only wait gave up.
                 let _ = waiter.send(reply_to_send.clone());
             }
+            // A reply is also an event `recv` is subscribed to: wake anyone
+            // streaming the session's updates, not just a reply-only wait.
+            self.wake_watchers(id);
         }
         Ok(accepted)
+    }
+
+    /// Takes the session's reply if one is waiting undelivered, stamping it.
+    ///
+    /// Unlike [`Store::mark_delivered`], which re-returns an already-delivered
+    /// reply so a re-fetch works, this returns `Some` only the first time — the
+    /// take-once discipline `recv` needs so a reply surfaces in the stream once.
+    pub fn take_reply(&self, id: &str) -> Result<Option<Reply>, StoreError> {
+        self.mutate(|sessions| {
+            let session = sessions.get_mut(id).ok_or(UnknownSession)?;
+            match session.reply.as_mut() {
+                Some(reply) if reply.delivered_at.is_none() => {
+                    reply.delivered_at = Some(SystemTime::now());
+                    Ok(Some(reply.clone()))
+                }
+                _ => Ok(None),
+            }
+        })
     }
 
     /// Marks a session's reply as delivered to an agent process, returning it.
@@ -850,26 +871,37 @@ impl Store {
         })
     }
 
-    /// Whether the reader is waiting on an answer anywhere in this session.
-    fn has_question(session: &Session) -> bool {
-        session.comments.iter().any(|comment| {
-            comment.delivered_at.is_none()
-                || comment
-                    .replies
-                    .iter()
-                    .any(|m| m.from == Author::User && m.delivered_at.is_none())
-        })
+    /// Whether the reader has said anything undelivered in this session — an
+    /// uncollected reply, or a line comment/follow-up no agent has taken.
+    ///
+    /// This is the "is there anything for `recv` to return right now?" check, so
+    /// it spans both kinds of event, not just line questions.
+    fn has_pending_event(session: &Session) -> bool {
+        let undelivered_reply = session
+            .reply
+            .as_ref()
+            .is_some_and(|reply| reply.delivered_at.is_none());
+        undelivered_reply
+            || session.comments.iter().any(|comment| {
+                comment.delivered_at.is_none()
+                    || comment
+                        .replies
+                        .iter()
+                        .any(|m| m.from == Author::User && m.delivered_at.is_none())
+            })
     }
 
-    /// Registers interest in the next thing the reader says.
+    /// Registers interest in the next thing the reader does — a reply or a line
+    /// comment alike.
     ///
     /// Resolves immediately when something is already waiting, so an agent that
-    /// starts watching after the question was asked does not hang.
+    /// starts watching after the event does not hang. This is the one primitive
+    /// behind `recv`: the caller then takes whichever event is pending.
     pub fn watch(&self, id: &str) -> Result<oneshot::Receiver<()>, UnknownSession> {
         let (tx, rx) = oneshot::channel();
         let mut inner = self.lock();
         let session = inner.sessions.get(id).ok_or(UnknownSession)?;
-        if Self::has_question(session) {
+        if Self::has_pending_event(session) {
             let _ = tx.send(());
         } else {
             inner.watchers.entry(id.to_owned()).or_default().push(tx);
@@ -880,7 +912,7 @@ impl Store {
     fn wake_watchers(&self, id: &str) {
         let watchers = self.lock().watchers.remove(id).unwrap_or_default();
         for watcher in watchers {
-            // A dropped receiver just means that `watch` gave up.
+            // A dropped receiver just means the `recv` subscription gave up.
             let _ = watcher.send(());
         }
     }

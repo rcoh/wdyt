@@ -108,7 +108,7 @@ fn router(store: Store, colors: ThemeColors, theme: String) -> Router {
         .route(agent_message_route)
         .route(threads_route)
         .route(agent_threads_route)
-        .route(next_question_route)
+        .route(recv_route)
         .route(inbox_route)
         .route(collect_route)
         .route(ack_route)
@@ -599,49 +599,69 @@ pub struct Threads {
     pub threads: Vec<Comment>,
 }
 
-/// Blocks until the reader says something no agent has taken, and takes it.
-#[route(GET "/api/sessions/{session_id}/threads/next")]
-async fn next_question_route(cx: &Cx) -> Result<Json<NextQuestion>> {
+/// Blocks until the reader does anything the agent has not seen, and takes it.
+///
+/// This is the one subscribe an agent needs: it returns the next user event of
+/// either kind — the overall reply, or a line comment/follow-up — and can be
+/// called again for the one after. Line comments come first, oldest first; the
+/// reply, which is terminal, surfaces once the comments are drained.
+#[route(GET "/api/sessions/{session_id}/recv")]
+async fn recv_route(cx: &Cx) -> Result<Json<Received>> {
     let id = path_param::<SessionId>(cx)?;
     let timeout = query_param(cx, "timeout_secs").and_then(|value| value.parse::<u64>().ok());
 
     let waiting = state(cx).store.watch(id).map_err(|_| not_found())?;
     let woken = wait_for(timeout, waiting).await.is_some();
 
-    // Even when woken, the question may have gone to another agent process that
-    // was watching the same session: taking it is what settles who has it.
-    let taken = if woken {
-        state(cx).store.take_question(id).map_err(store_error)?
+    // Even when woken, the event may have gone to another agent process that was
+    // watching the same session: taking it is what settles who has it. Drain
+    // line comments before the reply so the discussion reads in order and the
+    // terminal verdict lands last.
+    let event = if woken {
+        match state(cx).store.take_question(id).map_err(store_error)? {
+            Some((thread, message)) => Some(UserEvent::Comment { thread, message }),
+            None => state(cx)
+                .store
+                .take_reply(id)
+                .map_err(store_error)?
+                .map(|reply| UserEvent::Reply { reply }),
+        }
     } else {
         None
     };
-    Ok(Json(match taken {
-        Some((thread, message)) => NextQuestion {
-            asked: true,
-            thread: Some(thread),
-            message: Some(message),
-        },
-        None => NextQuestion {
-            asked: false,
-            thread: None,
-            message: None,
-        },
+    Ok(Json(Received {
+        received: event.is_some(),
+        event,
     }))
 }
 
-/// What an agent gets when it asks for the next question.
+/// The next thing the reader did, as returned by `recv`.
 #[derive(Serialize, Deserialize)]
-pub struct NextQuestion {
-    /// Whether anything was waiting.
-    pub asked: bool,
-    /// The thread it belongs to, with the line it is about and the whole exchange
-    /// so far — the agent needs the context, not just the sentence.
+pub struct Received {
+    /// Whether anything arrived before the timeout.
+    pub received: bool,
+    /// The event itself, absent on timeout.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thread: Option<Comment>,
-    /// The message itself. `id` is 0 for a comment's own text, which is the first
-    /// thing said in its thread.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<Message>,
+    pub event: Option<UserEvent>,
+}
+
+/// Something the reader did that an agent subscribes to with `recv`.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum UserEvent {
+    /// The overall reply typed into the page's reply box — the verdict on the
+    /// whole session, and terminal: there is only ever one.
+    Reply {
+        reply: Reply,
+    },
+    /// A line comment or a follow-up on one, with its thread context: the line
+    /// it is about, the quoted code, and the exchange so far, since an answer is
+    /// about the code rather than about the sentence. The message `id` is 0 for
+    /// a comment's own text, which is the first thing said in its thread.
+    Comment {
+        thread: Comment,
+        message: Message,
+    },
 }
 
 /// The text of the lines a comment anchors to, if any exist.

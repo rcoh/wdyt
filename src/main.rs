@@ -127,14 +127,22 @@ enum Command {
         all: bool,
     },
 
-    /// Wait for a reply to a session and print it.
-    /// Wait for a reply to a session and print it.
+    /// Subscribe to a session and print the reader's next event.
     ///
-    /// Blocks until the reply arrives, or until `--timeout` expires if one is
-    /// set. Exit status 0 means a reply was received; exit status 2 means
-    /// timeout. Without `--timeout` it waits forever. The session stays open
-    /// after a timeout — recover with `wdyt collect <id>` or check `wdyt inbox`.
-    Wait {
+    /// The one command an agent loops on: it blocks until the reader does
+    /// something — types the overall reply, or leaves/answers a line comment —
+    /// and prints that one event as JSON. Call it again for the next one.
+    ///
+    /// Prints {"received": true, "event": {"kind": "reply", "reply": {...}}} for
+    /// the overall reply, or {"kind": "comment", "thread": {...}, "message":
+    /// {...}} for a line comment, whose thread carries the file, line, quoted
+    /// snippet and the exchange so far. Answer a comment with `wdyt say`, and
+    /// acknowledge the reply with `wdyt ack`.
+    ///
+    /// Blocks forever unless `--timeout` is set. Exit status 2 means nothing
+    /// arrived before the timeout; the session stays open for `wdyt recv` again
+    /// or `wdyt collect <id>`.
+    Recv {
         /// Session id, as printed when the session was created.
         id: String,
         /// Give up after this many seconds (exit status 2 on timeout). Waits
@@ -190,32 +198,9 @@ enum Command {
         note: Vec<String>,
     },
 
-    /// Wait for the reader's next word in a discussion, and print it.
-    ///
-    /// Where `wait` waits once for the session's reply, this is the conversation:
-    /// it returns each comment and follow-up as it is written, oldest first, and
-    /// can be called again for the next one. Answer with `wdyt say`.
-    ///
-    /// Prints JSON: {"asked": true, "thread": {...}, "message": {...}}. The thread
-    /// carries the file, line, quoted snippet and everything said so far, so the
-    /// answer can be about the code rather than about the sentence. Exit status 2
-    /// means nothing was asked before `--timeout` (if one is set; otherwise it
-    /// waits forever).
-    ///
-    /// Taking a question marks it as picked up on the page; sending the answer is
-    /// what tells the reader it was actually read.
-    Watch {
-        /// Session id, as printed when the session was created.
-        id: String,
-        /// Give up after this many seconds (exit status 2 on timeout). Waits
-        /// forever if unset.
-        #[arg(long)]
-        timeout: Option<u64>,
-    },
-
     /// Answer one thread in a discussion.
     ///
-    /// The thread number is the comment id, which `wdyt watch` and `wdyt threads`
+    /// The thread number is the comment id, which `wdyt recv` and `wdyt threads`
     /// both print. The answer appears under that line on the page, in the reader's
     /// own view of the diff.
     /// Example: wdyt say abc123 4 "renamed it; the old name was from the prototype"
@@ -569,53 +554,40 @@ async fn run() -> Result<()> {
             show_content(&config, title, show, Content::Demo { port, path }, details).await
         }
 
-        Command::Wait { id, timeout } => {
+        Command::Recv { id, timeout } => {
             let client = Client::new(&config);
-            match client.wait(&id, timeout_duration(timeout)).await? {
-                Some(reply) => {
-                    println!("{}", serde_json::to_string_pretty(&reply)?);
-                    eprintln!(
-                        "wdyt: reply received. Run `wdyt collect {id}` for line comments, then:\n  \
-                         wdyt ack {id} \"<what you are doing>\""
-                    );
-                    Ok(())
-                }
-                None => {
-                    eprintln!(
-                        "wdyt: no reply within {}. The session stays open — \
-                         check later with `wdyt inbox`, or `wdyt collect {id}`.",
-                        timeout_label(timeout)
-                    );
-                    std::process::exit(2);
-                }
-            }
-        }
-
-        Command::Watch { id, timeout } => {
-            let client = Client::new(&config);
-            let next = client.next_question(&id, timeout_duration(timeout)).await?;
-            if !next.asked {
+            let received = client.recv(&id, timeout_duration(timeout)).await?;
+            let Some(event) = received.event else {
                 eprintln!(
-                    "wdyt: nothing asked within {}. The session stays open — \
-                     watch again, or read the discussion with `wdyt threads {id}`.",
+                    "wdyt: nothing arrived within {}. The session stays open — \
+                     `wdyt recv {id}` again, or read the discussion with `wdyt threads {id}`.",
                     timeout_label(timeout)
                 );
                 std::process::exit(2);
-            }
-            println!("{}", serde_json::to_string_pretty(&next)?);
-            if let Some(thread) = &next.thread {
-                eprintln!(
-                    "wdyt: {} asked about {}:{}. Answer it with:\n  \
-                     wdyt say {id} {} \"<your answer>\"",
-                    if thread.replies.is_empty() {
-                        "a new comment"
-                    } else {
-                        "a follow-up"
-                    },
-                    thread.file,
-                    thread.line,
-                    thread.id,
-                );
+            };
+            println!("{}", serde_json::to_string_pretty(&event)?);
+            match event {
+                wdyt::server::UserEvent::Reply { .. } => {
+                    eprintln!(
+                        "wdyt: reply received — the verdict on the whole session. \
+                         Acknowledge it with:\n  \
+                         wdyt ack {id} \"<what you are doing>\""
+                    );
+                }
+                wdyt::server::UserEvent::Comment { thread, .. } => {
+                    eprintln!(
+                        "wdyt: {} on {}:{}. Answer it with:\n  \
+                         wdyt say {id} {} \"<your answer>\"",
+                        if thread.replies.is_empty() {
+                            "a new comment"
+                        } else {
+                            "a follow-up"
+                        },
+                        thread.file,
+                        thread.line,
+                        thread.id,
+                    );
+                }
             }
             Ok(())
         }
@@ -626,8 +598,8 @@ async fn run() -> Result<()> {
             let message = Client::new(&config).say(&id, thread, &text).await?;
             println!("{}", serde_json::to_string_pretty(&message)?);
             eprintln!(
-                "wdyt: answered thread {thread}. Wait for the next question with:\n  \
-                 wdyt watch {id}"
+                "wdyt: answered thread {thread}. Wait for the next event with:\n  \
+                 wdyt recv {id}"
             );
             Ok(())
         }
