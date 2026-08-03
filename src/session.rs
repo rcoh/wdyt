@@ -1208,7 +1208,7 @@ fn base36(mut value: u64) -> String {
 }
 
 /// Serializes a `SystemTime` as whole seconds since the epoch, so the JSON that
-/// `wdyt wait` prints is easy for an agent to read.
+/// `wdyt recv` prints is easy for an agent to read.
 mod unix_seconds {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

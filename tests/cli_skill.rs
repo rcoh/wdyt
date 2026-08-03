@@ -1064,7 +1064,7 @@ async fn collect_comments_only_does_not_suggest_ack() {
 }
 
 #[tokio::test]
-async fn standalone_wait_success_prints_collect_and_ack_guidance() {
+async fn standalone_recv_success_prints_collect_and_ack_guidance() {
     let daemon = TestDaemon::start().await;
     let id = daemon.insert_code_session();
     daemon.reply(&id, "approved");
@@ -1072,7 +1072,7 @@ async fn standalone_wait_success_prints_collect_and_ack_guidance() {
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
-            .args(["wait", &id, "--timeout", "5"])
+            .args(["recv", &id, "--timeout", "5"])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1085,14 +1085,14 @@ async fn standalone_wait_success_prints_collect_and_ack_guidance() {
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // Standalone wait success should print collect and ack guidance.
+    // Standalone recv success should print collect and ack guidance.
     assert!(
         stderr.contains("wdyt collect"),
-        "standalone wait success should mention collect: {stderr}"
+        "standalone recv success should mention collect: {stderr}"
     );
     assert!(
         stderr.contains("wdyt ack"),
-        "standalone wait success should mention ack: {stderr}"
+        "standalone recv success should mention ack: {stderr}"
     );
 }
 
@@ -1202,20 +1202,20 @@ async fn ordinary_non_colliding_code_session_preserves_anchors() {
 // ---------- Finding 9: Help/docs ----------
 
 #[tokio::test]
-async fn wait_help_mentions_exit_2_and_recovery() {
+async fn recv_help_mentions_exit_2_and_recovery() {
     let output = tokio::process::Command::new(wdyt_bin())
-        .args(["wait", "--help"])
+        .args(["recv", "--help"])
         .output()
         .await
         .expect("failed to run");
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(
         help.contains("exit status 2"),
-        "wait help should mention exit status 2: {help}"
+        "recv help should mention exit status 2: {help}"
     );
     assert!(
         help.contains("collect") || help.contains("inbox"),
-        "wait help should mention recovery via collect/inbox: {help}"
+        "recv help should mention recovery via collect/inbox: {help}"
     );
 }
 

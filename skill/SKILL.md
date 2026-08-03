@@ -77,21 +77,23 @@ A line comment is usually a question, not a remark. Once you have the reply,
 **stay in the discussion** until they stop asking:
 
 ```sh
-wdyt watch <id>                          # blocks until they say something
-# {"asked": true, "thread": {"id": 4, "file": "src/diff.rs", "line": 97,
+wdyt recv <id>                           # blocks until they say something
+# {"kind": "comment", "thread": {"id": 4, "file": "src/diff.rs", "line": 97,
 #   "snippet": "old_first: old_start,", "text": "why is this a clone?"},
 #  "message": {"id": 0, "from": "user", "text": "why is this a clone?"}}
 
 wdyt say <id> 4 "cheap here, and the borrow would leak into the API"
-wdyt watch <id>                          # and again, for the follow-up
+wdyt recv <id>                           # and again, for the follow-up
 ```
 
-Loop `watch` → `say` until `watch` exits 2 (nothing asked before `--timeout`).
+Loop `recv` → `say` until `recv` exits 2 (nothing arrived before `--timeout`).
+`recv` also delivers the overall reply, as `"kind": "reply"` — that one is
+terminal, so acknowledge it with `wdyt ack` rather than answering it.
 Your answer appears under that line on their page while they are still reading it.
 
-- The `thread` id is the comment id. It comes back from `watch`, from
+- The `thread` id is the comment id. It comes back from `recv`, from
   `wdyt threads <id>`, and from `wdyt collect <id>`.
-- `watch` takes each question once, so two of your processes cannot answer the
+- `recv` takes each question once, so two of your processes cannot answer the
   same one. `wdyt threads <id>` reads the whole discussion and takes nothing.
 - Answer with what you did, not just what you think: "renamed it, pushed" reads
   better than "good point".
@@ -111,7 +113,7 @@ one session.
   the daemon URL and live sessions. Just run another content command to add a
   session — they coexist.
 - **Never kill/restart the daemon to "reset" it.** Sessions are persisted and
-  restored with the same ids, so restart is not a reset. An active `wdyt wait`
+  restored with the same ids, so restart is not a reset. An active `wdyt recv`
   disconnects and must be rerun after the daemon returns.
 - **Don't spawn stray daemons.** Running `wdyt serve` from another checkout or
   worktree starts a *second* daemon on a *different* port, fragmenting sessions.

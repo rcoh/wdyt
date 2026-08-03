@@ -83,7 +83,7 @@ can tell "no answer" from "answered". To send now and collect later:
 ```sh
 wdyt docs PLAN.md --title "the plan" --no-wait
 # prints: http://localhost:3000/s/<id>
-wdyt wait "<id>" --timeout 900
+wdyt recv "<id>" --timeout 900
 ```
 
 One reply per session, deliberately — the reply is the verdict on the whole
@@ -249,25 +249,27 @@ answer it while the page is still open:
 The agent's side is a loop of two commands:
 
 ```sh
-wdyt watch <id>          # blocks until the reader says something, then prints it
-# {"asked": true,
+wdyt recv <id>           # blocks until the reader says something, then prints it
+# {"kind": "comment",
 #  "thread": {"id": 4, "file": "src/diff.rs", "line": 97,
 #             "snippet": "    old_first: old_start,", "text": "why is this a clone?"},
 #  "message": {"id": 0, "from": "user", "text": "why is this a clone?"}}
 
 wdyt say <id> 4 "cheap here, and the borrow would leak into the API"
-wdyt watch <id>          # again, for the follow-up
+wdyt recv <id>           # again, for the follow-up
 ```
 
-`watch` exits 2 when nothing was asked before `--timeout`, so the loop ends on
-its own. `wdyt threads <id>` prints every thread and everything said in it.
+`recv` returns either kind of event: `"kind": "comment"` for a line comment or
+follow-up, and `"kind": "reply"` for the overall verdict, which is terminal. It
+exits 2 when nothing arrived before `--timeout`, so the loop ends on its own.
+`wdyt threads <id>` prints every thread and everything said in it.
 
 The whole thread comes with the question — the file, the line, the quoted
 snippet, and the exchange so far — because an answer is about the code, not about
 the sentence.
 
 **Each question is taken once.** Two agent processes watching the same session
-cannot answer the same question, and `watch` never returns a question twice.
+cannot answer the same question, and `recv` never returns a question twice.
 Reading (`wdyt threads`, and the page's own polling) takes nothing, so watching
 for an answer never marks the reader's own question as picked up.
 
@@ -364,12 +366,12 @@ reconstructed patch.
 The daemon starts automatically on first use and persists live sessions to
 `$XDG_STATE_HOME/wdyt/sessions.json` (normally
 `~/.local/state/wdyt/sessions.json`). Restarting restores their content, replies,
-comments, discussions, and acknowledgement state — a `wdyt watch` has to be rerun
+comments, discussions, and acknowledgement state — a `wdyt recv` has to be rerun
 after a restart, but the questions it had not taken yet are still there. Sessions expire after `session_ttl_hours`
 (24 by default; set it to nothing to keep them indefinitely).
 
 The state file is an atomically replaced, versioned JSON snapshot. An active
-`wdyt wait` disconnects during a restart and must be rerun, but it reconnects to
+`wdyt recv` disconnects during a restart and must be rerun, but it reconnects to
 the restored session id. Set `WDYT_STATE_PATH` to use a different file, such as
 `WDYT_STATE_PATH=/tmp/wdyt-test/sessions.json` for an isolated test daemon.
 A sibling `.lock` file prevents two daemons from writing the same snapshot.

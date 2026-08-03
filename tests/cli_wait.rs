@@ -377,15 +377,15 @@ async fn timed_out_session_is_still_collectible() {
 }
 
 #[tokio::test]
-async fn standalone_wait_still_works() {
+async fn standalone_recv_still_works() {
     let daemon = TestDaemon::start().await;
     let id = daemon.insert_code_session();
 
-    // `wdyt wait <id> --timeout 1` with no reply should exit 2.
+    // `wdyt recv <id> --timeout 1` with no reply should exit 2.
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
-            .args(["wait", &id, "--timeout", "1"])
+            .args(["recv", &id, "--timeout", "1"])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -393,7 +393,7 @@ async fn standalone_wait_still_works() {
             .output(),
     )
     .await
-    .expect("standalone wait did not finish (10s)")
+    .expect("standalone recv did not finish (10s)")
     .expect("failed to run wdyt");
 
     assert_eq!(
@@ -409,7 +409,7 @@ async fn standalone_wait_still_works() {
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
-            .args(["wait", &id, "--timeout", "5"])
+            .args(["recv", &id, "--timeout", "5"])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -417,7 +417,7 @@ async fn standalone_wait_still_works() {
             .output(),
     )
     .await
-    .expect("standalone wait with reply did not finish (10s)")
+    .expect("standalone recv with reply did not finish (10s)")
     .expect("failed to run wdyt");
 
     assert!(
@@ -463,6 +463,11 @@ async fn busy_port_range_relays_daemon_bind_error() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), "fn main() {}\n").unwrap();
 
+    // Point at a throwaway state file: sharing the developer's real one lets a
+    // `wdyt serve` running on this machine win the state lock first, so the
+    // failure reported would be the lock rather than the exhausted port range.
+    let state = tempfile::tempdir().unwrap();
+
     let output = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::process::Command::new(wdyt_bin())
@@ -472,6 +477,7 @@ async fn busy_port_range_relays_daemon_bind_error() {
                 "--no-wait",
                 "--no-notify",
             ])
+            .env("WDYT_STATE_PATH", state.path().join("sessions.json"))
             .env("WDYT_PORTS", &range)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

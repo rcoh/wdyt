@@ -3998,30 +3998,34 @@ async fn reading_a_discussion_does_not_take_it() {
     }
 }
 
-/// Asking for the next question takes it: a second agent must not answer the same
-/// one, and a second ask finds nothing.
+/// Receiving the next question takes it: a second agent must not answer the same
+/// one, and a second receive finds nothing.
 #[tokio::test]
 async fn the_next_question_is_taken_once() {
     let daemon = Daemon::start().await;
     let (id, thread) = asked_diff_session(&daemon).await;
 
     let (status, body) = daemon
-        .get(&format!("/api/sessions/{id}/threads/next?timeout_secs=5"))
+        .get(&format!("/api/sessions/{id}/recv?timeout_secs=5"))
         .await;
     assert_eq!(status, 200, "{body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["asked"], true);
-    assert_eq!(json["message"]["text"], "why is this a clone?");
+    assert_eq!(json["received"], true);
+    assert_eq!(json["event"]["kind"], "comment");
+    assert_eq!(json["event"]["message"]["text"], "why is this a clone?");
     // The thread comes with it: the line, the quoted code, and the exchange so
     // far, since an answer is about the code rather than about the sentence.
-    assert_eq!(json["thread"]["line"], 2);
-    assert_eq!(json["thread"]["snippet"], "    let x = 2;");
+    assert_eq!(json["event"]["thread"]["line"], 2);
+    assert_eq!(json["event"]["thread"]["snippet"], "    let x = 2;");
 
     let (_, body) = daemon
-        .get(&format!("/api/sessions/{id}/threads/next?timeout_secs=1"))
+        .get(&format!("/api/sessions/{id}/recv?timeout_secs=1"))
         .await;
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["asked"], false, "the same question came back: {body}");
+    assert_eq!(
+        json["received"], false,
+        "the same question came back: {body}"
+    );
 
     // The page can now say an agent has it.
     let (_, body) = daemon.get(&format!("/s/{id}/threads")).await;
@@ -4037,10 +4041,10 @@ async fn the_next_question_is_taken_once() {
         .await;
     assert_eq!(status, 200);
     let (_, body) = daemon
-        .get(&format!("/api/sessions/{id}/threads/next?timeout_secs=1"))
+        .get(&format!("/api/sessions/{id}/recv?timeout_secs=1"))
         .await;
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["asked"], false, "{body}");
+    assert_eq!(json["received"], false, "{body}");
 }
 
 /// An agent already waiting is woken by what the reader writes next, rather than
@@ -4051,14 +4055,14 @@ async fn a_waiting_agent_is_woken_by_a_follow_up() {
     let (id, thread) = asked_diff_session(&daemon).await;
     // Clear the comment itself out of the way.
     daemon
-        .get(&format!("/api/sessions/{id}/threads/next?timeout_secs=5"))
+        .get(&format!("/api/sessions/{id}/recv?timeout_secs=5"))
         .await;
 
     let base = daemon.base.clone();
     let session = id.clone();
     let waiting = tokio::spawn(async move {
         reqwest::get(format!(
-            "{base}/api/sessions/{session}/threads/next?timeout_secs=20"
+            "{base}/api/sessions/{session}/recv?timeout_secs=20"
         ))
         .await
         .expect("request sent")
@@ -4081,8 +4085,8 @@ async fn a_waiting_agent_is_woken_by_a_follow_up() {
         .expect("the wait ended when the reader wrote")
         .expect("task");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["asked"], true, "{body}");
-    assert_eq!(json["message"]["text"], "and the one below it?");
+    assert_eq!(json["received"], true, "{body}");
+    assert_eq!(json["event"]["message"]["text"], "and the one below it?");
 }
 
 #[tokio::test]

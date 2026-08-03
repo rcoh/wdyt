@@ -582,7 +582,7 @@ async fn threads_route(cx: &Cx) -> Result<Json<Threads>> {
 }
 
 /// The same, for an agent catching up on a discussion. Also read-only: taking a
-/// question is what `/threads/next` is for.
+/// question is what `/recv` is for.
 #[route(GET "/api/sessions/{session_id}/threads")]
 async fn agent_threads_route(cx: &Cx) -> Result<Json<Threads>> {
     threads(cx)

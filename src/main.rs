@@ -45,10 +45,10 @@ WORKFLOW (for coding agents):
        wdyt ack <id> \"rerunning the build with your flag\"  # turns receipt green
 
   5. Answer the questions left on lines, while they are still reading:
-       wdyt watch <id>            # blocks until they ask something; JSON on stdout
+       wdyt recv <id>             # blocks until they say something; JSON on stdout
        wdyt say <id> <thread> \"because the borrow would leak\"
        wdyt threads <id>          # the whole discussion, changing nothing
-     Loop watch → say until watch exits 2 (nothing asked in --timeout).
+     Loop recv → say until recv exits 2 (nothing said in --timeout).
 
   6. Exit status 2 means timeout — the session stays open for later collection.
 
@@ -217,7 +217,7 @@ enum Command {
     /// Print every thread in a session and everything said in it.
     ///
     /// Reading changes nothing: use it to catch up on a discussion, or after a
-    /// restart, without claiming to have picked anything up. `wdyt watch` is the
+    /// restart, without claiming to have picked anything up. `wdyt recv` is the
     /// one that takes a question.
     Threads {
         /// Session id.
@@ -570,7 +570,8 @@ async fn run() -> Result<()> {
                 wdyt::server::UserEvent::Reply { .. } => {
                     eprintln!(
                         "wdyt: reply received — the verdict on the whole session. \
-                         Acknowledge it with:\n  \
+                         Next:\n  \
+                         wdyt collect {id}    # the reply plus any line comments\n  \
                          wdyt ack {id} \"<what you are doing>\""
                     );
                 }
@@ -611,7 +612,7 @@ async fn run() -> Result<()> {
             if waiting > 0 {
                 eprintln!(
                     "wdyt: {waiting} thread{} waiting on you. Take the next with:\n  \
-                     wdyt watch {id}",
+                     wdyt recv {id}",
                     if waiting == 1 { "" } else { "s" }
                 );
             }
@@ -900,7 +901,7 @@ async fn show_content(
                 eprintln!(
                     "wdyt: reply received. Run `wdyt collect {id}` for line comments, then:\n  \
                      wdyt ack {id} \"<what you are doing>\"\n  \
-                     wdyt watch {id}      # answer questions left on lines, as they come"
+                     wdyt recv {id}       # answer questions left on lines, as they come"
                 );
             }
             None => {
@@ -910,7 +911,7 @@ async fn show_content(
                 eprintln!(
                     "wdyt: no reply within {}. The session stays open:\n  \
                      wdyt collect {id}    # check for reply + comments later\n  \
-                     wdyt watch {id}      # wait for a question on a line\n  \
+                     wdyt recv {id}       # wait for a question on a line\n  \
                      wdyt inbox           # list all pending replies",
                     timeout_label(timeout)
                 );
@@ -922,7 +923,7 @@ async fn show_content(
         eprintln!(
             "wdyt: session {id} created (not waiting). Later:\n  \
              wdyt collect {id}    # the reply and any line comments\n  \
-             wdyt watch {id}      # block until a question is asked, then `wdyt say`"
+             wdyt recv {id}       # block until a question is asked, then `wdyt say`"
         );
     }
     Ok(())
@@ -1223,14 +1224,14 @@ mod tests {
     }
 
     #[test]
-    fn standalone_wait_command_parses() {
-        let cli = Cli::parse_from(["wdyt", "wait", "abc123", "--timeout", "30"]);
+    fn standalone_recv_command_parses() {
+        let cli = Cli::parse_from(["wdyt", "recv", "abc123", "--timeout", "30"]);
         match cli.command {
-            Command::Wait { id, timeout } => {
+            Command::Recv { id, timeout } => {
                 assert_eq!(id, "abc123");
                 assert_eq!(timeout, Some(30));
             }
-            _ => panic!("expected Wait"),
+            _ => panic!("expected Recv"),
         }
     }
 
@@ -1273,12 +1274,12 @@ mod tests {
     /// a question, answer it, wait again.
     #[test]
     fn the_discussion_commands_parse() {
-        match Cli::parse_from(["wdyt", "watch", "abc123", "--timeout", "45"]).command {
-            Command::Watch { id, timeout } => {
+        match Cli::parse_from(["wdyt", "recv", "abc123", "--timeout", "45"]).command {
+            Command::Recv { id, timeout } => {
                 assert_eq!(id, "abc123");
                 assert_eq!(timeout, Some(45));
             }
-            _ => panic!("expected Watch"),
+            _ => panic!("expected Recv"),
         }
         // The answer is taken as words rather than one quoted argument, so an
         // agent that forgets the quotes still says what it meant.
