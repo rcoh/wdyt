@@ -95,6 +95,8 @@ fn router(store: Store, colors: ThemeColors, theme: String) -> Router {
         .page(session_page)
         .page(index_page)
         .route(reply_route)
+        .route(archive_route)
+        .route(restore_route)
         .route(raw_route)
         .route(asset_route)
         .route(health_route)
@@ -1045,6 +1047,29 @@ fn store_error(error: StoreError) -> topcoat::Error {
 
 const MAX_GROUPED_SESSIONS: usize = 12;
 
+#[route(POST "/s/{session_id}/archive")]
+async fn archive_route(cx: &Cx) -> Result<topcoat::router::Response> {
+    set_archived(cx, true)
+}
+
+#[route(POST "/s/{session_id}/restore")]
+async fn restore_route(cx: &Cx) -> Result<topcoat::router::Response> {
+    set_archived(cx, false)
+}
+
+/// Changes discovery state and returns to the active session list.
+fn set_archived(cx: &Cx, archived: bool) -> Result<topcoat::router::Response> {
+    let id = path_param::<SessionId>(cx)?;
+    state(cx)
+        .store
+        .set_archived(id, archived)
+        .map_err(store_error)?;
+    Ok(topcoat::router::Response::builder()
+        .status(http::StatusCode::SEE_OTHER)
+        .header(http::header::LOCATION, "/")
+        .body(topcoat::router::Body::empty())?)
+}
+
 /// Lists live sessions. Handy when a link has scrolled out of Slack.
 #[page("/")]
 async fn index_page(cx: &Cx) -> Result {
@@ -1097,18 +1122,28 @@ async fn index_page(cx: &Cx) -> Result {
             <div class="tabbed-review" data-tabbed-review="1">
                 <div class="review-tabs" role="tablist" aria-label="Review sessions">
                     for (index, (id, title, kind)) in tabs.iter().enumerate() {
-                        <button
-                            type="button"
-                            role="tab"
-                            id=(format!("review-tab-{index}"))
-                            aria-controls=(format!("review-panel-{index}"))
-                            aria-selected=(if index == selected_tab { "true" } else { "false" })
-                            tabindex=(if index == selected_tab { "0" } else { "-1" })
-                            data-session=(id)
-                        >
-                            <span class="tab-title">(title)</span>
-                            <span class="kind">(kind)</span>
-                        </button>
+                        <div class="review-tab" role="presentation">
+                            <button
+                                type="button"
+                                role="tab"
+                                id=(format!("review-tab-{index}"))
+                                aria-controls=(format!("review-panel-{index}"))
+                                aria-selected=(if index == selected_tab { "true" } else { "false" })
+                                tabindex=(if index == selected_tab { "0" } else { "-1" })
+                                data-session=(id)
+                            >
+                                <span class="tab-title">(title)</span>
+                                <span class="kind">(kind)</span>
+                            </button>
+                            <form action=(format!("/s/{id}/archive")) method="post">
+                                <button
+                                    class="tab-archive"
+                                    type="submit"
+                                    title="Archive tab"
+                                    aria-label=(format!("Archive {title}"))
+                                >"Archive"</button>
+                            </form>
+                        </div>
                     }
                 </div>
                 for (index, (id, title, _)) in tabs.iter().enumerate() {
@@ -1161,6 +1196,8 @@ async fn index_page(cx: &Cx) -> Result {
             commentable: false,
             embedded: false,
             origin: first.origin,
+            archive_control: false,
+            archived: false,
         };
         return view! { cx =>
             shell(
@@ -1172,21 +1209,28 @@ async fn index_page(cx: &Cx) -> Result {
         };
     }
 
-    let sessions = state.store.summaries();
+    let (archived_sessions, sessions): (Vec<_>, Vec<_>) = state
+        .store
+        .summaries()
+        .into_iter()
+        .partition(|session| session.4);
+    let archived_count = archived_sessions.len();
     let colors = &state.colors;
 
     let body = view! { cx =>
         <div class="wrap session-picker">
-            if sessions.is_empty() {
+            if sessions.is_empty() && archived_sessions.is_empty() {
                 <p style="color: var(--muted)">
                     "No sessions yet. An agent creates one with "
                     <code>"wdyt create …"</code>
                     "."
                 </p>
+            } else if sessions.is_empty() {
+                <p style="color: var(--muted)">"No active sessions."</p>
             } else {
                 <form id="session-picker" action="/" method="get">
                     <ul class="session-list">
-                        for (id, title, kind, replied) in sessions {
+                        for (id, title, kind, replied, _) in sessions {
                             <li>
                                 <input
                                     type="checkbox"
@@ -1197,6 +1241,13 @@ async fn index_page(cx: &Cx) -> Result {
                                 <label for=(format!("pick-{id}"))>(title)</label>
                                 <span class="kind">(kind)</span>
                                 <a class="direct" href=(format!("/s/{id}"))>"Open"</a>
+                                <button
+                                    class="session-action"
+                                    type="submit"
+                                    formaction=(format!("/s/{id}/archive"))
+                                    formmethod="post"
+                                    title="Archive tab"
+                                >"Archive"</button>
                                 if replied {
                                     <span style="color: var(--muted); grid-column: 2">"replied"</span>
                                 }
@@ -1208,6 +1259,25 @@ async fn index_page(cx: &Cx) -> Result {
                     </div>
                 </form>
                 <script>(Raw(crate::ui::SESSION_PICKER_JS))</script>
+            }
+            if !archived_sessions.is_empty() {
+                <details class="archived-sessions">
+                    <summary>"Archived (" (archived_count) ")"</summary>
+                    <ul class="session-list archived-list">
+                        for (id, title, kind, replied, _) in archived_sessions {
+                            <li>
+                                <a class="session-title" href=(format!("/s/{id}"))>(title)</a>
+                                <span class="kind">(kind)</span>
+                                if replied {
+                                    <span class="session-state">"replied"</span>
+                                }
+                                <form action=(format!("/s/{id}/restore")) method="post">
+                                    <button class="session-action" type="submit">"Restore"</button>
+                                </form>
+                            </li>
+                        }
+                    </ul>
+                </details>
             }
         </div>
     }?;
@@ -1245,6 +1315,7 @@ async fn session_page(cx: &Cx) -> Result {
                 session.theme.clone(),
                 session.brief.clone(),
                 session.brief_sources.clone(),
+                session.archived,
             )
         })
         .ok_or_else(not_found)?;
@@ -1259,6 +1330,7 @@ async fn session_page(cx: &Cx) -> Result {
         session_theme,
         brief,
         brief_sources,
+        archived,
     ) = session;
 
     // A session highlighted with its own theme needs the page's colours to match
@@ -1342,7 +1414,12 @@ async fn session_page(cx: &Cx) -> Result {
             Some(view! { cx =>
                 <nav class=(cls)>
                     for file in files {
-                        <a href=(format!("#{}", anchor(&file.label)))>(&file.label)</a>
+                        <a
+                            href=(format!("#{}", anchor(&file.label)))
+                            title=(&file.label)
+                        >
+                            <span class="file-label">(&file.label)</span>
+                        </a>
                     }
                 </nav>
             }?)
@@ -1356,11 +1433,15 @@ async fn session_page(cx: &Cx) -> Result {
             Some(view! { cx =>
                 <nav class=(cls)>
                     for file in files {
-                        <a href=(format!("#{}", anchor(&file.label)))>
-                            (&file.label)
-                            " "
-                            <span class="added">"+" (file.added)</span>
-                            <span class="removed">"−" (file.removed)</span>
+                        <a
+                            href=(format!("#{}", anchor(&file.label)))
+                            title=(&file.label)
+                        >
+                            <span class="file-label">(&file.label)</span>
+                            <span class="file-stats">
+                                <span class="added">"+" (file.added)</span>
+                                <span class="removed">"−" (file.removed)</span>
+                            </span>
                         </a>
                     }
                 </nav>
@@ -1375,7 +1456,12 @@ async fn session_page(cx: &Cx) -> Result {
             Some(view! { cx =>
                 <nav class=(cls)>
                     for file in files {
-                        <a href=(format!("#{}", anchor(&file.label)))>(&file.label)</a>
+                        <a
+                            href=(format!("#{}", anchor(&file.label)))
+                            title=(&file.label)
+                        >
+                            <span class="file-label">(&file.label)</span>
+                        </a>
                     }
                 </nav>
             }?)
@@ -1657,6 +1743,8 @@ async fn session_page(cx: &Cx) -> Result {
         commentable: content.is_commentable() || brief_commentable,
         embedded,
         origin,
+        archive_control: !embedded,
+        archived,
     };
 
     view! { cx =>

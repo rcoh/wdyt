@@ -87,7 +87,7 @@ header.bar {{
 }}
 header.bar .brand {{
   font-weight: 600; letter-spacing: .06em; color: var(--accent);
-  font-size: 11px; text-transform: uppercase;
+  font-size: 11px; text-transform: uppercase; text-decoration: none;
 }}
 header.bar h1 {{ font-size: 15px; font-weight: 600; margin: 0; }}
 header.bar .note {{ color: var(--muted); font-size: 13px; }}
@@ -116,25 +116,48 @@ header.bar .origin .cwd {{
   padding: 4px 7px; border: 1px solid var(--border-strong); border-radius: 4px;
   background: var(--surface); color: var(--muted);
 }}
+.archive-action {{ margin: 0; }}
+.archive-action button, .session-action {{
+  padding: 5px 8px; border: 1px solid var(--border-strong); border-radius: 5px;
+  background: var(--surface); color: var(--muted);
+  font: 11px/1 ui-sans-serif, system-ui, sans-serif; cursor: pointer;
+  white-space: nowrap;
+}}
+.archive-action button:hover, .session-action:hover {{
+  color: var(--fg); border-color: var(--accent);
+}}
 
 main {{ flex: 1 1 auto; min-height: 0; }}
 .wrap {{ max-width: 1100px; margin: 0 auto; padding: 24px 20px 96px; }}
 
 /* Session picker ---------------------------------------------------------- */
 .session-picker {{ max-width: 900px; }}
-.session-picker form {{ display: flex; flex-direction: column; min-height: 240px; }}
+#session-picker {{ display: flex; flex-direction: column; min-height: 240px; }}
 .session-list {{ list-style: none; padding: 0; margin: 0; }}
 .session-list li {{
-  display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto;
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto auto;
   align-items: center; gap: 12px;
   padding: 12px 0; border-bottom: 1px solid var(--border);
 }}
 .session-list input {{ width: 16px; height: 16px; accent-color: var(--accent); }}
-.session-list label {{
+.session-list label, .session-list .session-title {{
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-weight: 600; cursor: pointer;
 }}
 .session-list .direct {{ font-size: 12px; white-space: nowrap; }}
+.session-list .session-title {{ color: var(--fg); text-decoration: none; }}
+.session-list .session-title:hover {{ color: var(--accent); }}
+.session-list .session-state {{ color: var(--muted); font-size: 12px; }}
+.session-list form {{ margin: 0; }}
+.archived-sessions {{
+  margin-top: 22px; border-top: 1px solid var(--border); padding-top: 14px;
+}}
+.archived-sessions summary {{
+  color: var(--muted); font-weight: 600; cursor: pointer;
+}}
+.archived-list li {{
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+}}
 .picker-actions {{
   position: sticky; bottom: 0;
   display: flex; justify-content: flex-end;
@@ -163,12 +186,16 @@ body.grouped main {{ display: flex; overflow: hidden; }}
   background: var(--raised);
   scrollbar-width: thin;
 }}
+.review-tab {{
+  display: flex; flex: 0 0 auto; align-items: stretch;
+  min-width: 0; max-width: min(390px, 82vw);
+}}
 .review-tabs [role="tab"] {{
-  flex: 0 0 auto; max-width: min(320px, 72vw);
+  flex: 1 1 auto; min-width: 0; max-width: min(320px, 72vw);
   display: inline-flex; align-items: center; gap: 8px;
   padding: 9px 11px; margin-bottom: -1px;
   border: 1px solid transparent; border-bottom-color: var(--border);
-  border-radius: 6px 6px 0 0;
+  border-radius: 6px 0 0 0;
   background: transparent; color: var(--muted);
   font: 13px/1.2 ui-sans-serif, system-ui, sans-serif;
   cursor: pointer;
@@ -179,6 +206,19 @@ body.grouped main {{ display: flex; overflow: hidden; }}
 .review-tabs [role="tab"] .kind {{ font-size: 9px; flex: 0 0 auto; }}
 .review-tabs [role="tab"][aria-selected="true"] {{
   background: var(--surface); color: var(--fg);
+  border-color: var(--border); border-bottom-color: var(--surface);
+}}
+.review-tab form {{ display: flex; margin: 0; }}
+.review-tab .tab-archive {{
+  margin: 0 0 -1px -1px; padding: 0 8px;
+  border: 1px solid transparent; border-bottom-color: var(--border);
+  border-radius: 0 6px 0 0;
+  background: transparent; color: var(--muted);
+  font: 10px/1 ui-sans-serif, system-ui, sans-serif; cursor: pointer;
+}}
+.review-tab .tab-archive:hover {{ color: var(--accent); background: var(--surface); }}
+.review-tabs [role="tab"][aria-selected="true"] + form .tab-archive {{
+  background: var(--surface);
   border-color: var(--border); border-bottom-color: var(--surface);
 }}
 .review-tabs [role="tab"]:focus-visible {{
@@ -238,8 +278,16 @@ section.file, section.doc {{ scroll-margin-top: 92px; }}
     box-shadow: none;
   }}
   body:not(.framed):not(.nochrome) nav.files.has-sidebar a {{
-    display: block; white-space: nowrap; overflow: hidden;
-    text-overflow: ellipsis; padding: 5px 8px;
+    display: flex; align-items: center; min-width: 0;
+    white-space: nowrap; overflow: hidden; padding: 5px 8px;
+  }}
+  body:not(.framed):not(.nochrome) nav.files.has-sidebar .file-label {{
+    display: block; flex: 1 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    direction: rtl; text-align: left;
+  }}
+  body:not(.framed):not(.nochrome) nav.files.has-sidebar .file-stats {{
+    flex: 0 0 auto;
   }}
   /* The main content shifts right to make room for the sidebar. */
   body:not(.framed):not(.nochrome).has-file-sidebar main {{
@@ -3440,6 +3488,10 @@ pub struct Page {
     pub embedded: bool,
     /// Where the agent that made this session is running.
     pub origin: crate::zellij_origin::Origin,
+    /// Whether the page header should offer archive/restore for this session.
+    pub archive_control: bool,
+    /// The current archive state, used to choose the inverse header action.
+    pub archived: bool,
 }
 
 impl Page {
@@ -3456,6 +3508,8 @@ impl Page {
             commentable: false,
             embedded: false,
             origin: crate::zellij_origin::Origin::default(),
+            archive_control: false,
+            archived: false,
         }
     }
 }
@@ -3481,7 +3535,14 @@ pub async fn shell(
         commentable,
         embedded,
         origin,
+        archive_control,
+        archived,
     } = page;
+    let archive_action = format!(
+        "/s/{session_id}/{}",
+        if archived { "restore" } else { "archive" }
+    );
+    let archive_label = if archived { "Restore" } else { "Archive" };
     view! {
         <!DOCTYPE html>
         <html lang="en">
@@ -3494,7 +3555,7 @@ pub async fn shell(
             <body class=(body_class)>
                 if !embedded {
                     <header class="bar">
-                        <span class="brand">"wdyt"</span>
+                        <a class="brand" href="/" aria-label="wdyt home">"wdyt"</a>
                         <h1>(title)</h1>
                         if let Some(note) = note {
                             <span class="note">(note)</span>
@@ -3516,6 +3577,13 @@ pub async fn shell(
                                     <span class="cwd">(cwd)</span>
                                 }
                             </span>
+                        }
+                        if archive_control {
+                            <form class="archive-action" action=(archive_action) method="post">
+                                <button type="submit" title=(format!("{archive_label} tab"))>
+                                    (archive_label)
+                                </button>
+                            </form>
                         }
                         <span class="kind">(kind)</span>
                         if hideable {

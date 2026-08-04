@@ -506,6 +506,9 @@ pub struct Session {
     pub theme: Option<String>,
     #[serde(with = "unix_seconds")]
     pub created: SystemTime,
+    /// Hidden from the active session list without deleting its content or URL.
+    #[serde(default)]
+    pub archived: bool,
     /// The reply, once the user sends one. A session accepts a single reply;
     /// the sender is consumed on first use.
     pub reply: Option<Reply>,
@@ -671,6 +674,7 @@ impl Store {
                 brief,
                 brief_sources,
                 created: now,
+                archived: false,
                 reply: None,
                 comments: Vec::new(),
             };
@@ -688,6 +692,19 @@ impl Store {
 
     pub fn exists(&self, id: &str) -> bool {
         self.lock().sessions.contains_key(id)
+    }
+
+    /// Archives or restores a session, returning whether its state changed.
+    ///
+    /// Archiving only affects discovery. Direct links, replies, comments, and
+    /// agent subscriptions continue to work until the normal session TTL expires.
+    pub fn set_archived(&self, id: &str, archived: bool) -> Result<bool, StoreError> {
+        self.mutate(|sessions| {
+            let session = sessions.get_mut(id).ok_or(UnknownSession)?;
+            let changed = session.archived != archived;
+            session.archived = archived;
+            Ok(changed)
+        })
     }
 
     /// Records a reply and wakes any waiters.
@@ -1009,8 +1026,9 @@ impl Store {
         Ok(rx)
     }
 
-    /// Session ids and titles, newest first. For `wdyt list`.
-    pub fn summaries(&self) -> Vec<(String, String, &'static str, bool)> {
+    /// Session ids and titles, newest first. Archived state lets callers choose
+    /// whether to show the active list, the archive, or both.
+    pub fn summaries(&self) -> Vec<(String, String, &'static str, bool, bool)> {
         let mut items: Vec<_> = self
             .lock()
             .sessions
@@ -1021,14 +1039,15 @@ impl Store {
                     s.title.clone(),
                     s.content.kind(),
                     s.reply.is_some(),
+                    s.archived,
                     s.created,
                 )
             })
             .collect();
-        items.sort_by_key(|item| std::cmp::Reverse(item.4));
+        items.sort_by_key(|item| std::cmp::Reverse(item.5));
         items
             .into_iter()
-            .map(|(id, title, kind, replied, _)| (id, title, kind, replied))
+            .map(|(id, title, kind, replied, archived, _)| (id, title, kind, replied, archived))
             .collect()
     }
 
@@ -1762,6 +1781,24 @@ mod tests {
         let second = store.insert("second".into(), None, demo());
         let ids: Vec<_> = store.summaries().into_iter().map(|s| s.0).collect();
         assert_eq!(ids, vec![second, first]);
+    }
+
+    #[test]
+    fn archive_state_is_reversible_and_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sessions.json");
+        let store = Store::open(&path, None).unwrap();
+        let id = store.insert("finished".into(), None, demo());
+
+        assert!(store.set_archived(&id, true).unwrap());
+        assert!(!store.set_archived(&id, true).unwrap());
+        assert!(store.with(&id, |session| session.archived).unwrap());
+        drop(store);
+
+        let restored = Store::open(&path, None).unwrap();
+        assert!(restored.with(&id, |session| session.archived).unwrap());
+        assert!(restored.set_archived(&id, false).unwrap());
+        assert!(!restored.with(&id, |session| session.archived).unwrap());
     }
 
     #[test]

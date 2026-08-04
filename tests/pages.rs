@@ -286,6 +286,54 @@ async fn the_index_has_no_reply_widget() {
 }
 
 #[tokio::test]
+async fn a_session_links_home_and_can_be_archived_and_restored() {
+    let daemon = Daemon::start().await;
+    let id = titled_code_session(&daemon, "finished change");
+
+    let (status, session) = daemon.get(&format!("/s/{id}")).await;
+    assert_eq!(status, 200, "{session}");
+    assert!(
+        session.contains(r#"<a class="brand" href="/" aria-label="wdyt home">wdyt</a>"#),
+        "{session}"
+    );
+    assert!(
+        session.contains(&format!(r#"action="/s/{id}/archive" method="post""#)),
+        "{session}"
+    );
+
+    let (status, archived_index) = daemon.post(&format!("/s/{id}/archive")).await;
+    assert_eq!(status, 200, "{archived_index}");
+    assert!(daemon.store.with(&id, |session| session.archived).unwrap());
+    assert!(
+        !archived_index.contains(&format!(r#"value="{id}""#)),
+        "archived session remained selectable: {archived_index}"
+    );
+    assert!(archived_index.contains("Archived (1)"), "{archived_index}");
+    assert!(
+        archived_index.contains(&format!(r#"action="/s/{id}/restore" method="post""#)),
+        "{archived_index}"
+    );
+
+    let (status, archived_session) = daemon.get(&format!("/s/{id}")).await;
+    assert_eq!(status, 200, "{archived_session}");
+    assert!(
+        archived_session.contains(&format!(r#"action="/s/{id}/restore" method="post""#)),
+        "{archived_session}"
+    );
+
+    let (status, restored_index) = daemon.post(&format!("/s/{id}/restore")).await;
+    assert_eq!(status, 200, "{restored_index}");
+    assert!(!daemon.store.with(&id, |session| session.archived).unwrap());
+    assert!(
+        restored_index.contains(&format!(r#"value="{id}""#)),
+        "{restored_index}"
+    );
+
+    let (status, _) = daemon.post("/s/not-a-session/archive").await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
 async fn the_index_composes_selected_sessions_and_keeps_direct_links() {
     let daemon = Daemon::start().await;
     let first = titled_code_session(&daemon, "first change");
@@ -304,6 +352,10 @@ async fn the_index_composes_selected_sessions_and_keeps_direct_links() {
     assert!(body.contains("Open selected tabs"), "{body}");
     assert!(body.contains(&format!(r#"href="/s/{first}""#)), "{body}");
     assert!(body.contains(&format!(r#"href="/s/{second}""#)), "{body}");
+    assert!(
+        body.contains(&format!(r#"formaction="/s/{first}/archive""#)),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -349,6 +401,7 @@ async fn grouped_sessions_are_ordered_deduplicated_and_share_the_first_reply() {
     assert!(body.contains("ArrowRight"), "keyboard tab behavior missing");
     assert!(body.contains("event.key === 'Home'"), "{body}");
     assert!(body.contains("event.key === 'End'"), "{body}");
+    assert_eq!(body.matches(r#"title="Archive tab""#).count(), 2, "{body}");
 }
 
 #[tokio::test]
@@ -1534,6 +1587,37 @@ async fn existing_file_anchors_still_work() {
     assert!(
         mbody.contains("id=\"f-src-lib-rs\""),
         "file anchor missing on multi: {mbody}"
+    );
+}
+
+#[tokio::test]
+async fn the_file_sidebar_preserves_the_useful_end_of_long_paths() {
+    let daemon = Daemon::start().await;
+    let labels = [
+        "packages/accounts/src/http/handlers/create_account_request.rs",
+        "packages/accounts/src/http/handlers/delete_account_request.rs",
+        "packages/billing/src/http/handlers/create_invoice_request.rs",
+        "packages/billing/src/http/handlers/delete_invoice_request.rs",
+    ];
+    let files = labels
+        .iter()
+        .map(|label| wdyt::render::highlight(label, "fn handle() {}\n", theme("Nord")).unwrap())
+        .collect();
+    let id = daemon.insert(Content::Code { files });
+
+    let (status, body) = daemon.get(&format!("/s/{id}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#"class="files has-sidebar""#), "{body}");
+    for label in labels {
+        assert!(body.contains(&format!(r#"title="{label}""#)), "{body}");
+        assert!(
+            body.contains(&format!(r#"<span class="file-label">{label}</span>"#)),
+            "{body}"
+        );
+    }
+    assert!(
+        body.contains("direction: rtl; text-align: left"),
+        "sidebar does not truncate paths from the left: {body}"
     );
 }
 

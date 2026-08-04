@@ -72,7 +72,10 @@ wdyt create demo "$PORT" --title "running dashboard" # live server
 ```
 
 The no-query home page lists active sessions and can compose selected sessions
-into the same tabbed view.
+into the same tabbed view. The `wdyt` label on every review links back there.
+Archive controls remove finished tabs from the active list without deleting
+their content or direct URLs; archived tabs can be restored from the collapsed
+archive on the home page.
 
 ## Getting the reply
 
