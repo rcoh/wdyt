@@ -1244,7 +1244,7 @@ pub(crate) const SESSION_PICKER_JS: &str = r#"
 (function () {
   var form = document.getElementById('session-picker');
   if (!form) return;
-  var button = form.querySelector('button[type="submit"]');
+  var button = form.querySelector('.picker-actions button[type="submit"]');
   var choices = form.querySelectorAll('input[name="s"]');
   if (!button) return;
   function update() {

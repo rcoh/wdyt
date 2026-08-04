@@ -356,6 +356,10 @@ async fn the_index_composes_selected_sessions_and_keeps_direct_links() {
         body.contains(&format!(r#"formaction="/s/{first}/archive""#)),
         "{body}"
     );
+    assert!(
+        body.contains(r#"form.querySelector('.picker-actions button[type="submit"]')"#),
+        "the picker script must not disable the first session's archive button: {body}"
+    );
 }
 
 #[tokio::test]
