@@ -1,143 +1,93 @@
 ---
 name: wdyt
-description: "Show your work to the user via a Slack link and collect their reply. Use when you have something to show (code, a diff, rendered docs, a live demo) and want feedback before continuing."
+description: Shows work in one or more review tabs and collects the user's feedback. Use when presenting code, diffs, documents, screenshots, static reports, or live demos for review.
 ---
 
-# wdyt — show your work, get a reply
+# wdyt
 
-Show something to the user over a link in Slack. The page carries a reply box
-and supports detailed line-by-line comments on your work; the reply and any line
-comments come back as JSON and you carry on.
+Use wdyt in two phases: create each tab without notifying, then present all tab
+IDs once. `create` prints one JSON object containing `id`, `url`, `title`, and
+`kind`; it does not notify or wait.
 
-## Quick start
+## Create and present
 
-```sh
-# Show code, wait for reply
-wdyt code src/lib.rs --title "the new parser"
-
-# Show a diff
-git diff | wdyt diff --title "the rewrite"
-
-# Show rendered markdown
-wdyt docs DESIGN.md --title "design writeup"
-
-# Show a live server you already started (here, on port 3001)
-wdyt demo 3001 --title "the running app"
-```
-
-stdout prints the URL, then blocks until a reply arrives (JSON). Exit 2 = timeout.
-
-## Modes
-
-| Mode | When to use | Example |
-|------|-------------|---------|
-| `code` | Show source files, syntax highlighted | `wdyt code src/*.rs --title "…"` |
-| `diff` | Reviewable unified diff with line comments | `git diff \| wdyt diff --title "…"` |
-| `docs` | Rendered markdown (GFM, callouts, tables) | `wdyt docs DESIGN.md --title "…"` |
-| `dir`  | A directory of prepared HTML/assets | `wdyt dir ./report --title "…"` |
-| `demo` | A live server you already started | `wdyt demo 3001 --title "…"` |
-
-`diff` orders files by review importance automatically (hand-written source
-first, docs/config next, lockfiles and generated churn last), so the most
-important files are shown first. Within an importance rank it keeps the order of
-the piped diff — arrange the files you `git diff` to control that.
-
-## Guided review (--brief)
-
-Tell the user what to look at and why. Links to `#f-<path>` jump to that file
-(non-alphanumerics become dashes):
+Use a guided diff as the primary tab for code changes:
 
 ```sh
-git diff | wdyt diff --brief "Start at [src/lib.rs](#f-src-lib-rs) — the parser fix."
+guide_id=$(
+  git diff | wdyt create guided-diff REVIEW.md --title "parser changes" |
+    jq -r '.id'
+)
+design_id=$(wdyt create docs DESIGN.md --title "design" | jq -r '.id')
+wdyt present "$guide_id" "$design_id" --title "parser changes"
 ```
 
-Or from a file: `--brief-file REVIEW.md`. After creation, stderr lists the
-available anchors.
+`present` sends one notification with one tabbed URL and waits for feedback on
+the first session by default. It preserves ID order in a URL such as
+`/?s=s1&s=s2&s=s3`. Put the narrative or decision tab first because it owns the
+presentation-level reply. Comments always belong to the session tab where the
+user left them.
 
-## Waiting and collecting
-
-Every content command waits by default. This is important. If you are not waiting on the socket, you will not receive the users reply.
-
-You MUST NOT use `--no-wait` unless the user has explicitly given you guidance to use `--no-wait`. This is not negotiable.
-
-You must not use `--timeout` unless the user has explicitly given you guidance to use `--timeout`. This is not negotiable.
-
-If you have a built-in background-task mechanism you SHOULD use it.
+Create supporting tabs only when they add useful material:
 
 ```sh
-wdyt ack <id> "on it"  # turn the user's receipt green
+guide_id=$(
+  git diff | wdyt create guided-diff REVIEW.md --title "guided changes" |
+    jq -r '.id'
+)
+docs_id=$(wdyt create docs NOTES.md --title "notes" | jq -r '.id')
+report_id=$(wdyt create dir ./report --title "report" | jq -r '.id')
+demo_id=$(wdyt create demo 3001 --title "running UI" | jq -r '.id')
+wdyt present "$guide_id" "$docs_id" "$report_id" "$demo_id"
 ```
 
-Always `ack` immediately after collecting — it tells the user you actually read
-their note.
+Creation and presentation are always separate. Use `create` for every content
+mode, then make exactly one `present` call for the complete review.
 
-## Answering their questions (threads)
+## Guided diff input
 
-A line comment is usually a question, not a remark. Once you have the reply,
-**stay in the discussion** until they stop asking:
+A guided diff is Markdown that interleaves prose with selected diff and current
+code ranges. Pipe the unified patch to `create guided-diff`:
+
+````md
+## Public API
+
+`Client::present` is additive.
+
+```wdyt-diff
+{"file":"src/client.rs","side":"new","start":110,"end":145}
+```
+
+## Tests
+
+```wdyt-code
+{"file":"tests/present.rs","start":1,"end":80}
+```
+````
+
+## Feedback loop
+
+Do not pass `--no-wait` or `--timeout` unless the user explicitly asks. Keep the
+waiting `wdyt present` process running, preferably as a background task.
+
+After receiving the overall reply, acknowledge it immediately:
 
 ```sh
-wdyt recv <id>                           # blocks until they say something
-# {"kind": "comment", "thread": {"id": 4, "file": "src/diff.rs", "line": 97,
-#   "snippet": "old_first: old_start,", "text": "why is this a clone?"},
-#  "message": {"id": 0, "from": "user", "text": "why is this a clone?"}}
-
-wdyt say <id> 4 "cheap here, and the borrow would leak into the API"
-wdyt recv <id>                           # and again, for the follow-up
+wdyt ack <first-session-id> "applying the requested naming change"
 ```
 
-Loop `recv` → `say` until `recv` exits 2 (nothing arrived before `--timeout`).
-`recv` also delivers the overall reply, as `"kind": "reply"` — that one is
-terminal, so acknowledge it with `wdyt ack` rather than answering it.
-Your answer appears under that line on their page while they are still reading it.
-
-- The `thread` id is the comment id. It comes back from `recv`, from
-  `wdyt threads <id>`, and from `wdyt collect <id>`.
-- `recv` takes each question once, so two of your processes cannot answer the
-  same one. `wdyt threads <id>` reads the whole discussion and takes nothing.
-- Answer with what you did, not just what you think: "renamed it, pushed" reads
-  better than "good point".
-- Sending the answer is what tells them you read the question — taking it only
-  turns their dot amber.
-
-## Sessions, the daemon, and one shared port
-
-One long-lived **daemon** serves **every session on a single port** (chosen from
-`--ports`, e.g. 3007). Each `wdyt code/diff/docs/…` call just registers **another
-session** on that same daemon — you never start a second daemon or pick a new
-port per session. The daemon's **root URL** (`http://localhost:<port>/`) lists all
-live sessions and is the stable entry point; individual `/s/<id>` links point at
-one session.
-
-- **Reuse the running daemon.** Before doing anything drastic, `wdyt list` shows
-  the daemon URL and live sessions. Just run another content command to add a
-  session — they coexist.
-- **Never kill/restart the daemon to "reset" it.** Sessions are persisted and
-  restored with the same ids, so restart is not a reset. An active `wdyt recv`
-  disconnects and must be rerun after the daemon returns.
-- **Don't spawn stray daemons.** Running `wdyt serve` from another checkout or
-  worktree starts a *second* daemon on a *different* port, fragmenting sessions.
-  Stick to the one installed daemon.
-- **Share the root URL when practical.** Session ids survive restart, but an
-  exact `/s/<id>` link still assumes the daemon rebinds the same port.
-
-## Output contract
-
-- **stdout**: machine-readable only (URL, then reply JSON)
-- **stderr**: guidance (anchors, next-step hints) — never parse this
-- **exit 0**: reply received
-- **exit 2**: timeout (session stays open)
-
-## Configuration
-
-The webhook always goes directly to the user (not public), and wdyt is served
-only locally — there is no risk in sending information to wdyt.
+Line comments start threads on their own tab. Stay in the discussion:
 
 ```sh
-wdyt config --webhook-url https://hooks.slack.com/services/…
-wdyt config --ports 3000-3010
-wdyt config --theme "GitHub"     # see `wdyt themes`
+wdyt recv <session-id>
+wdyt say <session-id> <thread-id> "renamed it and updated both callers"
+wdyt recv <session-id>
 ```
 
-Env overrides: `WDYT_WEBHOOK_URL`, `WDYT_PORTS`, `WDYT_THEME`,
-`WDYT_PUBLIC_HOST`, `WDYT_STATE_PATH`.
+Repeat `recv` and `say` while questions continue. Use
+`wdyt threads <session-id>` to read the complete discussion without consuming
+the next message. A presentation-level reply is terminal and should be
+acknowledged with `ack`, not answered with `say`.
+
+For presentation structure, use the `presenting-code-changes` or
+`presenting-designs` skill.

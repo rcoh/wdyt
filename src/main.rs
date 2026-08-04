@@ -22,10 +22,11 @@ use wdyt::session::{Content, Store};
     after_help = "\
 WORKFLOW (for coding agents):
 
-  1. Show your work — the command waits for a reply by default:
-       wdyt code src/lib.rs src/main.rs --title \"the new parser\"
-       git diff | wdyt diff --title \"the parser rewrite\"
-       wdyt docs DESIGN.md --title \"design writeup\"
+  1. Create one or more sessions, then present them together:
+       wdyt create code src/lib.rs --title \"public API\"
+       wdyt create docs DESIGN.md --title \"design\"
+       wdyt create guided-diff REVIEW.md --patch changes.patch
+       wdyt present <code-id> <design-id>
 
   2. In a guided review brief (--brief / --brief-file), link to files with
      #f-<path> where non-alphanumerics become dashes:
@@ -37,8 +38,9 @@ WORKFLOW (for coding agents):
      (line anchors resolve in code/diff; in docs they jump to the covering
      block.) After session creation, available anchors are printed to stderr.
 
-  3. stdout is machine-readable: first the session URL, then (if waiting) the
-     reply as JSON. Pass --no-wait for fire-and-forget.
+  3. stdout is machine-readable: create prints one session JSON object; present
+     prints the combined URL, then (if waiting) the reply as JSON. Pass
+     --no-wait to present for fire-and-forget.
 
   4. Collect the reply + line/block comments (blocks until one arrives):
        wdyt collect <id>   # returns reply + line/block comments as JSON
@@ -52,8 +54,8 @@ WORKFLOW (for coding agents):
 
   6. Exit status 2 means timeout — the session stays open for later collection.
 
-STDIN CAVEAT: --brief - and a piped diff cannot both read stdin. Use --brief-file
-when piping a diff."
+STDIN CAVEAT: --brief - and a piped `wdyt create diff` cannot both read stdin.
+Use --brief-file when piping a diff."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -62,62 +64,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show source files, syntax highlighted.
+    /// Register content without notifying or waiting.
     ///
-    /// Waits for a reply by default. Pass --no-wait for fire-and-forget.
-    /// Example: wdyt code src/lib.rs src/main.rs --title "the new parser"
-    Code {
-        /// Files to show.
+    /// Prints one JSON object with `id`, `url`, `title`, and `kind`. Use the
+    /// returned IDs with `wdyt present`.
+    Create {
+        #[command(subcommand)]
+        content: CreateCommand,
+    },
+
+    /// Present one or more sessions as tabs in a single notification.
+    ///
+    /// The first session owns the overall reply and is waited on by default.
+    Present {
+        /// Session IDs in tab order.
         #[arg(required = true)]
-        files: Vec<PathBuf>,
+        ids: Vec<String>,
         #[command(flatten)]
-        show: ShowArgs,
-    },
-
-    /// Show a unified diff, reviewable line by line with comments.
-    ///
-    /// Reads from stdin by default: `git diff | wdyt diff --title "..."`.
-    /// Pass a file path instead of `-` to read from a file.
-    /// Note: --brief - cannot be combined with a piped diff; use --brief-file.
-    Diff {
-        /// A patch file, or `-` to read the diff from stdin.
-        #[arg(default_value = "-")]
-        patch: PathBuf,
-        #[command(flatten)]
-        show: ShowArgs,
-    },
-
-    /// Show markdown files, rendered (GFM: tables, tasklists, callouts).
-    ///
-    /// Waits for a reply by default. Pass --no-wait for fire-and-forget.
-    /// Example: wdyt docs DESIGN.md --title "design writeup"
-    Docs {
-        #[arg(required = true)]
-        files: Vec<PathBuf>,
-        #[command(flatten)]
-        show: ShowArgs,
-    },
-
-    /// Show a directory of static files.
-    Dir {
-        /// Directory to serve.
-        root: PathBuf,
-        /// Page to open within it.
-        #[arg(long, default_value = "index.html")]
-        entry: String,
-        #[command(flatten)]
-        show: ShowArgs,
-    },
-
-    /// Show a server already running on PORT.
-    Demo {
-        /// The port the server is listening on.
-        port: u16,
-        /// Path to open on that server.
-        #[arg(long, default_value = "/")]
-        path: String,
-        #[command(flatten)]
-        show: ShowArgs,
+        present: PresentArgs,
     },
 
     /// Print a free port for a demo server to bind.
@@ -168,9 +132,9 @@ enum Command {
     ///
     /// Returns JSON: {"replied": bool, "reply": {...}, "comments": [...]}
     /// Each comment has file, line, side, snippet, and text fields.
-    /// For markdown comments (docs/brief), a `target` field identifies where the
-    /// comment was placed: "brief" for the guided review, "doc:<n>" for the nth
-    /// docs file. Code/diff comments omit `target` (file path is sufficient).
+    /// A `target` field identifies structured content: "brief", "doc:<n>", or
+    /// "guided:<n>". Ordinary code/diff comments omit it because the file path
+    /// is sufficient.
     ///
     /// After collecting, acknowledge with: wdyt ack <id> "your note"
     Collect {
@@ -252,25 +216,86 @@ enum Command {
     /// List available syntax themes.
     Themes,
 
-    /// Install the wdyt agent skill into a project or globally.
+    /// Install the wdyt agent skills into a project or globally.
     ///
-    /// Writes SKILL.md so that coding agents (Kiro, Claude Code, etc.) know how
-    /// to use wdyt. By default installs into the current project's .kiro/skills/
-    /// and .claude/skills/ directories. Pass --global to install into the user's
-    /// home directory instead (~/.kiro/skills/wdyt/ and ~/.claude/skills/wdyt/).
+    /// Installs wdyt mechanics plus code-change and design presentation skills
+    /// for Kiro, Claude Code, Codex, and agents using the shared skills path.
+    /// By default writes beneath the current project; pass --global to write
+    /// beneath the user's home directory instead.
     ///
     /// Example: wdyt skill --global
     Skill {
-        /// Install to ~/.kiro/skills/ and ~/.claude/skills/ instead of the
-        /// current project.
+        /// Install beneath the user's home directory instead of this project.
         #[arg(long, short)]
         global: bool,
     },
 }
 
-/// Flags shared by the content-producing subcommands.
+#[derive(Subcommand)]
+enum CreateCommand {
+    /// Register source files, syntax highlighted.
+    Code {
+        /// Files to show.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        #[command(flatten)]
+        session: SessionArgs,
+    },
+
+    /// Register a unified diff, reviewable line by line with comments.
+    Diff {
+        /// A patch file, or `-` to read the diff from stdin.
+        #[arg(default_value = "-")]
+        patch: PathBuf,
+        #[command(flatten)]
+        session: SessionArgs,
+    },
+
+    /// Register an ordered review mixing prose, diff ranges, and code ranges.
+    GuidedDiff {
+        /// Markdown review containing wdyt-diff and wdyt-code directives.
+        review: PathBuf,
+        /// A patch file, or `-` to read the patch from stdin.
+        #[arg(long, default_value = "-")]
+        patch: PathBuf,
+        #[command(flatten)]
+        session: GuidedSessionArgs,
+    },
+
+    /// Register markdown files, rendered as GFM.
+    Docs {
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        #[command(flatten)]
+        session: SessionArgs,
+    },
+
+    /// Register a directory of static files.
+    Dir {
+        /// Directory to serve.
+        root: PathBuf,
+        /// Page to open within it.
+        #[arg(long, default_value = "index.html")]
+        entry: String,
+        #[command(flatten)]
+        session: SessionArgs,
+    },
+
+    /// Register a server already running on PORT.
+    Demo {
+        /// The port the server is listening on.
+        port: u16,
+        /// Path to open on that server.
+        #[arg(long, default_value = "/")]
+        path: String,
+        #[command(flatten)]
+        session: SessionArgs,
+    },
+}
+
+/// Metadata stored with a create-only content session.
 #[derive(Args)]
-struct ShowArgs {
+struct SessionArgs {
     /// Headline for the notification and the page.
     #[arg(long, short)]
     title: Option<String>,
@@ -278,28 +303,6 @@ struct ShowArgs {
     /// A sentence of extra context, shown under the title.
     #[arg(long, short)]
     note: Option<String>,
-
-    /// Do not wait for a reply — fire and forget.
-    ///
-    /// By default every content command blocks until a reply arrives (or
-    /// `--timeout` expires). Pass `--no-wait` when you only need the link.
-    #[arg(long, conflicts_with = "wait")]
-    no_wait: bool,
-
-    /// Retained for backwards compatibility; waiting is now the default.
-    #[arg(long, hide = true, conflicts_with = "no_wait")]
-    wait: bool,
-
-    /// Seconds to wait before giving up (exit status 2). Waits forever if unset.
-    ///
-    /// The session stays open after a timeout — check later with `wdyt inbox`
-    /// or `wdyt collect <id>`.
-    #[arg(long, conflicts_with = "no_wait")]
-    timeout: Option<u64>,
-
-    /// Print the link instead of sending a notification.
-    #[arg(long)]
-    no_notify: bool,
 
     /// Syntax theme for this session only. See `wdyt themes`.
     ///
@@ -323,14 +326,47 @@ struct ShowArgs {
     brief_file: Option<PathBuf>,
 }
 
-impl ShowArgs {
-    /// Whether this invocation should wait for a reply.
-    fn should_wait(&self) -> bool {
-        // `--no-wait` opts out; the old `--wait` is accepted silently (it was
-        // already the default).
-        !self.no_wait
-    }
+/// Guided reviews carry their narrative in the content itself.
+#[derive(Args)]
+struct GuidedSessionArgs {
+    /// Headline for the page.
+    #[arg(long, short)]
+    title: Option<String>,
 
+    /// A sentence of extra context, shown under the title.
+    #[arg(long, short)]
+    note: Option<String>,
+
+    /// Syntax theme for this session only. See `wdyt themes`.
+    #[arg(long)]
+    theme: Option<String>,
+}
+
+/// Notification and wait controls for a composed presentation.
+#[derive(Args)]
+struct PresentArgs {
+    /// Headline for the notification.
+    #[arg(long, short)]
+    title: Option<String>,
+
+    /// A sentence of extra context, shown under the title.
+    #[arg(long, short)]
+    note: Option<String>,
+
+    /// Do not wait for a reply.
+    #[arg(long)]
+    no_wait: bool,
+
+    /// Seconds to wait before giving up (exit status 2).
+    #[arg(long, conflicts_with = "no_wait")]
+    timeout: Option<u64>,
+
+    /// Print the link instead of sending a notification.
+    #[arg(long)]
+    no_notify: bool,
+}
+
+impl SessionArgs {
     /// The theme to highlight with: this invocation's, or the configured default.
     fn theme<'a>(&'a self, config: &'a Config) -> Result<&'a str> {
         let name = self.theme.as_deref().unwrap_or(&config.theme);
@@ -365,6 +401,24 @@ impl ShowArgs {
         let theme = self.theme(config)?;
         let doc = render::markdown_commentable("brief", &source, theme);
         Ok(Some((doc.html, doc.sources)))
+    }
+}
+
+impl From<GuidedSessionArgs> for SessionArgs {
+    fn from(guided: GuidedSessionArgs) -> Self {
+        Self {
+            title: guided.title,
+            note: guided.note,
+            theme: guided.theme,
+            brief: None,
+            brief_file: None,
+        }
+    }
+}
+
+impl PresentArgs {
+    fn should_wait(&self) -> bool {
+        !self.no_wait
     }
 }
 
@@ -415,144 +469,47 @@ async fn run() -> Result<()> {
             Ok(())
         }
 
-        Command::Code { files, show } => {
-            let theme = render::theme(show.theme(&config)?);
-            let mut rendered = Vec::with_capacity(files.len());
-            for path in &files {
-                let source = read_text(path)?;
-                rendered.push(render::highlight(&label(path), &source, theme)?);
+        Command::Create { content } => match content {
+            CreateCommand::Code { files, session } => {
+                let prepared = prepare_code(&config, &session, files)?;
+                create_content(&config, session, prepared).await
             }
-            let details = vec![summarize(files.len(), "file")];
-            let title = show
-                .title
-                .clone()
-                .unwrap_or_else(|| default_title(&files, "code"));
-            show_content(
-                &config,
-                title,
-                show,
-                Content::Code { files: rendered },
-                details,
-            )
-            .await
-        }
-
-        Command::Diff { patch, show } => {
-            // Both cannot come from stdin: whichever read first would consume the
-            // other's input, and the diff is the one that is usually piped.
-            anyhow::ensure!(
-                !(patch == *"-" && show.brief.as_deref() == Some("-")),
-                "the diff and the brief cannot both come from stdin. \
-                 Use `--brief-file <PATH>`, or pass the patch as a file"
-            );
-            // Reading from stdin is the common case: `git diff | wdyt diff`.
-            let source = if patch == *"-" {
-                use std::io::Read as _;
-                let mut buffer = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut buffer)
-                    .context("reading the diff from stdin")?;
-                anyhow::ensure!(
-                    !buffer.trim().is_empty(),
-                    "empty diff on stdin. Pipe one in, as with \
-                     `git diff | wdyt diff`, or pass a patch file"
-                );
-                buffer
-            } else {
-                read_text(&patch)?
-            };
-
-            let mut files = wdyt::diff::parse(&source, render::theme(show.theme(&config)?))?;
-            // The lines between the hunks are not in the patch. Read them from the
-            // tree while we are still standing in it, so the page can offer them.
-            wdyt::diff::capture_sources(&mut files);
-            // A `git diff` lists files alphabetically, floating low-signal files
-            // like Cargo.lock and .config/nextest.toml to the top. Order them by
-            // review importance instead; the stable sort keeps patch order within
-            // a rank.
-            files.sort_by_key(|f| wdyt::diff::review_rank(&f.label));
-            let added: usize = files.iter().map(|f| f.added).sum();
-            let removed: usize = files.iter().map(|f| f.removed).sum();
-            let title = show
-                .title
-                .clone()
-                .unwrap_or_else(|| match files.as_slice() {
-                    [one] => one.label.clone(),
-                    many => format!("{} changed files", many.len()),
-                });
-            let details = vec![
-                summarize(files.len(), "file"),
-                format!("+{added} −{removed}"),
-            ];
-            show_content(&config, title, show, Content::Diff { files }, details).await
-        }
-
-        Command::Docs { files, show } => {
-            let mut rendered = Vec::with_capacity(files.len());
-            for path in &files {
-                let source = read_text(path)?;
-                rendered.push(render::markdown_commentable(
-                    &label(path),
-                    &source,
-                    show.theme(&config)?,
-                ));
+            CreateCommand::Diff { patch, session } => {
+                let prepared = prepare_diff(&config, &session, patch)?;
+                create_content(&config, session, prepared).await
             }
-            let details = vec![summarize(files.len(), "doc")];
-            let title = show
-                .title
-                .clone()
-                .unwrap_or_else(|| default_title(&files, "docs"));
-            show_content(
-                &config,
-                title,
-                show,
-                Content::Docs { files: rendered },
-                details,
-            )
-            .await
-        }
-
-        Command::Dir { root, entry, show } => {
-            let root = root
-                .canonicalize()
-                .with_context(|| format!("{} does not exist", root.display()))?;
-            anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
-            if !root.join(&entry).exists() {
-                eprintln!(
-                    "wdyt: warning: {} has no {entry}; the page may be blank",
-                    root.display()
-                );
+            CreateCommand::GuidedDiff {
+                review,
+                patch,
+                session,
+            } => {
+                let session = SessionArgs::from(session);
+                let prepared = prepare_guided_diff(&config, &session, review, patch)?;
+                create_content(&config, session, prepared).await
             }
-            let title = show
-                .title
-                .clone()
-                .unwrap_or_else(|| format!("{}", root.file_name().unwrap_or_default().display()));
-            let details = vec![root.display().to_string()];
-            show_content(
-                &config,
-                title,
-                show,
-                Content::Static { root, entry },
-                details,
-            )
-            .await
-        }
+            CreateCommand::Docs { files, session } => {
+                let prepared = prepare_docs(&config, &session, files)?;
+                create_content(&config, session, prepared).await
+            }
+            CreateCommand::Dir {
+                root,
+                entry,
+                session,
+            } => {
+                let prepared = prepare_dir(&session, root, entry)?;
+                create_content(&config, session, prepared).await
+            }
+            CreateCommand::Demo {
+                port,
+                path,
+                session,
+            } => {
+                let prepared = prepare_demo(&config, &session, port, path)?;
+                create_content(&config, session, prepared).await
+            }
+        },
 
-        Command::Demo { port, path, show } => {
-            // A demo the agent has not actually started is the most likely
-            // mistake here, so check before sending a link to a dead port.
-            anyhow::ensure!(
-                !ports::is_free(config.bind, port),
-                "nothing is listening on port {port}. Start the server first, \
-                 then run `wdyt demo {port}`"
-            );
-            let title = show
-                .title
-                .clone()
-                .unwrap_or_else(|| format!("live demo on port {port}"));
-            let details = vec![format!("port {port}")];
-            show_content(&config, title, show, Content::Demo { port, path }, details).await
-        }
+        Command::Present { ids, present } => present_sessions(&config, ids, present).await,
 
         Command::Recv { id, timeout } => {
             let client = Client::new(&config);
@@ -781,152 +738,379 @@ async fn run() -> Result<()> {
     }
 }
 
-/// Creates the session, sends the notification, and optionally waits.
-async fn show_content(
-    config: &Config,
+struct PreparedContent {
     title: String,
-    show: ShowArgs,
     content: Content,
-    details: Vec<String>,
-) -> Result<()> {
+}
+
+struct CreatedContent {
+    id: String,
+    url: String,
+    title: String,
+    kind: &'static str,
+    file_labels: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct CreatedOutput {
+    id: String,
+    url: String,
+    title: String,
+    kind: &'static str,
+}
+
+fn prepare_code(
+    config: &Config,
+    session: &SessionArgs,
+    files: Vec<PathBuf>,
+) -> Result<PreparedContent> {
+    let theme = render::theme(session.theme(config)?);
+    let mut rendered = Vec::with_capacity(files.len());
+    for path in &files {
+        let source = read_text(path)?;
+        rendered.push(render::highlight(&label(path), &source, theme)?);
+    }
+    let title = session
+        .title
+        .clone()
+        .unwrap_or_else(|| default_title(&files, "code"));
+    Ok(PreparedContent {
+        title,
+        content: Content::Code { files: rendered },
+    })
+}
+
+fn prepare_diff(config: &Config, session: &SessionArgs, patch: PathBuf) -> Result<PreparedContent> {
+    // Both cannot come from stdin: whichever read first would consume the
+    // other's input, and the diff is the one that is usually piped.
+    anyhow::ensure!(
+        !(patch == *"-" && session.brief.as_deref() == Some("-")),
+        "the diff and the brief cannot both come from stdin. \
+         Use `--brief-file <PATH>`, or pass the patch as a file"
+    );
+    let source = if patch == *"-" {
+        use std::io::Read as _;
+        let mut buffer = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buffer)
+            .context("reading the diff from stdin")?;
+        anyhow::ensure!(
+            !buffer.trim().is_empty(),
+            "empty diff on stdin. Pipe one in, as with \
+             `git diff | wdyt create diff`, or pass a patch file"
+        );
+        buffer
+    } else {
+        read_text(&patch)?
+    };
+
+    let mut files = wdyt::diff::parse(&source, render::theme(session.theme(config)?))?;
+    wdyt::diff::capture_sources(&mut files);
+    files.sort_by_key(|file| wdyt::diff::review_rank(&file.label));
+    let title = session
+        .title
+        .clone()
+        .unwrap_or_else(|| match files.as_slice() {
+            [one] => one.label.clone(),
+            many => format!("{} changed files", many.len()),
+        });
+    Ok(PreparedContent {
+        title,
+        content: Content::Diff { files },
+    })
+}
+
+fn prepare_guided_diff(
+    config: &Config,
+    session: &SessionArgs,
+    review: PathBuf,
+    patch: PathBuf,
+) -> Result<PreparedContent> {
+    let review_source = read_text(&review)?;
+    let patch_source = if patch == *"-" {
+        use std::io::Read as _;
+        let mut buffer = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buffer)
+            .context("reading the guided diff patch from stdin")?;
+        buffer
+    } else {
+        read_text(&patch)?
+    };
+    let workspace = std::env::current_dir().context("determining the guided diff workspace")?;
+    let blocks = wdyt::guided::parse(
+        &review_source,
+        &patch_source,
+        &workspace,
+        session.theme(config)?,
+    )?;
+    let title = session.title.clone().unwrap_or_else(|| label(&review));
+    Ok(PreparedContent {
+        title,
+        content: Content::Guided { blocks },
+    })
+}
+
+fn prepare_docs(
+    config: &Config,
+    session: &SessionArgs,
+    files: Vec<PathBuf>,
+) -> Result<PreparedContent> {
+    let mut rendered = Vec::with_capacity(files.len());
+    for path in &files {
+        let source = read_text(path)?;
+        rendered.push(render::markdown_commentable(
+            &label(path),
+            &source,
+            session.theme(config)?,
+        ));
+    }
+    let title = session
+        .title
+        .clone()
+        .unwrap_or_else(|| default_title(&files, "docs"));
+    Ok(PreparedContent {
+        title,
+        content: Content::Docs { files: rendered },
+    })
+}
+
+fn prepare_dir(session: &SessionArgs, root: PathBuf, entry: String) -> Result<PreparedContent> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("{} does not exist", root.display()))?;
+    anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
+    if !root.join(&entry).exists() {
+        eprintln!(
+            "wdyt: warning: {} has no {entry}; the page may be blank",
+            root.display()
+        );
+    }
+    let title = session
+        .title
+        .clone()
+        .unwrap_or_else(|| root.file_name().unwrap_or_default().display().to_string());
+    Ok(PreparedContent {
+        title,
+        content: Content::Static { root, entry },
+    })
+}
+
+fn prepare_demo(
+    config: &Config,
+    session: &SessionArgs,
+    port: u16,
+    path: String,
+) -> Result<PreparedContent> {
+    anyhow::ensure!(
+        !ports::is_free(config.bind, port),
+        "nothing is listening on port {port}. Start the server first, \
+         then run `wdyt create demo {port}`"
+    );
+    let title = session
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("live demo on port {port}"));
+    Ok(PreparedContent {
+        title,
+        content: Content::Demo { port, path },
+    })
+}
+
+async fn register_content(
+    config: &Config,
+    session: &SessionArgs,
+    prepared: PreparedContent,
+) -> Result<CreatedContent> {
+    let PreparedContent { title, content } = prepared;
     let kind = content.kind();
-    let client = Client::new(config);
-    // Extract wait parameters before partial moves of `show`.
-    let do_wait = show.should_wait();
-    let timeout = show.timeout;
-    let no_notify = show.no_notify;
-    // The theme travels with the session so the page's chrome agrees with the
+    let file_labels = content_file_labels(&content);
+    if !file_labels.is_empty()
+        && let Err(message) = wdyt::validate_file_anchors(&file_labels)
+    {
+        anyhow::bail!("{message}");
+    }
+
+    // The theme travels with the session so the page chrome agrees with the
     // highlighting the CLI already applied.
-    let theme = show.theme(config)?.to_owned();
-    let brief_pair = show.brief(config)?;
-    let (brief, brief_sources) = match brief_pair {
+    let theme = session.theme(config)?.to_owned();
+    let (brief, brief_sources) = match session.brief(config)? {
         Some((html, sources)) => (Some(html), sources),
         None => (None, Vec::new()),
     };
-
-    // Collect file labels for anchor printing (before content is moved).
-    let file_labels: Vec<String> = match &content {
-        Content::Code { files } => files.iter().map(|f| f.label.clone()).collect(),
-        Content::Diff { files } => files.iter().map(|f| f.label.clone()).collect(),
-        Content::Docs { files } => files.iter().map(|f| f.label.clone()).collect(),
-        _ => Vec::new(),
-    };
-
-    // Reject duplicate/colliding anchors before creating the session. Two files
-    // that normalize to the same #f- anchor would break page navigation and
-    // guided-review links.
-    if !file_labels.is_empty()
-        && let Err(msg) = wdyt::validate_file_anchors(&file_labels)
-    {
-        anyhow::bail!("{msg}");
-    }
-
+    let client = Client::new(config);
     let id = client
         .create(wdyt::server::CreateSession {
-            note: show.note.clone(),
+            note: session.note.clone(),
             theme: Some(theme),
             brief,
             brief_sources,
             ..wdyt::server::CreateSession::new(title.clone(), content)
         })
         .await?;
-    // Which agent is asking: with several running there is otherwise nothing in
-    // the notification to say which pane to go back to.
-    let mut details = details;
-    if let Some(origin) = wdyt::zellij_origin::Origin::detect().summary() {
-        details.push(origin);
-    }
-    // The daemon's port is discovered, not assumed: the range is chosen for
-    // being forwarded, which also means other servers are already in it.
     let url = client.session_url(&id).await?;
+    Ok(CreatedContent {
+        id,
+        url,
+        title,
+        kind,
+        file_labels,
+    })
+}
 
+async fn create_content(
+    config: &Config,
+    session: SessionArgs,
+    prepared: PreparedContent,
+) -> Result<()> {
+    let created = register_content(config, &session, prepared).await?;
+    let output = CreatedOutput {
+        id: created.id.clone(),
+        url: created.url,
+        title: created.title,
+        kind: created.kind,
+    };
+    println!("{}", serde_json::to_string(&output)?);
+    print_file_anchors(&created.file_labels);
+    eprintln!(
+        "wdyt: session {} created (not notified; not waiting)",
+        created.id
+    );
+    Ok(())
+}
+
+async fn present_sessions(config: &Config, ids: Vec<String>, present: PresentArgs) -> Result<()> {
+    let do_wait = present.should_wait();
+    let timeout = present.timeout;
+    let no_notify = present.no_notify;
+    let client = Client::new(config);
+    let prepared = client.prepare_presentation(&ids).await?;
+    let ids = prepared.ids;
+    let url = prepared.url;
+    let owner = ids
+        .first()
+        .expect("presentation preparation requires at least one ID")
+        .clone();
+    let title = present.title.unwrap_or_else(|| {
+        format!(
+            "{} wdyt {}",
+            ids.len(),
+            if ids.len() == 1 {
+                "session"
+            } else {
+                "sessions"
+            }
+        )
+    });
     let notification = Notification {
         title,
-        note: show.note,
+        note: present.note,
         url: url.clone(),
-        kind,
-        details,
+        kind: "presentation",
+        details: vec![summarize(ids.len(), "tab")],
     };
+    let sent = send_notification(config, no_notify, &notification).await?;
 
-    let webhook = (!no_notify)
-        .then_some(config.webhook_url.as_deref())
-        .flatten();
-    let sent = notification.send(webhook, &config.webhook_field).await?;
-
-    // The URL always goes to stdout so the agent can quote it back to the user
-    // even when a notification went out.
-    println!("{url}");
-    // Flush stdout before blocking so a downstream reader gets the URL
-    // immediately even when stdout is piped (and therefore fully buffered).
-    use std::io::Write as _;
-    std::io::stdout()
-        .flush()
-        .context("failed to flush session URL to stdout")?;
-
+    print_and_flush_url(&url)?;
     if !sent {
-        if no_notify {
-            eprintln!("wdyt: session {id} ready (notification skipped)");
-        } else {
-            eprintln!("wdyt: session {id} ready (no webhook configured)");
-        }
-    }
-
-    // Print file anchors to stderr so agents know how to link in --brief.
-    if !file_labels.is_empty() {
-        eprintln!("wdyt: file anchors for --brief links:");
-        for label in &file_labels {
-            eprintln!("  {} → #{}", label, wdyt::file_anchor(label));
-        }
-        // GitHub-style line spans hang off the same anchor, so an agent can
-        // point the reader at an exact passage rather than a whole file.
-        if let Some(label) = file_labels.first() {
-            let a = wdyt::file_anchor(label);
-            eprintln!(
-                "  add -L<start> or -L<start>-L<end> for a line span, e.g. #{a}-L10 or #{a}-L10-L20"
-            );
-        }
+        print_notification_status(no_notify);
     }
 
     if do_wait {
-        match timeout {
-            Some(seconds) => eprintln!("wdyt: waiting up to {seconds}s for a reply…"),
-            None => eprintln!("wdyt: waiting for a reply…"),
-        }
-        match client.wait(&id, timeout_duration(timeout)).await? {
-            Some(reply) => {
-                println!("{}", serde_json::to_string_pretty(&reply)?);
-                // Receiving it is not reading it, and the page says so until an
-                // ack arrives. Prompt for one rather than leaving the user
-                // looking at an amber dot.
-                eprintln!(
-                    "wdyt: reply received. Run `wdyt collect {id}` for line comments, then:\n  \
-                     wdyt ack {id} \"<what you are doing>\"\n  \
-                     wdyt recv {id}       # answer questions left on lines, as they come"
-                );
-            }
-            None => {
-                // The wait gave up, but the session has not: the daemon holds
-                // the reply for as long as the session lives, so say where to
-                // find it rather than letting it look lost.
-                eprintln!(
-                    "wdyt: no reply within {}. The session stays open:\n  \
-                     wdyt collect {id}    # check for reply + comments later\n  \
-                     wdyt recv {id}       # wait for a question on a line\n  \
-                     wdyt inbox           # list all pending replies",
-                    timeout_label(timeout)
-                );
-                std::process::exit(2);
-            }
-        }
+        wait_for_presentation(&client, &owner, timeout, "presentation").await
     } else {
-        // --no-wait: brief guidance on what to do next.
         eprintln!(
-            "wdyt: session {id} created (not waiting). Later:\n  \
-             wdyt collect {id}    # the reply and any line comments\n  \
-             wdyt recv {id}       # block until a question is asked, then `wdyt say`"
+            "wdyt: presentation created (not waiting). The overall reply belongs to {owner}:\n  \
+             wdyt collect {owner}"
+        );
+        Ok(())
+    }
+}
+
+async fn send_notification(
+    config: &Config,
+    no_notify: bool,
+    notification: &Notification,
+) -> Result<bool> {
+    let webhook = (!no_notify)
+        .then_some(config.webhook_url.as_deref())
+        .flatten();
+    notification.send(webhook, &config.webhook_field).await
+}
+
+async fn wait_for_presentation(
+    client: &Client,
+    owner: &str,
+    timeout: Option<u64>,
+    label: &str,
+) -> Result<()> {
+    match timeout {
+        Some(seconds) => eprintln!("wdyt: waiting up to {seconds}s for a reply…"),
+        None => eprintln!("wdyt: waiting for a reply…"),
+    }
+    match client.wait(owner, timeout_duration(timeout)).await? {
+        Some(reply) => {
+            println!("{}", serde_json::to_string_pretty(&reply)?);
+            eprintln!(
+                "wdyt: reply received. Run `wdyt collect {owner}` for line comments, then:\n  \
+                 wdyt ack {owner} \"<what you are doing>\"\n  \
+                 wdyt recv {owner}       # answer questions left on lines, as they come"
+            );
+            Ok(())
+        }
+        None => {
+            eprintln!(
+                "wdyt: no reply within {}. The {label} stays open:\n  \
+                 wdyt collect {owner}    # check for reply + comments later\n  \
+                 wdyt recv {owner}       # wait for a question on a line\n  \
+                 wdyt inbox              # list all pending replies",
+                timeout_label(timeout)
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+fn content_file_labels(content: &Content) -> Vec<String> {
+    match content {
+        Content::Code { files } => files.iter().map(|file| file.label.clone()).collect(),
+        Content::Diff { files } => files.iter().map(|file| file.label.clone()).collect(),
+        Content::Docs { files } => files.iter().map(|file| file.label.clone()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn print_and_flush_url(url: &str) -> Result<()> {
+    println!("{url}");
+    use std::io::Write as _;
+    std::io::stdout()
+        .flush()
+        .context("failed to flush presentation URL to stdout")
+}
+
+fn print_notification_status(no_notify: bool) {
+    if no_notify {
+        eprintln!("wdyt: presentation ready (notification skipped)");
+    } else {
+        eprintln!("wdyt: presentation ready (no webhook configured)");
+    }
+}
+
+fn print_file_anchors(file_labels: &[String]) {
+    if file_labels.is_empty() {
+        return;
+    }
+    eprintln!("wdyt: file anchors for --brief links:");
+    for label in file_labels {
+        eprintln!("  {} → #{}", label, wdyt::file_anchor(label));
+    }
+    if let Some(label) = file_labels.first() {
+        let anchor = wdyt::file_anchor(label);
+        eprintln!(
+            "  add -L<start> or -L<start>-L<end> for a line span, \
+             e.g. #{anchor}-L10 or #{anchor}-L10-L20"
         );
     }
-    Ok(())
 }
 
 /// A CLI `--timeout` in seconds as a `Duration`, or `None` to wait forever.
@@ -981,36 +1165,50 @@ fn parse_range(value: &str) -> Result<(u16, u16)> {
     Ok((low, high))
 }
 
-/// The wdyt SKILL.md, embedded at compile time.
-const SKILL_MD: &str = include_str!("../skill/SKILL.md");
+/// Agent skills embedded at compile time so `cargo install wdyt` is sufficient.
+const SKILLS: &[(&str, &str)] = &[
+    ("wdyt", include_str!("../skill/SKILL.md")),
+    (
+        "presenting-code-changes",
+        include_str!("../skill/presenting-code-changes/SKILL.md"),
+    ),
+    (
+        "presenting-designs",
+        include_str!("../skill/presenting-designs/SKILL.md"),
+    ),
+];
 
 /// Install the bundled skill into the appropriate directories.
 fn install_skill(global: bool) -> Result<()> {
-    let targets: Vec<PathBuf> = if global {
+    let roots: Vec<PathBuf> = if global {
         let home = directories::BaseDirs::new().context("cannot determine home directory")?;
         let home = home.home_dir();
         vec![
-            home.join(".kiro/skills/wdyt"),
-            home.join(".claude/skills/wdyt"),
-            home.join(".codex/skills/wdyt"),
-            home.join(".config/agents/skills/wdyt"),
+            home.join(".kiro/skills"),
+            home.join(".claude/skills"),
+            home.join(".codex/skills"),
+            home.join(".config/agents/skills"),
         ]
     } else {
         let cwd = std::env::current_dir().context("cannot determine working directory")?;
         vec![
-            cwd.join(".kiro/skills/wdyt"),
-            cwd.join(".claude/skills/wdyt"),
-            cwd.join(".codex/skills/wdyt"),
-            cwd.join(".agents/skills/wdyt"),
+            cwd.join(".kiro/skills"),
+            cwd.join(".claude/skills"),
+            cwd.join(".codex/skills"),
+            cwd.join(".agents/skills"),
         ]
     };
 
     let mut installed = Vec::new();
-    for dir in &targets {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let dest = dir.join("SKILL.md");
-        std::fs::write(&dest, SKILL_MD).with_context(|| format!("writing {}", dest.display()))?;
-        installed.push(dest);
+    for root in &roots {
+        for (name, contents) in SKILLS {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            let dest = dir.join("SKILL.md");
+            std::fs::write(&dest, contents)
+                .with_context(|| format!("writing {}", dest.display()))?;
+            installed.push(dest);
+        }
     }
 
     for path in &installed {
@@ -1021,7 +1219,7 @@ fn install_skill(global: bool) -> Result<()> {
     } else {
         "in this project"
     };
-    eprintln!("wdyt: skill installed {scope}. Agents will now know how to use wdyt.");
+    eprintln!("wdyt: skills installed {scope}. Agents will now know how to use wdyt.");
     Ok(())
 }
 
@@ -1054,172 +1252,134 @@ mod tests {
     }
 
     #[test]
+    fn installer_bundles_mechanics_code_and_design_skills() {
+        let names = SKILLS.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["wdyt", "presenting-code-changes", "presenting-designs"]
+        );
+        assert!(
+            SKILLS
+                .iter()
+                .all(|(_, contents)| contents.starts_with("---"))
+        );
+        assert!(
+            SKILLS[1]
+                .1
+                .contains("Present changes in this order: Carefully explain")
+        );
+    }
+
+    #[test]
     fn parse_range_rejects_bad_input() {
         assert_eq!(parse_range("3000-3010").unwrap(), (3000, 3010));
         assert!(parse_range("3000").is_err());
         assert!(parse_range("3010-3000").is_err());
     }
 
-    // — Parser tests for --no-wait / --wait on every content command —
+    #[test]
+    fn create_and_present_commands_parse() {
+        match Cli::parse_from(["wdyt", "create", "code", "f.rs", "--title", "API"]).command {
+            Command::Create {
+                content: CreateCommand::Code { files, session },
+            } => {
+                assert_eq!(files, [PathBuf::from("f.rs")]);
+                assert_eq!(session.title.as_deref(), Some("API"));
+            }
+            _ => panic!("expected create code"),
+        }
 
-    /// Helper: parse CLI args and extract the ShowArgs.
-    fn parse_show(args: &[&str]) -> ShowArgs {
-        let cli = Cli::parse_from(args);
-        match cli.command {
-            Command::Code { show, .. } => show,
-            Command::Diff { show, .. } => show,
-            Command::Docs { show, .. } => show,
-            Command::Dir { show, .. } => show,
-            Command::Demo { show, .. } => show,
-            _ => panic!("not a content command"),
+        match Cli::parse_from([
+            "wdyt",
+            "create",
+            "guided-diff",
+            "REVIEW.md",
+            "--patch",
+            "changes.patch",
+            "--title",
+            "Review",
+        ])
+        .command
+        {
+            Command::Create {
+                content:
+                    CreateCommand::GuidedDiff {
+                        review,
+                        patch,
+                        session,
+                    },
+            } => {
+                assert_eq!(review, PathBuf::from("REVIEW.md"));
+                assert_eq!(patch, PathBuf::from("changes.patch"));
+                assert_eq!(session.title.as_deref(), Some("Review"));
+            }
+            _ => panic!("expected create guided-diff"),
+        }
+
+        match Cli::parse_from(["wdyt", "present", "abc123", "def456", "--timeout", "30"]).command {
+            Command::Present { ids, present } => {
+                assert_eq!(ids, ["abc123", "def456"]);
+                assert_eq!(present.timeout, Some(30));
+                assert!(present.should_wait());
+            }
+            _ => panic!("expected present"),
         }
     }
 
     #[test]
-    fn code_waits_by_default() {
-        let show = parse_show(&["wdyt", "code", "f.rs"]);
-        assert!(show.should_wait());
+    fn only_create_exposes_content_modes() {
+        assert!(Cli::try_parse_from(["wdyt", "code", "f.rs"]).is_err());
+        assert!(Cli::try_parse_from(["wdyt", "diff", "p.patch"]).is_err());
+        assert!(Cli::try_parse_from(["wdyt", "docs", "README.md"]).is_err());
+        assert!(Cli::try_parse_from(["wdyt", "dir", "/tmp"]).is_err());
+        assert!(Cli::try_parse_from(["wdyt", "demo", "8080"]).is_err());
+        assert!(Cli::try_parse_from(["wdyt", "create", "code", "f.rs"]).is_ok());
+        match Cli::parse_from(["wdyt", "create", "guided-diff", "REVIEW.md"]).command {
+            Command::Create {
+                content: CreateCommand::GuidedDiff { patch, .. },
+            } => assert_eq!(patch, PathBuf::from("-")),
+            _ => panic!("expected create guided-diff"),
+        }
     }
 
     #[test]
-    fn code_no_wait_opts_out() {
-        let show = parse_show(&["wdyt", "code", "f.rs", "--no-wait"]);
-        assert!(!show.should_wait());
-    }
-
-    #[test]
-    fn code_legacy_wait_still_accepted() {
-        // --wait is silently accepted for backwards compat (it was the default).
-        let show = parse_show(&["wdyt", "code", "f.rs", "--wait"]);
-        assert!(show.should_wait());
-    }
-
-    #[test]
-    fn diff_waits_by_default() {
-        let show = parse_show(&["wdyt", "diff", "p.patch"]);
-        assert!(show.should_wait());
-    }
-
-    #[test]
-    fn diff_no_wait_opts_out() {
-        let show = parse_show(&["wdyt", "diff", "--no-wait"]);
-        assert!(!show.should_wait());
-    }
-
-    #[test]
-    fn diff_legacy_wait_accepted() {
-        let show = parse_show(&["wdyt", "diff", "--wait"]);
-        assert!(show.should_wait());
-    }
-
-    #[test]
-    fn docs_waits_by_default() {
-        let show = parse_show(&["wdyt", "docs", "README.md"]);
-        assert!(show.should_wait());
-    }
-
-    #[test]
-    fn docs_no_wait_opts_out() {
-        let show = parse_show(&["wdyt", "docs", "README.md", "--no-wait"]);
-        assert!(!show.should_wait());
-    }
-
-    #[test]
-    fn docs_legacy_wait_accepted() {
-        let show = parse_show(&["wdyt", "docs", "README.md", "--wait"]);
-        assert!(show.should_wait());
-    }
-
-    #[test]
-    fn dir_waits_by_default() {
-        let show = parse_show(&["wdyt", "dir", "/tmp"]);
-        assert!(show.should_wait());
-    }
-
-    #[test]
-    fn dir_no_wait_opts_out() {
-        let show = parse_show(&["wdyt", "dir", "/tmp", "--no-wait"]);
-        assert!(!show.should_wait());
-    }
-
-    #[test]
-    fn dir_legacy_wait_accepted() {
-        let show = parse_show(&["wdyt", "dir", "/tmp", "--wait"]);
-        assert!(show.should_wait());
-    }
-
-    #[test]
-    fn demo_waits_by_default() {
-        let show = parse_show(&["wdyt", "demo", "8080"]);
-        assert!(show.should_wait());
-    }
-
-    #[test]
-    fn demo_no_wait_opts_out() {
-        let show = parse_show(&["wdyt", "demo", "8080", "--no-wait"]);
-        assert!(!show.should_wait());
-    }
-
-    #[test]
-    fn demo_legacy_wait_accepted() {
-        let show = parse_show(&["wdyt", "demo", "8080", "--wait"]);
-        assert!(show.should_wait());
-    }
-
-    #[test]
-    fn timeout_is_customisable() {
-        let show = parse_show(&["wdyt", "code", "f.rs", "--timeout", "30"]);
-        assert_eq!(show.timeout, Some(30));
-        assert!(show.should_wait());
-    }
-
-    #[test]
-    fn timeout_defaults_to_none_so_the_wait_sits_open() {
-        // No `--timeout` means wait forever, not the old 600s default.
-        let show = parse_show(&["wdyt", "code", "f.rs"]);
-        assert_eq!(show.timeout, None);
-        assert!(show.should_wait());
-    }
-
-    #[test]
-    fn no_wait_and_timeout_conflict() {
-        // --timeout explicitly supplied with --no-wait must be rejected.
-        let result = Cli::try_parse_from(["wdyt", "code", "f.rs", "--no-wait", "--timeout", "5"]);
-        assert!(result.is_err(), "--no-wait and --timeout should conflict");
-    }
-
-    #[test]
-    fn wait_and_no_wait_conflict() {
-        // --wait and --no-wait must be rejected.
-        let result = Cli::try_parse_from(["wdyt", "code", "f.rs", "--wait", "--no-wait"]);
-        assert!(result.is_err(), "--wait and --no-wait should conflict");
-    }
-
-    #[test]
-    fn no_wait_is_not_in_help() {
-        // --wait must be hidden; --no-wait must be visible.
-        use clap::CommandFactory;
-        let mut buf = Vec::new();
-        Cli::command()
-            .find_subcommand("code")
-            .unwrap()
-            .clone()
-            .write_help(&mut buf)
-            .unwrap();
-        let help = String::from_utf8(buf).unwrap();
-        assert!(help.contains("--no-wait"), "help should show --no-wait");
-        // --wait is hidden: it should NOT appear as its own option line.
-        // Check that no line starts with a --wait option description (lines
-        // that only mention --no-wait are fine).
-        let has_wait_option_line = help.lines().any(|line| {
-            let trimmed = line.trim();
-            // An option line for --wait would start with "--wait" but NOT
-            // "--wait" as part of "--no-wait".
-            trimmed.starts_with("--wait") && !trimmed.starts_with("--no-wait")
-        });
+    fn create_has_no_presentation_flags() {
+        assert!(Cli::try_parse_from(["wdyt", "create", "code", "f.rs", "--no-wait"]).is_err());
+        assert!(Cli::try_parse_from(["wdyt", "create", "code", "f.rs", "--no-notify"]).is_err());
+        assert!(Cli::try_parse_from(["wdyt", "create", "code", "f.rs", "--timeout", "5"]).is_err());
         assert!(
-            !has_wait_option_line,
-            "--wait should be hidden from help output:\n{help}"
+            Cli::try_parse_from([
+                "wdyt",
+                "create",
+                "guided-diff",
+                "REVIEW.md",
+                "--brief",
+                "duplicate narrative"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "wdyt",
+                "create",
+                "guided-diff",
+                "REVIEW.md",
+                "--brief-file",
+                "BRIEF.md"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn present_wait_controls_are_consistent() {
+        match Cli::parse_from(["wdyt", "present", "abc123", "--no-wait"]).command {
+            Command::Present { present, .. } => assert!(!present.should_wait()),
+            _ => panic!("expected present"),
+        }
+        assert!(
+            Cli::try_parse_from(["wdyt", "present", "abc123", "--no-wait", "--timeout", "5"])
+                .is_err()
         );
     }
 
@@ -1266,7 +1426,8 @@ mod tests {
 
     #[test]
     fn collect_no_wait_and_timeout_conflict() {
-        let result = Cli::try_parse_from(["wdyt", "collect", "abc123", "--no-wait", "--timeout", "5"]);
+        let result =
+            Cli::try_parse_from(["wdyt", "collect", "abc123", "--no-wait", "--timeout", "5"]);
         assert!(result.is_err(), "--no-wait and --timeout should conflict");
     }
 

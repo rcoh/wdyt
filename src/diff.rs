@@ -222,13 +222,19 @@ const MAX_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 /// disagreement the file is simply not expandable, which the page then does not
 /// offer.
 pub fn capture_sources(files: &mut [DiffFile]) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    capture_sources_in(files, &cwd);
+}
+
+/// Captures source relative to `workspace`, falling back to its Git root.
+pub fn capture_sources_in(files: &mut [DiffFile], workspace: &Path) {
     // The toplevel is only asked for if some file is not where the label says,
     // and then only once: `git diff` names paths from the repository root, so a
     // patch made in a subdirectory needs it, and a patch that is not from git at
     // all must not pay for it.
-    let mut toplevel = Toplevel::Unasked;
+    let mut toplevel = Toplevel::Unasked(workspace.to_path_buf());
     for file in files {
-        if let Some(lines) = read_source(&file.label, &mut toplevel) {
+        if let Some(lines) = read_source(&file.label, workspace, &mut toplevel) {
             attach_source(file, lines);
         }
     }
@@ -246,15 +252,16 @@ pub fn attach_source(file: &mut DiffFile, lines: Vec<String>) -> bool {
 }
 
 enum Toplevel {
-    Unasked,
+    Unasked(std::path::PathBuf),
     Known(Option<std::path::PathBuf>),
 }
 
 impl Toplevel {
     fn get(&mut self) -> Option<&std::path::Path> {
-        if let Self::Unasked = self {
+        if let Self::Unasked(cwd) = self {
             let found = std::process::Command::new("git")
                 .args(["rev-parse", "--show-toplevel"])
+                .current_dir(cwd)
                 .stdin(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .output()
@@ -268,29 +275,27 @@ impl Toplevel {
         }
         match self {
             Self::Known(path) => path.as_deref(),
-            Self::Unasked => None,
+            Self::Unasked(_) => None,
         }
     }
 }
 
 /// Reads a diffed file's lines, from the label as given or from the repository
 /// root the label is relative to.
-fn read_source(label: &str, toplevel: &mut Toplevel) -> Option<Vec<String>> {
+fn read_source(label: &str, workspace: &Path, toplevel: &mut Toplevel) -> Option<Vec<String>> {
     // A path that climbs out of the tree, or an absolute one, is not something a
     // diff of this repository should be naming; refuse rather than read it.
     let relative = Path::new(label);
     if relative.is_absolute() || relative.components().any(|c| c.as_os_str() == "..") {
         return None;
     }
-    let direct = relative.metadata().ok().filter(|m| m.is_file());
-    let (path, meta) = match direct {
-        Some(meta) => (relative.to_path_buf(), meta),
-        None => {
-            let root = toplevel.get()?.join(relative);
-            let meta = root.metadata().ok().filter(|m| m.is_file())?;
-            (root, meta)
-        }
+    let resolve = |root: &Path| {
+        let root = root.canonicalize().ok()?;
+        let path = root.join(relative).canonicalize().ok()?;
+        path.starts_with(&root).then_some(path)
     };
+    let path = resolve(workspace).or_else(|| resolve(toplevel.get()?))?;
+    let meta = path.metadata().ok().filter(|m| m.is_file())?;
     if meta.len() > MAX_SOURCE_BYTES {
         return None;
     }

@@ -22,6 +22,8 @@ pub enum Content {
     Diff { files: Vec<DiffFile> },
     /// Markdown, rendered.
     Docs { files: Vec<DocFile> },
+    /// An ordered review that interleaves prose, diff ranges, and code ranges.
+    Guided { blocks: Vec<GuidedBlock> },
     /// A directory served as-is.
     Static { root: PathBuf, entry: String },
     /// A server the agent started; wdyt frames it and adds the reply box.
@@ -34,6 +36,7 @@ impl Content {
             Self::Code { .. } => "code",
             Self::Diff { .. } => "diff",
             Self::Docs { .. } => "docs",
+            Self::Guided { .. } => "guided",
             Self::Static { .. } => "static",
             Self::Demo { .. } => "demo",
         }
@@ -49,9 +52,45 @@ impl Content {
     pub fn is_commentable(&self) -> bool {
         matches!(
             self,
-            Self::Diff { .. } | Self::Code { .. } | Self::Docs { .. }
+            Self::Diff { .. } | Self::Code { .. } | Self::Docs { .. } | Self::Guided { .. }
         )
     }
+}
+
+/// One ordered section of a guided review.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GuidedBlock {
+    /// Safe, rendered Markdown between structured directives.
+    Text {
+        html: String,
+        /// Original 1-based line where this Markdown section begins.
+        source_start: usize,
+        /// Authoritative Markdown lines, without trailing newlines.
+        sources: Vec<String>,
+    },
+    /// Lines selected from one side of a unified diff.
+    Diff {
+        /// The complete parsed file and any validated current-workspace source.
+        /// `selected_hunks` is initially visible; this full file lets the UI
+        /// reveal surrounding patch and source lines on demand.
+        file: DiffFile,
+        side: Side,
+        start: usize,
+        end: usize,
+        /// Selected lines grouped under their original hunk headers.
+        selected_hunks: Vec<Hunk>,
+    },
+    /// A highlighted range from the current workspace.
+    Code {
+        file: String,
+        language: String,
+        start: usize,
+        end: usize,
+        /// Highlighted HTML parallel to `sources`.
+        highlighted: Vec<String>,
+        /// Authoritative current-code lines, without trailing newlines.
+        sources: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,9 +278,8 @@ pub struct Anchor {
     pub file: String,
     /// Explicit comment target identity, separate from display label.
     ///
-    /// `Some("brief")` for the guided-review brief, `Some("doc:<n>")` for the
-    /// nth docs file. `None` for legacy code/diff comments where `file` alone
-    /// is sufficient.
+    /// `Some("brief")`, `Some("doc:<n>")`, or `Some("guided:<n>")` for
+    /// structured content. `None` for ordinary code/diff comments.
     pub target: Option<String>,
     /// The first line covered, on `side`.
     pub line: usize,
@@ -348,11 +386,8 @@ pub struct Comment {
     pub file: String,
     /// Explicit comment target identity, distinct from the display label.
     ///
-    /// For guided briefs: `"brief"`. For docs: `"doc:<index>"` where index is the
-    /// 0-based position in the files array. For code/diff: absent (legacy
-    /// identity uses `file`). This lets the agent distinguish comments on files
-    /// with duplicate labels, and disambiguates the guided-review brief from a
-    /// doc file that happens to be named `"brief:"`.
+    /// `"brief"`, `"doc:<index>"`, or `"guided:<index>"`. Ordinary code/diff
+    /// identity uses `file`. This distinguishes repeated labels and blocks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// The first line the comment covers, on `side`.

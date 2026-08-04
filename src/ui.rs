@@ -106,6 +106,11 @@ header.bar .origin .cwd {{
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   max-width: 30ch; direction: rtl; text-align: left;
 }}
+@media (max-width: 600px) {{
+  header.bar {{ align-items: center; gap: 8px; padding: 10px 12px; }}
+  header.bar h1 {{ min-width: 0; flex: 1 1 auto; }}
+  header.bar .spacer, header.bar .origin {{ display: none; }}
+}}
 .kind {{
   font: 11px/1 ui-monospace, monospace; text-transform: uppercase;
   padding: 4px 7px; border: 1px solid var(--border-strong); border-radius: 4px;
@@ -114,6 +119,77 @@ header.bar .origin .cwd {{
 
 main {{ flex: 1 1 auto; min-height: 0; }}
 .wrap {{ max-width: 1100px; margin: 0 auto; padding: 24px 20px 96px; }}
+
+/* Session picker ---------------------------------------------------------- */
+.session-picker {{ max-width: 900px; }}
+.session-picker form {{ display: flex; flex-direction: column; min-height: 240px; }}
+.session-list {{ list-style: none; padding: 0; margin: 0; }}
+.session-list li {{
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center; gap: 12px;
+  padding: 12px 0; border-bottom: 1px solid var(--border);
+}}
+.session-list input {{ width: 16px; height: 16px; accent-color: var(--accent); }}
+.session-list label {{
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-weight: 600; cursor: pointer;
+}}
+.session-list .direct {{ font-size: 12px; white-space: nowrap; }}
+.picker-actions {{
+  position: sticky; bottom: 0;
+  display: flex; justify-content: flex-end;
+  padding: 14px 0; margin-top: auto;
+  background: color-mix(in srgb, var(--bg) 94%, transparent);
+}}
+.picker-actions button {{
+  padding: 9px 14px; border: 1px solid var(--accent); border-radius: 6px;
+  background: var(--accent); color: #fff; font: 600 13px/1 ui-sans-serif, system-ui, sans-serif;
+  cursor: pointer;
+}}
+.picker-actions button:disabled {{ opacity: .45; cursor: default; }}
+
+/* Grouped sessions -------------------------------------------------------- */
+html:has(body.grouped), body.grouped {{ height: 100%; overflow: hidden; }}
+body.grouped main {{ display: flex; overflow: hidden; }}
+.tabbed-review {{
+  display: flex; flex: 1 1 auto; flex-direction: column;
+  width: 100%; min-width: 0; min-height: 0;
+}}
+.review-tabs {{
+  display: flex; flex: 0 0 auto; gap: 2px;
+  min-width: 0; padding: 8px 12px 0;
+  overflow-x: auto; overflow-y: hidden;
+  border-bottom: 1px solid var(--border);
+  background: var(--raised);
+  scrollbar-width: thin;
+}}
+.review-tabs [role="tab"] {{
+  flex: 0 0 auto; max-width: min(320px, 72vw);
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 9px 11px; margin-bottom: -1px;
+  border: 1px solid transparent; border-bottom-color: var(--border);
+  border-radius: 6px 6px 0 0;
+  background: transparent; color: var(--muted);
+  font: 13px/1.2 ui-sans-serif, system-ui, sans-serif;
+  cursor: pointer;
+}}
+.review-tabs [role="tab"] .tab-title {{
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}}
+.review-tabs [role="tab"] .kind {{ font-size: 9px; flex: 0 0 auto; }}
+.review-tabs [role="tab"][aria-selected="true"] {{
+  background: var(--surface); color: var(--fg);
+  border-color: var(--border); border-bottom-color: var(--surface);
+}}
+.review-tabs [role="tab"]:focus-visible {{
+  outline: 2px solid var(--accent); outline-offset: -2px;
+}}
+.review-panel {{ flex: 1 1 auto; min-width: 0; min-height: 0; }}
+.review-panel[hidden] {{ display: none; }}
+.review-frame {{
+  display: block; width: 100%; height: 100%; min-height: 0;
+  border: 0; background: var(--bg);
+}}
 
 /* File list --------------------------------------------------------------- */
 /* Sticky, because on a long diff this is the only way to jump between files: a
@@ -252,6 +328,16 @@ section.brief > :last-child {{ margin-bottom: 0; }}
 /* A framed page does not scroll, so an unbounded brief would push the iframe out
    of view entirely. It scrolls within itself instead. */
 body.framed section.brief {{ max-height: 30vh; overflow-y: auto; }}
+
+/* Guided content ---------------------------------------------------------- */
+.guided-review {{ display: flex; flex-direction: column; gap: 26px; }}
+.guided-review > .doc {{
+  padding: 0; max-width: 74ch; border-bottom: 0;
+}}
+.guided-review > section.file {{ margin-bottom: 0; }}
+.guided-review .guided-range {{
+  color: var(--muted); font: 11px/1 ui-monospace, monospace;
+}}
 
 /* Code -------------------------------------------------------------------- */
 /* The card carries the syntax theme's own colours: the highlighting inside it
@@ -1103,6 +1189,146 @@ const REPLY_JS: &str = r#"
 })();
 "#;
 
+/// Enables the home page's native repeated-`s` form once at least one session
+/// is selected. The URL itself is built by the browser, so ordering and encoding
+/// follow ordinary form semantics.
+pub(crate) const SESSION_PICKER_JS: &str = r#"
+(function () {
+  var form = document.getElementById('session-picker');
+  if (!form) return;
+  var button = form.querySelector('button[type="submit"]');
+  var choices = form.querySelectorAll('input[name="s"]');
+  if (!button) return;
+  function update() {
+    var selected = false;
+    for (var i = 0; i < choices.length; i++) {
+      if (choices[i].checked) { selected = true; break; }
+    }
+    button.disabled = !selected;
+  }
+  form.addEventListener('change', update);
+  update();
+})();
+"#;
+
+/// Accessible tabs for a grouped review.
+///
+/// Inactive frames keep their URL in `data-src` until selected. Selection is
+/// mirrored to `?tab=<session>` so copying the URL and browser history both keep
+/// the same tab active without disturbing the ordered repeated `s` parameters.
+pub(crate) const TABS_JS: &str = r#"
+(function () {
+  var root = document.querySelector('[data-tabbed-review]');
+  if (!root) return;
+  var tabs = root.querySelectorAll('[role="tab"]');
+  var panels = root.querySelectorAll('[role="tabpanel"]');
+  if (!tabs.length || tabs.length !== panels.length) return;
+
+  function indexFromUrl() {
+    var selected = new URL(window.location.href).searchParams.get('tab');
+    if (!selected) return 0;
+    for (var i = 0; i < tabs.length; i++) {
+      if (tabs[i].getAttribute('data-session') === selected) return i;
+    }
+    return 0;
+  }
+
+  function select(index, historyMode, focus) {
+    if (index < 0 || index >= tabs.length) return;
+    for (var i = 0; i < tabs.length; i++) {
+      var active = i === index;
+      tabs[i].setAttribute('aria-selected', active ? 'true' : 'false');
+      tabs[i].tabIndex = active ? 0 : -1;
+      panels[i].hidden = !active;
+    }
+    var frame = panels[index].querySelector('iframe');
+    if (frame && !frame.getAttribute('src')) {
+      frame.setAttribute('src', frame.getAttribute('data-src') + window.location.hash);
+    }
+    if (frame && frame.contentWindow && window.location.hash) {
+      frame.contentWindow.postMessage({ type: 'wdyt:set-fragment', hash: window.location.hash }, '*');
+    }
+    if (focus) tabs[index].focus();
+    if (historyMode) {
+      var url = new URL(window.location.href);
+      url.searchParams.set('tab', tabs[index].getAttribute('data-session'));
+      history[historyMode + 'State']({ tab: index }, '', url);
+    }
+  }
+
+  window.addEventListener('message', function (event) {
+    if (!event.data || event.data.type !== 'wdyt:fragment') return;
+    for (var i = 0; i < panels.length; i++) {
+      var frame = panels[i].querySelector('iframe');
+      if (!frame || frame.contentWindow !== event.source) continue;
+      var url = new URL(window.location.href);
+      url.searchParams.set('tab', tabs[i].getAttribute('data-session'));
+      url.hash = event.data.hash || '';
+      history.replaceState({ tab: i }, '', url);
+      return;
+    }
+  });
+
+  window.addEventListener('hashchange', function () {
+    var selected = indexFromUrl();
+    var frame = panels[selected].querySelector('iframe');
+    if (frame && frame.contentWindow) {
+      frame.contentWindow.postMessage({ type: 'wdyt:set-fragment', hash: window.location.hash }, '*');
+    }
+  });
+
+  for (var i = 0; i < tabs.length; i++) {
+    (function (index) {
+      var frame = panels[index].querySelector('iframe');
+      if (frame) frame.addEventListener('load', function () {
+        if (window.location.hash && frame.contentWindow) {
+          frame.contentWindow.postMessage(
+            { type: 'wdyt:set-fragment', hash: window.location.hash }, '*');
+        }
+      });
+      tabs[index].addEventListener('click', function () {
+        select(index, 'push', false);
+      });
+      tabs[index].addEventListener('keydown', function (event) {
+        var next = null;
+        if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+        if (event.key === 'ArrowLeft') next = (index + tabs.length - 1) % tabs.length;
+        if (event.key === 'Home') next = 0;
+        if (event.key === 'End') next = tabs.length - 1;
+        if (next == null) return;
+        event.preventDefault();
+        select(next, 'push', true);
+      });
+    })(i);
+  }
+
+  window.addEventListener('popstate', function () {
+    select(indexFromUrl(), null, false);
+  });
+  select(indexFromUrl(), null, false);
+})();
+"#;
+
+const EMBEDDED_BRIDGE_JS: &str = r#"
+(function () {
+  function report() {
+    if (window.parent !== window) {
+      window.parent.postMessage({ type: 'wdyt:fragment', hash: window.location.hash }, '*');
+    }
+  }
+  window.addEventListener('hashchange', report);
+  window.addEventListener('popstate', report);
+  document.addEventListener('click', function () { setTimeout(report, 0); });
+  document.addEventListener('mouseup', function () { setTimeout(report, 0); });
+  window.addEventListener('message', function (event) {
+    if (!event.data || event.data.type !== 'wdyt:set-fragment') return;
+    var hash = event.data.hash || '';
+    if (window.location.hash !== hash) window.location.hash = hash;
+  });
+  report();
+})();
+"#;
+
 /// Showing and hiding the top bar.
 ///
 /// The preference is remembered because someone who wants the chrome gone
@@ -1270,12 +1496,14 @@ pub(crate) const COMMENT_JS: &str = r#"
   function siblings(button) {
     var file = button.getAttribute('data-file');
     var side = button.getAttribute('data-side');
-    var key = side + '\u0000' + file;
+    var target = button.getAttribute('data-target') || '';
+    var key = target + '\u0000' + side + '\u0000' + file;
     if (siblingCache[key]) return siblingCache[key];
     var all = root.querySelectorAll('.addnote');
     var rows = [];
     for (var i = 0; i < all.length; i++) {
       if (all[i].getAttribute('data-file') === file &&
+          (all[i].getAttribute('data-target') || '') === target &&
           all[i].getAttribute('data-side') === side) {
         rows.push(all[i]);
       }
@@ -1329,6 +1557,8 @@ pub(crate) const COMMENT_JS: &str = r#"
     // meaning, and the server would reject it anyway.
     if (!button
         || button.getAttribute('data-file') !== drag.from.getAttribute('data-file')
+        || (button.getAttribute('data-target') || '') !==
+           (drag.from.getAttribute('data-target') || '')
         || button.getAttribute('data-side') !== drag.from.getAttribute('data-side')) return;
     // Still over the row the last move already drew: redrawing it would retint
     // the same rows and repaint the table for nothing, several times a second.
@@ -1438,7 +1668,7 @@ pub(crate) const COMMENT_JS: &str = r#"
     if (!reopen) return;
 
     // Update the URL fragment to the selection so the range is copyable.
-    var filePath = from.getAttribute('data-file');
+    var filePath = from.getAttribute('data-target') || from.getAttribute('data-file');
     var side = from.getAttribute('data-side');
     var frag = selFragment(filePath, side, lo, hi);
     history.replaceState(null, '', '#' + frag);
@@ -1498,6 +1728,7 @@ pub(crate) const COMMENT_JS: &str = r#"
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           file: from.getAttribute('data-file'),
+          target: from.getAttribute('data-target') || null,
           line: lo,
           end_line: hi,
           side: from.getAttribute('data-side'),
@@ -1601,7 +1832,42 @@ pub(crate) const EXPAND_JS: &str = r##"
 
   // A revealed line looks exactly like a context line the patch did include,
   // because that is what it is: same columns, same comment affordance.
-  function contextRow(line, file) {
+  function threadNode(comment) {
+    var note = document.createElement('div');
+    note.className = 'note';
+    note.id = 'comment-' + comment.id;
+    note.setAttribute('data-thread', comment.id);
+    var who = document.createElement('span');
+    who.className = 'who';
+    who.textContent = 'you';
+    note.appendChild(who);
+    var link = document.createElement('a');
+    link.className = 'permalink';
+    link.href = '#comment-' + comment.id;
+    link.title = 'Link to this comment';
+    link.textContent = '#';
+    note.appendChild(link);
+    note.appendChild(document.createTextNode(comment.text));
+    for (var i = 0; i < comment.replies.length; i++) {
+      var message = comment.replies[i];
+      var said = document.createElement('div');
+      said.className = 'said ' + message.from;
+      said.setAttribute('data-message', message.id);
+      var label = document.createElement('span');
+      label.className = 'who';
+      label.textContent = message.from === 'agent' ? 'agent' : 'you';
+      said.appendChild(label);
+      said.appendChild(document.createTextNode(message.text));
+      note.appendChild(said);
+    }
+    var foot = document.createElement('div');
+    foot.className = 'threadfoot';
+    note.appendChild(foot);
+    return note;
+  }
+
+  function contextRow(line, file, target) {
+    var fragment = document.createDocumentFragment();
     var row = document.createElement('tr');
     row.className = 'ctx';
     var old = document.createElement('td');
@@ -1617,6 +1883,7 @@ pub(crate) const EXPAND_JS: &str = r##"
     add.className = 'addnote';
     add.title = 'Comment on this line, or drag to cover more';
     add.setAttribute('data-file', file);
+    if (target) add.setAttribute('data-target', target);
     add.setAttribute('data-line', line.new);
     add.setAttribute('data-side', 'new');
     add.textContent = '+';
@@ -1632,7 +1899,23 @@ pub(crate) const EXPAND_JS: &str = r##"
     row.appendChild(old);
     row.appendChild(current);
     row.appendChild(code);
-    return row;
+    fragment.appendChild(row);
+    if (line.comments && line.comments.length) {
+      var notes = document.createElement('tr');
+      notes.className = 'notes';
+      var gutter = document.createElement('td');
+      gutter.className = 'ln';
+      gutter.colSpan = 2;
+      var cell = document.createElement('td');
+      cell.className = 'code';
+      for (var i = 0; i < line.comments.length; i++) {
+        cell.appendChild(threadNode(line.comments[i]));
+      }
+      notes.appendChild(gutter);
+      notes.appendChild(cell);
+      fragment.appendChild(notes);
+    }
+    return fragment;
   }
 
   function reveal(band, take) {
@@ -1661,8 +1944,9 @@ pub(crate) const EXPAND_JS: &str = r##"
       })
       .then(function (data) {
         var rows = document.createDocumentFragment();
+        var target = band.getAttribute('data-target') || '';
         for (var i = 0; i < data.lines.length; i++) {
-          rows.appendChild(contextRow(data.lines[i], data.file));
+          rows.appendChild(contextRow(data.lines[i], data.file, target));
         }
         // The band stays inside what is still hidden: lines taken from the top go
         // above it, lines taken from the bottom go below.
@@ -2070,7 +2354,8 @@ const FRAGMENT_JS: &str = r##"
     var found = false;
     for (var i = 0; i < buttons.length; i++) {
       var btn = buttons[i];
-      if (btn.getAttribute('data-file') !== sel.path) continue;
+      var identity = btn.getAttribute('data-target') || btn.getAttribute('data-file');
+      if (identity !== sel.path) continue;
       if (btn.getAttribute('data-side') !== sel.side) continue;
       var n = parseInt(btn.getAttribute('data-line'), 10);
       if (n >= sel.start && n <= sel.end) {
@@ -2168,7 +2453,7 @@ const FRAGMENT_JS: &str = r##"
       var btn = row.querySelector('.addnote');
       if (!btn) return;
       e.preventDefault();
-      var path = btn.getAttribute('data-file');
+      var path = btn.getAttribute('data-target') || btn.getAttribute('data-file');
       var side = btn.getAttribute('data-side');
       var line = btn.getAttribute('data-line');
       var frag = selFragment(path, side, parseInt(line, 10));
@@ -2270,6 +2555,8 @@ pub(crate) const DOC_COMMENT_JS: &str = r##"
     (function (root) {
       var docFile = root.getAttribute('data-doc-file');
       var docTarget = root.getAttribute('data-doc-target') || docFile;
+      var lineOffset = parseInt(root.getAttribute('data-doc-line-offset') || '0', 10);
+      if (!Number.isFinite(lineOffset) || lineOffset < 0) lineOffset = 0;
       var session = findSession(root);
       if (!session) return;
 
@@ -2348,7 +2635,11 @@ pub(crate) const DOC_COMMENT_JS: &str = r##"
       for (var i = 0; i < blocks.length; i++) {
         var sp = parseSourcepos(blocks[i].getAttribute('data-sourcepos'));
         if (sp && safeLineNo(sp.startLine) && safeLineNo(sp.endLine)) {
-          rangeToBlock[sp.startLine + ':' + sp.endLine] = blocks[i];
+          if (lineOffset === 0) {
+            rangeToBlock[sp.startLine + ':' + sp.endLine] = blocks[i];
+          } else {
+            rangeToBlock[(sp.startLine + lineOffset) + ':' + (sp.endLine + lineOffset)] = blocks[i];
+          }
         }
       }
 
@@ -2367,8 +2658,8 @@ pub(crate) const DOC_COMMENT_JS: &str = r##"
         (function (block) {
           var sp = parseSourcepos(block.getAttribute('data-sourcepos'));
           if (!sp) return;
-          var startLine = safeLineNo(sp.startLine);
-          var endLine = safeLineNo(sp.endLine);
+          var startLine = safeLineNo(sp.startLine + lineOffset);
+          var endLine = safeLineNo(sp.endLine + lineOffset);
           if (!startLine) return;
 
           // Make the block a positioned ancestor for the button.
@@ -2508,13 +2799,18 @@ pub(crate) const DOC_COMMENT_JS: &str = r##"
       // The brief has no source path a reader would link to by file anchor.
       if (!docFile || docFile === 'brief:') continue;
       if (fileAnchor(docFile) !== fl.anchor) continue;
+      var lineOffset = parseInt(root.getAttribute('data-doc-line-offset') || '0', 10);
+      if (!Number.isFinite(lineOffset) || lineOffset < 0) lineOffset = 0;
       var children = root.children;
       for (var ci = 0; ci < children.length; ci++) {
         var child = children[ci];
         var sp = parseSourcepos(child.getAttribute ? child.getAttribute('data-sourcepos') : null);
         if (!sp) continue;
         // Overlap between the block's source span and the requested one.
-        if (sp.startLine <= fl.end && sp.endLine >= fl.start) {
+        var overlaps = lineOffset === 0
+          ? sp.startLine <= fl.end && sp.endLine >= fl.start
+          : sp.startLine + lineOffset <= fl.end && sp.endLine + lineOffset >= fl.start;
+        if (overlaps) {
           // Instant jump for a hand-written deep link (see FRAGMENT_JS).
           child.scrollIntoView({ block: 'center', behavior: 'auto' });
           child.classList.add('sel-highlight');
@@ -2692,15 +2988,26 @@ pub async fn thread(comment: &Comment) -> Result {
 /// which the gutter already shows, and the reason to look at that row is to get
 /// the code the patch left out. Its trailing section heading — the function the
 /// hunk is in — is kept, since nothing else says that.
+pub(crate) struct DiffHunkContext<'a> {
+    pub(crate) before: Option<Gap>,
+    pub(crate) after: Option<Gap>,
+    pub(crate) target: Option<&'a str>,
+}
+
 #[component]
-pub async fn diff_hunk(
+pub(crate) async fn diff_hunk(
     file: &str,
     index: usize,
     hunk: &Hunk,
     comments: &[Comment],
-    gap_before: Option<Gap>,
-    gap_after: Option<Gap>,
+    context: DiffHunkContext<'_>,
 ) -> Result {
+    let DiffHunkContext {
+        before: gap_before,
+        after: gap_after,
+        target,
+    } = context;
+    let fragment_target = target.unwrap_or(file);
     // The section heading a `@@` line can carry — `@@ -1,5 +1,7 @@ fn foo()` — is
     // the one part of the header the gutter does not already say, so it survives
     // when an expander takes the row.
@@ -2722,8 +3029,9 @@ pub async fn diff_hunk(
                 _ => ("new", line.new),
             };
             let line_no = number.unwrap_or(0);
-            let mine =
-                |c: &&Comment| c.target.is_none() && c.file == file && c.side.as_str() == side;
+            let mine = |c: &&Comment| {
+                c.target.as_deref() == target && c.file == file && c.side.as_str() == side
+            };
             Row {
                 line: line.clone(),
                 side,
@@ -2755,6 +3063,7 @@ pub async fn diff_hunk(
                         class="gap"
                         data-file=(file)
                         data-index=(index)
+                        data-target=(target.unwrap_or(""))
                         data-from=(gap.from)
                         data-to=(gap.to)
                         data-place="before"
@@ -2780,7 +3089,7 @@ pub async fn diff_hunk(
                         <td class="ln old">
                             if let Some(n) = row.line.old {
                                 if row.side == "old" {
-                                    <a href=(format!("#{}", crate::fragment::line_fragment(file, "old", n)))>(n)</a>
+                                    <a href=(format!("#{}", crate::fragment::line_fragment(fragment_target, "old", n)))>(n)</a>
                                 } else {
                                     (n)
                                 }
@@ -2789,7 +3098,7 @@ pub async fn diff_hunk(
                         <td class="ln new">
                             if let Some(n) = row.line.new {
                                 if row.side == "new" {
-                                    <a href=(format!("#{}", crate::fragment::line_fragment(file, "new", n)))>(n)</a>
+                                    <a href=(format!("#{}", crate::fragment::line_fragment(fragment_target, "new", n)))>(n)</a>
                                 } else {
                                     (n)
                                 }
@@ -2802,6 +3111,7 @@ pub async fn diff_hunk(
                                 class="addnote"
                                 title="Comment on this line, or drag to cover more"
                                 data-file=(file)
+                                data-target=(target.unwrap_or(""))
                                 data-line=(row.line_no)
                                 data-side=(row.side)
                             >"+"</button>
@@ -2826,6 +3136,7 @@ pub async fn diff_hunk(
                         class="gap"
                         data-file=(file)
                         data-index=(index)
+                        data-target=(target.unwrap_or(""))
                         data-from=(gap.from)
                         data-to=(gap.to)
                         data-place="after"
@@ -2850,15 +3161,24 @@ pub async fn diff_hunk(
 /// three columns like the diff — a `colspan="2"` line-number cell plus the code
 /// cell — so the shared script's `colspan="2"` note rows line up.
 #[component]
-pub async fn code_file(file: &str, highlighted: &[String], comments: &[Comment]) -> Result {
+pub async fn code_file(
+    file: &str,
+    highlighted: &[String],
+    comments: &[Comment],
+    start: usize,
+    target: Option<&str>,
+) -> Result {
+    let fragment_target = target.unwrap_or(file);
     // Line numbers are 1-indexed and every line is addressable on the new side,
     // so the anchor work mirrors `diff_hunk` with the side fixed.
     let rows: Vec<CodeRow> = highlighted
         .iter()
         .enumerate()
         .map(|(index, html)| {
-            let line_no = index + 1;
-            let mine = |c: &&Comment| c.target.is_none() && c.file == file && c.side == Side::New;
+            let line_no = index + start;
+            let mine = |c: &&Comment| {
+                c.target.as_deref() == target && c.file == file && c.side == Side::New
+            };
             CodeRow {
                 line_no,
                 html: html.clone(),
@@ -2887,9 +3207,9 @@ pub async fn code_file(file: &str, highlighted: &[String], comments: &[Comment])
                     </tr>
                 }
                 for row in rows {
-                    <tr id=(format!("{}-L{}", crate::file_anchor(file), row.line_no)) class=(if row.in_range { "inrange" } else { "" })>
+                    <tr id=(format!("{}-L{}", crate::file_anchor(fragment_target), row.line_no)) class=(if row.in_range { "inrange" } else { "" })>
                         <td class="ln" colspan="2">
-                            <a href=(format!("#{}", crate::fragment::line_fragment(file, "new", row.line_no)))>(row.line_no)</a>
+                            <a href=(format!("#{}", crate::fragment::line_fragment(fragment_target, "new", row.line_no)))>(row.line_no)</a>
                         </td>
                         <td class="code">
                             // Drag from one `+` to another to comment on a range.
@@ -2898,6 +3218,7 @@ pub async fn code_file(file: &str, highlighted: &[String], comments: &[Comment])
                                 class="addnote"
                                 title="Comment on this line, or drag to cover more"
                                 data-file=(file)
+                                data-target=(target.unwrap_or(""))
                                 data-line=(row.line_no)
                                 data-side="new"
                             >"+"</button>
@@ -3115,6 +3436,8 @@ pub struct Page {
     pub hideable: bool,
     /// Whether the page has commentable lines, which need the comment script.
     pub commentable: bool,
+    /// Whether this document is inside a grouped review frame.
+    pub embedded: bool,
     /// Where the agent that made this session is running.
     pub origin: crate::zellij_origin::Origin,
 }
@@ -3131,6 +3454,7 @@ impl Page {
             body_class: None,
             hideable: false,
             commentable: false,
+            embedded: false,
             origin: crate::zellij_origin::Origin::default(),
         }
     }
@@ -3155,6 +3479,7 @@ pub async fn shell(
         body_class,
         hideable,
         commentable,
+        embedded,
         origin,
     } = page;
     view! {
@@ -3167,37 +3492,39 @@ pub async fn shell(
                 <style>(Raw(stylesheet(colors)))</style>
             </head>
             <body class=(body_class)>
-                <header class="bar">
-                    <span class="brand">"wdyt"</span>
-                    <h1>(title)</h1>
-                    if let Some(note) = note {
-                        <span class="note">(note)</span>
-                    }
-                    <span class="spacer"></span>
-                    // Which agent is asking. With several running at once the
-                    // title alone does not say, and the pane is where you go to
-                    // talk to it.
-                    if !origin.is_empty() {
-                        <span class="origin" title=(origin.pane.clone().unwrap_or_default())>
-                            if let Some(session) = origin.session.clone() {
-                                <span class="place">(session)</span>
-                                if let Some(tab) = origin.tab.clone() {
-                                    <span class="sep">"›"</span>
-                                    <span class="place">(tab)</span>
+                if !embedded {
+                    <header class="bar">
+                        <span class="brand">"wdyt"</span>
+                        <h1>(title)</h1>
+                        if let Some(note) = note {
+                            <span class="note">(note)</span>
+                        }
+                        <span class="spacer"></span>
+                        // Which agent is asking. With several running at once the
+                        // title alone does not say, and the pane is where you go to
+                        // talk to it.
+                        if !origin.is_empty() {
+                            <span class="origin" title=(origin.pane.clone().unwrap_or_default())>
+                                if let Some(session) = origin.session.clone() {
+                                    <span class="place">(session)</span>
+                                    if let Some(tab) = origin.tab.clone() {
+                                        <span class="sep">"›"</span>
+                                        <span class="place">(tab)</span>
+                                    }
                                 }
-                            }
-                            if let Some(cwd) = origin.cwd.clone() {
-                                <span class="cwd">(cwd)</span>
-                            }
-                        </span>
-                    }
-                    <span class="kind">(kind)</span>
-                    if hideable {
-                        <button id="chrome-toggle" type="button" title="Hide this bar (.)">
-                            "Hide bar"
-                        </button>
-                    }
-                </header>
+                                if let Some(cwd) = origin.cwd.clone() {
+                                    <span class="cwd">(cwd)</span>
+                                }
+                            </span>
+                        }
+                        <span class="kind">(kind)</span>
+                        if hideable {
+                            <button id="chrome-toggle" type="button" title="Hide this bar (.)">
+                                "Hide bar"
+                            </button>
+                        }
+                    </header>
+                }
 
                 if let Some(subheader) = subheader {
                     (subheader)
@@ -3205,20 +3532,24 @@ pub async fn shell(
 
                 <main>(child)</main>
 
-                if hideable {
+                if hideable && !embedded {
                     <button id="chrome-show" type="button" title="Show the bar (.)">
                         "wdyt ▾"
                     </button>
                     <script>(Raw(CHROME_JS))</script>
                 }
 
-                // Jump-to-top: always rendered, shown by JS when scrolled down.
-                <button id="jump-top" type="button" aria-label="Jump to top" title="Back to top">
-                    "↑"
-                </button>
+                if !embedded {
+                    // Jump-to-top: shown by JS when scrolled down.
+                    <button id="jump-top" type="button" aria-label="Jump to top" title="Back to top">
+                        "↑"
+                    </button>
+                }
                 <script>(Raw(NAV_JS))</script>
 
-                reply_widget(session_id: &session_id, existing: existing_reply)
+                if !embedded {
+                    reply_widget(session_id: &session_id, existing: existing_reply)
+                }
 
                 if commentable {
                     <script>(Raw(COMMENT_JS))</script>
@@ -3226,6 +3557,10 @@ pub async fn shell(
                     <script>(Raw(THREAD_JS))</script>
                     <script>(Raw(DOC_COMMENT_JS))</script>
                     <script>(Raw(FRAGMENT_JS))</script>
+                }
+
+                if embedded {
+                    <script>(Raw(EMBEDDED_BRIDGE_JS))</script>
                 }
             </body>
         </html>

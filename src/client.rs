@@ -5,10 +5,16 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::config::Config;
-use crate::server::{
-    Comments, CreateSession, CreatedSession, Inbox, InboxItem, Received, Threads,
-};
+use crate::server::{Comments, CreateSession, CreatedSession, Inbox, InboxItem, Received, Threads};
 use crate::session::{Comment, Message, Reply};
+
+pub const MAX_PRESENTATION_TABS: usize = 12;
+const MAX_SESSION_ID_LEN: usize = 64;
+
+pub struct PreparedPresentation {
+    pub ids: Vec<String>,
+    pub url: String,
+}
 
 /// The `timeout_secs` query string for a long-poll, or an empty string when no
 /// timeout is set. Leaving it off tells the daemon to wait indefinitely.
@@ -17,6 +23,18 @@ fn timeout_query(timeout: Option<Duration>) -> String {
         Some(timeout) => format!("timeout_secs={}", timeout.as_secs()),
         None => String::new(),
     }
+}
+
+fn validate_session_id(id: &str) -> Result<()> {
+    anyhow::ensure!(
+        !id.is_empty()
+            && id.len() <= MAX_SESSION_ID_LEN
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+        "invalid session ID {id:?}: expected 1-{MAX_SESSION_ID_LEN} lowercase ASCII letters or digits"
+    );
+    Ok(())
 }
 
 pub struct Client {
@@ -111,6 +129,80 @@ impl Client {
     pub async fn session_url(&self, id: &str) -> Result<String> {
         let port = self.daemon_port().await.context("no daemon running")?;
         Ok(format!("http://{}:{port}/s/{id}", self.public_host))
+    }
+
+    /// Validates, de-duplicates, and resolves the sessions for a presentation.
+    ///
+    /// The returned IDs retain first-seen order. Every session is confirmed
+    /// through the daemon before the URL is made available to a caller.
+    pub async fn prepare_presentation(&self, ids: &[String]) -> Result<PreparedPresentation> {
+        let ids = Self::normalize_presentation_ids(ids)?;
+        let base = self.require_base().await?;
+        for id in &ids {
+            self.ensure_session_exists_at(&base, id).await?;
+        }
+        let port = self.daemon_port().await.context("no daemon running")?;
+        let query = ids
+            .iter()
+            .map(|id| format!("s={id}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        Ok(PreparedPresentation {
+            ids,
+            url: format!("http://{}:{port}/?{query}", self.public_host),
+        })
+    }
+
+    /// The browser URL for a verified presentation.
+    pub async fn presentation_url(&self, ids: &[String]) -> Result<String> {
+        Ok(self.prepare_presentation(ids).await?.url)
+    }
+
+    /// Confirms that `id` names a live session without changing its state.
+    pub async fn ensure_session_exists(&self, id: &str) -> Result<()> {
+        validate_session_id(id)?;
+        let base = self.require_base().await?;
+        self.ensure_session_exists_at(&base, id).await
+    }
+
+    /// Normalizes presentation IDs without contacting the daemon.
+    pub fn normalize_presentation_ids(ids: &[String]) -> Result<Vec<String>> {
+        anyhow::ensure!(
+            !ids.is_empty(),
+            "a presentation requires at least one session ID"
+        );
+        let mut normalized = Vec::with_capacity(ids.len().min(MAX_PRESENTATION_TABS));
+        for id in ids {
+            validate_session_id(id)?;
+            if normalized.iter().any(|seen| seen == id) {
+                continue;
+            }
+            anyhow::ensure!(
+                normalized.len() < MAX_PRESENTATION_TABS,
+                "a presentation supports at most {MAX_PRESENTATION_TABS} unique tabs"
+            );
+            normalized.push(id.clone());
+        }
+        Ok(normalized)
+    }
+
+    async fn ensure_session_exists_at(&self, base: &str, id: &str) -> Result<()> {
+        let response = self
+            .http
+            .get(format!("{base}/api/sessions/{id}/status"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .with_context(|| format!("could not verify session ID {id:?}"))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!("unknown session ID {id:?}");
+        }
+        anyhow::ensure!(
+            response.status().is_success(),
+            "daemon returned {} while checking session ID {id:?}",
+            response.status()
+        );
+        Ok(())
     }
 
     /// The port the daemon is on, if it is running.
@@ -458,4 +550,43 @@ fn daemon_log_path() -> std::path::PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!("wdyt-serve-{}-{nanos}.log", std::process::id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presentation_ids_are_deduplicated_in_first_seen_order() {
+        let ids = ["second", "first", "second", "third", "first"]
+            .map(str::to_owned)
+            .to_vec();
+        assert_eq!(
+            Client::normalize_presentation_ids(&ids).unwrap(),
+            ["second", "first", "third"]
+        );
+    }
+
+    #[test]
+    fn presentation_id_limits_are_enforced_after_deduplication() {
+        let mut ids = (0..MAX_PRESENTATION_TABS)
+            .map(|index| format!("id{index}"))
+            .collect::<Vec<_>>();
+        ids.push("id0".to_owned());
+        assert_eq!(
+            Client::normalize_presentation_ids(&ids).unwrap().len(),
+            MAX_PRESENTATION_TABS
+        );
+
+        ids.push("overflow".to_owned());
+        let error = Client::normalize_presentation_ids(&ids).unwrap_err();
+        assert!(error.to_string().contains("at most 12 unique tabs"));
+    }
+
+    #[test]
+    fn presentation_ids_are_length_bounded() {
+        let error =
+            Client::normalize_presentation_ids(&["a".repeat(MAX_SESSION_ID_LEN + 1)]).unwrap_err();
+        assert!(error.to_string().contains("1-64"));
+    }
 }

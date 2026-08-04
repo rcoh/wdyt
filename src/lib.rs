@@ -9,6 +9,7 @@ pub mod client;
 pub mod config;
 pub mod diff;
 pub mod fragment;
+pub mod guided;
 pub mod notify;
 pub mod ports;
 pub mod render;

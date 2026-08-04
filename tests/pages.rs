@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use wdyt::config::Config;
 use wdyt::render::{theme, theme_colors};
-use wdyt::session::{Content, Store};
+use wdyt::session::{Content, GuidedBlock, Store};
 
 /// Cross-process reservation for a test daemon port.
 ///
@@ -205,6 +205,77 @@ fn multi_file_diff_session(daemon: &Daemon) -> String {
     daemon.insert(Content::Diff { files })
 }
 
+fn titled_code_session(daemon: &Daemon, title: &str) -> String {
+    let file = wdyt::render::highlight("x.rs", "fn main() {}\n", theme("Nord")).unwrap();
+    daemon
+        .store
+        .insert(title.to_owned(), None, Content::Code { files: vec![file] })
+}
+
+fn guided_session(daemon: &Daemon) -> String {
+    let prose_source = "## Public API\n\nAPI narrative.\n";
+    let prose = wdyt::render::markdown_commentable("guided.md", prose_source, "Nord");
+
+    let code_source = "fn main() {\n    let value = 2;\n    println!(\"{value}\");\n}\n";
+    let code = wdyt::render::highlight("src/main.rs", code_source, theme("Nord")).unwrap();
+
+    const GUIDED_PATCH: &str = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,3 +3,3 @@
+ before
+-old value
++new value
+ after
+";
+    let mut files = wdyt::diff::parse(GUIDED_PATCH, theme("Nord")).unwrap();
+    assert!(wdyt::diff::attach_source(
+        &mut files[0],
+        vec![
+            "hidden one".to_owned(),
+            "hidden two".to_owned(),
+            "before".to_owned(),
+            "new value".to_owned(),
+            "after".to_owned(),
+            "hidden six".to_owned(),
+            "hidden seven".to_owned(),
+        ],
+    ));
+    let mut selected_hunks = files[0].hunks.clone();
+    selected_hunks[0]
+        .lines
+        .retain(|line| line.kind != wdyt::session::LineKind::Context);
+
+    daemon.store.insert(
+        "guided changes".to_owned(),
+        None,
+        Content::Guided {
+            blocks: vec![
+                GuidedBlock::Text {
+                    html: prose.html,
+                    source_start: 10,
+                    sources: prose.sources,
+                },
+                GuidedBlock::Diff {
+                    file: files.remove(0),
+                    side: wdyt::session::Side::New,
+                    start: 4,
+                    end: 4,
+                    selected_hunks,
+                },
+                GuidedBlock::Code {
+                    file: "src/main.rs".to_owned(),
+                    language: code.language,
+                    start: 2,
+                    end: 3,
+                    highlighted: code.highlighted[1..3].to_vec(),
+                    sources: code.sources[1..3].to_vec(),
+                },
+            ],
+        },
+    )
+}
+
 #[tokio::test]
 async fn the_index_has_no_reply_widget() {
     let daemon = Daemon::start().await;
@@ -212,6 +283,320 @@ async fn the_index_has_no_reply_widget() {
     assert_eq!(status, 200);
     // A widget here would POST to `/s//reply`: there is no session to reply to.
     assert!(!body.contains("id=\"reply\""), "{body}");
+}
+
+#[tokio::test]
+async fn the_index_composes_selected_sessions_and_keeps_direct_links() {
+    let daemon = Daemon::start().await;
+    let first = titled_code_session(&daemon, "first change");
+    let second = titled_code_session(&daemon, "second change");
+
+    let (status, body) = daemon.get("/").await;
+    assert_eq!(status, 200);
+    assert!(body.contains(r#"id="session-picker" action="/" method="get""#));
+    assert_eq!(
+        body.matches(r#"<input type="checkbox" name="s""#).count(),
+        2,
+        "{body}"
+    );
+    assert!(body.contains(&format!(r#"value="{first}""#)), "{body}");
+    assert!(body.contains(&format!(r#"value="{second}""#)), "{body}");
+    assert!(body.contains("Open selected tabs"), "{body}");
+    assert!(body.contains(&format!(r#"href="/s/{first}""#)), "{body}");
+    assert!(body.contains(&format!(r#"href="/s/{second}""#)), "{body}");
+}
+
+#[tokio::test]
+async fn grouped_sessions_are_ordered_deduplicated_and_share_the_first_reply() {
+    let daemon = Daemon::start().await;
+    let first = titled_code_session(&daemon, "first change");
+    let second = titled_code_session(&daemon, "second change");
+
+    let (status, body) = daemon
+        .get(&format!("/?s={second}&s={first}&s={second}"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body.matches(r#"<button type="button" role="tab""#).count(),
+        2,
+        "{body}"
+    );
+    assert_eq!(
+        body.matches(r#"<section class="review-panel" role="tabpanel""#)
+            .count(),
+        2,
+        "{body}"
+    );
+    assert!(
+        body.find("second change").unwrap() < body.find("first change").unwrap(),
+        "query order was not preserved: {body}"
+    );
+    assert!(body.contains(r#"aria-controls="review-panel-0""#), "{body}");
+    assert!(body.contains(r#"aria-labelledby="review-tab-0""#), "{body}");
+    assert!(
+        body.contains(&format!(r#"action="/s/{second}/reply""#)),
+        "{body}"
+    );
+    assert!(
+        !body.contains(&format!(r#"action="/s/{first}/reply""#)),
+        "{body}"
+    );
+    assert_eq!(
+        body.matches(&format!(r#"data-session="{second}""#)).count(),
+        2,
+        "one tab plus the shared reply should name the first session: {body}"
+    );
+    assert!(body.contains("ArrowRight"), "keyboard tab behavior missing");
+    assert!(body.contains("event.key === 'Home'"), "{body}");
+    assert!(body.contains("event.key === 'End'"), "{body}");
+}
+
+#[tokio::test]
+async fn one_grouped_session_and_selected_tab_state_render() {
+    let daemon = Daemon::start().await;
+    let first = titled_code_session(&daemon, "first change");
+    let second = titled_code_session(&daemon, "second change");
+
+    let (status, one) = daemon.get(&format!("/?s={first}")).await;
+    assert_eq!(status, 200, "{one}");
+    assert_eq!(
+        one.matches(r#"<button type="button" role="tab""#).count(),
+        1,
+        "{one}"
+    );
+
+    let (status, selected) = daemon
+        .get(&format!("/?s={first}&s={second}&tab={second}"))
+        .await;
+    assert_eq!(status, 200, "{selected}");
+    assert!(
+        selected.contains(&format!(
+            r#"<iframe class="review-frame" src="/s/{second}?embed=1""#
+        )),
+        "{selected}"
+    );
+    assert!(
+        !selected.contains(&format!(
+            r#"<iframe class="review-frame" src="/s/{first}?embed=1""#
+        )),
+        "inactive frame was not lazy: {selected}"
+    );
+    assert!(
+        selected.contains("window.addEventListener('popstate'"),
+        "{selected}"
+    );
+    assert!(
+        selected.contains("url.searchParams.set('tab'"),
+        "{selected}"
+    );
+}
+
+#[tokio::test]
+async fn invalid_grouped_selections_are_client_errors() {
+    let daemon = Daemon::start().await;
+
+    let (status, body) = daemon.get("/?s=").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("empty"), "{body}");
+
+    let (status, body) = daemon.get("/?s=not-a-session").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("unknown session"), "{body}");
+
+    let ids: Vec<_> = (0..13)
+        .map(|index| titled_code_session(&daemon, &format!("change {index}")))
+        .collect();
+    let query = ids
+        .iter()
+        .map(|id| format!("s={id}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let (status, body) = daemon.get(&format!("/?{query}")).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("at most 12"), "{body}");
+}
+
+#[tokio::test]
+async fn embedded_sessions_keep_review_content_without_duplicate_chrome() {
+    let daemon = Daemon::start().await;
+    let id = multiline_code_session(&daemon);
+
+    let (status, body) = daemon.get(&format!("/s/{id}?embed=1")).await;
+    assert_eq!(status, 200);
+    assert!(body.contains(r#"class="embedded""#), "{body}");
+    assert!(!body.contains(r#"<header class="bar">"#), "{body}");
+    assert!(!body.contains(r#"id="reply""#), "{body}");
+    assert!(!body.contains(r#"id="jump-top""#), "{body}");
+    assert!(body.contains(r#"class="addnote""#), "{body}");
+    assert!(body.contains("wdyt:commented"), "{body}");
+    assert!(body.contains("handleFragment"), "{body}");
+}
+
+#[tokio::test]
+async fn guided_content_renders_in_order_with_authoritative_block_targets() {
+    let daemon = Daemon::start().await;
+    let id = guided_session(&daemon);
+
+    let (status, body) = daemon.get(&format!("/s/{id}")).await;
+    assert_eq!(status, 200, "{body}");
+    let prose = body.find("API narrative.").expect("guided prose");
+    let diff = body.find("new value").expect("guided diff");
+    let code = body.find("println!").expect("guided code");
+    assert!(
+        prose < diff && diff < code,
+        "guided block order changed: {body}"
+    );
+    assert!(body.contains(r#"data-doc-target="guided:0""#), "{body}");
+    assert!(body.contains(r#"data-doc-line-offset="9""#), "{body}");
+    assert!(body.contains(r#"data-target="guided:1""#), "{body}");
+    assert!(body.contains(r#"data-target="guided:2""#), "{body}");
+    assert!(
+        body.contains(&format!(
+            r##"href="#{}""##,
+            wdyt::fragment::line_fragment("guided:1", "new", 4)
+        )),
+        "guided diff link uses the display file instead of its block target: {body}"
+    );
+    assert!(
+        body.contains(&format!(
+            r##"href="#{}""##,
+            wdyt::fragment::line_fragment("guided:2", "new", 2)
+        )),
+        "guided code link uses the display file instead of its block target: {body}"
+    );
+    assert!(
+        body.contains(r#"data-from="1" data-to="3" data-place="before""#),
+        "guided diff cannot expand above: {body}"
+    );
+    assert!(
+        body.contains(r#"data-from="5" data-to="7" data-place="after""#),
+        "guided diff cannot expand below: {body}"
+    );
+}
+
+#[tokio::test]
+async fn guided_comments_use_each_blocks_original_source_lines() {
+    let daemon = Daemon::start().await;
+    let id = guided_session(&daemon);
+
+    let cases = [
+        (
+            serde_json::json!({
+                "file": "untrusted",
+                "target": "guided:0",
+                "line": 12,
+                "side": "new",
+                "text": "explain the API"
+            }),
+            "guided:",
+            "API narrative.",
+        ),
+        (
+            serde_json::json!({
+                "file": "untrusted",
+                "target": "guided:1",
+                "line": 4,
+                "side": "new",
+                "text": "explain the diff"
+            }),
+            "src/lib.rs",
+            "new value",
+        ),
+        (
+            serde_json::json!({
+                "file": "untrusted",
+                "target": "guided:2",
+                "line": 2,
+                "side": "new",
+                "text": "explain the code"
+            }),
+            "src/main.rs",
+            "    let value = 2;",
+        ),
+    ];
+
+    for (request, expected_file, expected_snippet) in cases {
+        let (status, body) = daemon
+            .post_json(&format!("/s/{id}/comments"), request)
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let comment: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(comment["file"], expected_file, "{body}");
+        assert_eq!(comment["snippet"], expected_snippet, "{body}");
+    }
+
+    let (_, page) = daemon.get(&format!("/s/{id}")).await;
+    for text in ["explain the API", "explain the diff", "explain the code"] {
+        assert!(page.contains(text), "missing guided comment {text}: {page}");
+    }
+}
+
+#[tokio::test]
+async fn guided_diff_context_can_expand_and_be_commented_on() {
+    let daemon = Daemon::start().await;
+    let id = guided_session(&daemon);
+
+    let (status, body) = daemon
+        .get(&format!("/s/{id}/context?file=1&from=1&to=2"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let context: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(context["file"], "src/lib.rs");
+    assert_eq!(context["lines"][0]["new"], 1);
+    assert!(
+        context["lines"][0]["html"]
+            .as_str()
+            .unwrap()
+            .contains("hidden"),
+        "{body}"
+    );
+
+    let (status, body) = daemon
+        .post_json(
+            &format!("/s/{id}/comments"),
+            serde_json::json!({
+                "file": "ignored",
+                "target": "guided:1",
+                "line": 1,
+                "side": "new",
+                "text": "expanded context"
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let comment: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(comment["snippet"], "hidden one", "{body}");
+
+    let (status, body) = daemon
+        .get(&format!("/s/{id}/context?file=1&from=1&to=2"))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let context: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        context["lines"][0]["comments"][0]["text"],
+        "expanded context"
+    );
+    assert!(
+        daemon
+            .get(&format!("/s/{id}"))
+            .await
+            .1
+            .contains("threadNode(line.comments[i])")
+    );
+}
+
+#[tokio::test]
+async fn grouped_pages_bridge_child_fragments_into_the_copyable_url() {
+    let daemon = Daemon::start().await;
+    let first = titled_code_session(&daemon, "first");
+    let second = titled_code_session(&daemon, "second");
+    let (_, body) = daemon.get(&format!("/?s={first}&s={second}")).await;
+    assert!(body.contains("wdyt:fragment"), "{body}");
+    assert!(body.contains("url.hash = event.data.hash"), "{body}");
+
+    let (_, embedded) = daemon.get(&format!("/s/{first}?embed=1")).await;
+    assert!(embedded.contains("wdyt:set-fragment"), "{embedded}");
+    assert!(embedded.contains("window.parent.postMessage"), "{embedded}");
 }
 
 #[tokio::test]

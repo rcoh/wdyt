@@ -39,40 +39,51 @@ Environment overrides for one-off runs: `WDYT_WEBHOOK_URL`, `WDYT_PORTS`,
 With no webhook configured, wdyt prints the link instead of sending it, so it
 is usable before it is set up.
 
-## The modes
+## Create and present
 
 ```sh
-# Source files, syntax highlighted, with line anchors
-wdyt code src/lib.rs src/main.rs --title "the new parser"
+# Create tabs without notifying or waiting
+code=$(wdyt create code src/lib.rs src/main.rs --title "public API")
+docs=$(wdyt create docs DESIGN.md --title "design")
 
-# A unified diff, reviewable line by line with comments
-git diff | wdyt diff --title "the parser rewrite"
-
-# Markdown, rendered (GFM: tables, tasklists, footnotes, > [!NOTE] callouts)
-wdyt docs DESIGN.md --title "design writeup"
-
-# A directory of prepared HTML, served with its relative assets
-wdyt dir ./report --title "benchmark report"
-
-# A live server the agent started itself
-PORT=$(wdyt port)
-my-app --port "$PORT" &
-wdyt demo "$PORT" --title "the new dashboard"
+# Present them in one ordered, tabbed review
+wdyt present "$(printf '%s' "$code" | jq -r .id)" \
+  "$(printf '%s' "$docs" | jq -r .id)" \
+  --title "parser changes"
 ```
 
-Every content command waits for a reply by default and prints it as JSON after
-the session URL. Pass `--no-wait` for fire-and-forget (the URL is still printed
-on stdout so the agent can quote it).
+`create` prints one JSON object with `id`, `url`, `title`, and `kind`. It never
+sends a notification and never waits. `present` sends one notification for a
+URL such as `/?s=s1&s=s2&s=s3`, then waits for the overall reply by default.
+Tabs preserve the supplied order; duplicate IDs are removed. The first tab owns
+the overall reply, while line comments remain attached to the tab where they
+were written.
+
+All content modes are created the same way:
+
+```sh
+wdyt create code src/lib.rs                         # highlighted source
+git diff | wdyt create diff                         # unified diff
+wdyt create docs DESIGN.md                          # rendered Markdown
+wdyt create dir ./report                            # prepared HTML/assets
+PORT=$(wdyt port)
+my-app --port "$PORT" &
+wdyt create demo "$PORT" --title "running dashboard" # live server
+```
+
+The no-query home page lists active sessions and can compose selected sessions
+into the same tabbed view.
 
 ## Getting the reply
 
-Every content command blocks until a reply arrives (or `--timeout` expires), then
-prints the reply as JSON:
+`present` prints the grouped URL, then blocks until the first session receives
+an overall reply:
 
 ```sh
-wdyt code src/lib.rs --title "the new parser"
-# prints: http://localhost:3000/s/<id>
-# then blocks…
+created=$(wdyt create code src/lib.rs --title "the new parser")
+id=$(printf '%s' "$created" | jq -r .id)
+wdyt present "$id"
+# prints: http://localhost:3000/?s=<id>, then blocks
 # {"text": "rename the second arg and ship it", "at": 1785287644}
 ```
 
@@ -81,8 +92,9 @@ give up after a bound, in which case exit status is `2` on timeout so a script
 can tell "no answer" from "answered". To send now and collect later:
 
 ```sh
-wdyt docs PLAN.md --title "the plan" --no-wait
-# prints: http://localhost:3000/s/<id>
+created=$(wdyt create docs PLAN.md --title "the plan")
+id=$(printf '%s' "$created" | jq -r .id)
+wdyt present "$id" --no-wait
 wdyt recv "<id>" --timeout 900
 ```
 
@@ -105,9 +117,9 @@ This is what makes a reply sent a day after the agent stopped waiting still land
 
 ## CLI output as agent skill
 
-The CLI's stdout is strictly machine-readable (the session URL, then optionally
-the reply JSON). All coaching — file anchors, next-step guidance — goes to stderr,
-so piping stdout into another tool or variable never captures noise.
+The CLI's stdout is strictly machine-readable: `create` emits one JSON object;
+`present` emits the grouped URL and then, when waiting, the reply JSON. All
+coaching goes to stderr, so piping stdout never captures noise.
 
 After creating a code, diff, or docs session, stderr prints the available file
 anchors for use in `--brief` guided reviews:
@@ -123,11 +135,12 @@ These use the exact same helper that renders the page's navigation anchors, so
 the links always match. The anchor rule: prefix `f-`, then replace every
 non-alphanumeric character with `-` and lowercase letters.
 
-Post-session stderr guidance varies by outcome:
+Presentation stderr guidance varies by outcome:
 
 | Scenario | Stderr says |
 |---|---|
-| `--no-wait` | Session created; shows `collect` command |
+| `create` | Session created without notification or waiting |
+| `present --no-wait` | Presentation ready; shows `collect` command |
 | Reply received | Shows `collect <id>` (for line comments) and `ack <id>` |
 | Timeout (exit 2) | Session still open; shows `collect` and `inbox` |
 
@@ -163,7 +176,7 @@ receipt.
 
 ## Reviewing a diff
 
-`wdyt diff` renders a unified diff — added, removed, and context lines tinted
+`wdyt create diff` renders a unified diff — added, removed, and context lines tinted
 and numbered on both sides, highlighted per language. Each hunk side is
 reassembled and highlighted as one document before being split back into lines,
 so a multi-line string or comment colours correctly instead of restarting at
@@ -282,37 +295,49 @@ while the tab is visible, so an answer arrives without a reload.
 The reply box for a thread floats over the listing like the comment editor does,
 for the same measured reason. A thread holds at most 100 messages.
 
-## Guided review
+## Guided diff
 
-Rather than dropping a diff on someone and hoping, the agent can write the tour:
-what changed, why, and what to look at first. `--brief` takes markdown, or
-`--brief-file` a path:
+Guided diff is the default way to present code changes. It is a Markdown
+narrative that interleaves prose, selected patch ranges, and selected current
+code ranges in one ordered view:
+
+````markdown
+## Public API
+
+`Client::present` adds grouped reviews.
+
+```wdyt-diff
+{"file":"src/client.rs","side":"new","start":110,"end":145}
+```
+
+## Tests
+
+These cases cover stable order, duplicate IDs, and unknown sessions.
+
+```wdyt-code
+{"file":"tests/present.rs","start":20,"end":78}
+```
+
+## Detailed logic
+
+The grouped URL repeats the `s` query parameter.
+````
+
+Create it with a patch on stdin or with `--patch <PATH>`:
 
 ```sh
-git diff | wdyt diff --brief-file REVIEW.md
-wdyt code src/*.rs --brief "Start with the parser; the rest is mechanical."
+guide=$(git diff | wdyt create guided-diff REVIEW.md --title "grouped reviews")
+wdyt present "$(printf '%s' "$guide" | jq -r .id)"
 ```
 
-It renders above the content in the same column as the code, with GFM callouts
-and highlighted fences. A link to `#f-<path>` jumps to that file, with
-non-alphanumerics replaced by dashes — `src/diff.rs` is `#f-src-diff-rs`. To
-point at a line span, append `-L<start>` or `-L<start>-L<end>`, mirroring
-GitHub's `#L10` / `#L10-L20` blob URLs; wdyt scrolls to and highlights the span
-(in `code` and `diff` modes, on the new side, which have real line numbers — in
-`docs` it jumps to the rendered block covering those source lines):
+Each directive is strict JSON. Paths are workspace-relative, ranges are
+1-based and inclusive, and one range may select at most 500 lines. Diff excerpts
+include both sides of replacements and retain validated current-file context,
+which the reader can expand above or below the selected lines.
 
-```markdown
-> [!NOTE]
-> The parser bug is the interesting one.
-
-- [src/diff.rs](#f-src-diff-rs) — the hunk-length fix
-- [the off-by-one](#f-src-diff-rs-L42) — the exact line
-- [the new guard](#f-src-diff-rs-L80-L95) — the whole block
-- [README.md](#f-readme-md) — docs only
-```
-
-`--brief -` reads from stdin, so it cannot be combined with a diff that is also
-piped in; wdyt says so rather than silently eating one of them.
+For simpler code, diff, and docs sessions, `--brief` and `--brief-file` still
+add a Markdown introduction. File and line links use the printed `#f-<path>`
+anchors.
 
 ## Colour schemes
 
@@ -320,7 +345,7 @@ piped in; wdyt says so rather than silently eating one of them.
 `wdyt config --theme` sets the lasting default:
 
 ```sh
-git diff | wdyt diff --theme GitHub
+git diff | wdyt create diff --theme GitHub
 wdyt config --theme "Solarized (light)"
 ```
 

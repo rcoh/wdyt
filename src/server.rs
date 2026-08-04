@@ -14,7 +14,7 @@ use topcoat::view::view;
 use crate::config::Config;
 use crate::render::{ThemeColors, theme, theme_colors};
 use crate::session::{
-    Anchor, Author, Comment, Content, Message, Reply, Session, Side, Store, StoreError,
+    Anchor, Author, Comment, Content, GuidedBlock, Message, Reply, Session, Side, Store, StoreError,
 };
 use crate::ui::{Raw, code_file, diff_hunk, shell};
 
@@ -377,6 +377,8 @@ pub struct ContextLine {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old: Option<usize>,
     pub html: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<Comment>,
 }
 
 /// The most lines one expansion may ask for.
@@ -412,17 +414,34 @@ async fn context_route(cx: &Cx) -> Result<Json<ContextLines>> {
 
     // The session is cloned out rather than highlighted under the store's lock:
     // highlighting a file is real work and no other request should wait on it.
-    let (file, theme_name) = state(cx)
-        .store
-        .with(id, |session| match &session.content {
-            Content::Diff { files } => files
-                .get(index)
-                .filter(|file| !file.source.is_empty())
-                .map(|file| (file.clone(), session.theme.clone())),
-            _ => None,
-        })
-        .ok_or_else(not_found)?
-        .ok_or_else(|| bad_request("that file has no captured source"))?;
+    let (file, theme_name, comments, target) =
+        state(cx)
+            .store
+            .with(id, |session| match &session.content {
+                Content::Diff { files } => files
+                    .get(index)
+                    .filter(|file| !file.source.is_empty())
+                    .map(|file| {
+                        (
+                            file.clone(),
+                            session.theme.clone(),
+                            session.comments.clone(),
+                            None,
+                        )
+                    }),
+                Content::Guided { blocks } => blocks.get(index).and_then(|block| match block {
+                    GuidedBlock::Diff { file, .. } if !file.source.is_empty() => Some((
+                        file.clone(),
+                        session.theme.clone(),
+                        session.comments.clone(),
+                        Some(format!("guided:{index}")),
+                    )),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .ok_or_else(not_found)?
+            .ok_or_else(|| bad_request("that file has no captured source"))?;
     if to > file.source.len() {
         return Err(bad_request("beyond the end of the file").into());
     }
@@ -430,13 +449,26 @@ async fn context_route(cx: &Cx) -> Result<Json<ContextLines>> {
     let highlighted = state(cx).highlighted(id, index, &file, theme_name.as_deref())?;
     let offset = crate::diff::old_offset_at(&file, from);
     let lines = (from..=to)
-        .map(|number| ContextLine {
-            new: number,
-            old: offset.and_then(|by| usize::try_from(number as i64 + by).ok()),
-            html: highlighted
-                .get(number - 1)
+        .map(|number| {
+            let comments = comments
+                .iter()
+                .filter(|comment| {
+                    comment.file == file.label
+                        && comment.target == target
+                        && comment.side == Side::New
+                        && comment.end_line.unwrap_or(comment.line) == number
+                })
                 .cloned()
-                .unwrap_or_else(String::new),
+                .collect();
+            ContextLine {
+                new: number,
+                old: offset.and_then(|by| usize::try_from(number as i64 + by).ok()),
+                html: highlighted
+                    .get(number - 1)
+                    .cloned()
+                    .unwrap_or_else(String::new),
+                comments,
+            }
         })
         .collect();
     Ok(Json(ContextLines {
@@ -464,24 +496,38 @@ async fn comment_route(cx: &Cx, Json(mut input): Json<CommentInput>) -> Result<J
 
     // Explicit markdown targets are authoritative; the display label stored in
     // the comment comes from the session, never from the request.
-    if let Some(target) = input.target.as_deref() {
-        let file = state(cx)
+    let explicit_requires_new = if let Some(target) = input.target.as_deref() {
+        let (file, requires_new) = state(cx)
             .store
             .with(id, |session| match target {
-                "brief" if !session.brief_sources.is_empty() => Some("brief:".to_owned()),
+                "brief" if !session.brief_sources.is_empty() => Some(("brief:".to_owned(), true)),
                 value if value.starts_with("doc:") => {
                     let index = value.strip_prefix("doc:")?.parse::<usize>().ok()?;
                     let Content::Docs { files } = &session.content else {
                         return None;
                     };
-                    files.get(index).map(|file| file.label.clone())
+                    files.get(index).map(|file| (file.label.clone(), true))
+                }
+                value if value.starts_with("guided:") => {
+                    let index = guided_block_index(value)?;
+                    let Content::Guided { blocks } = &session.content else {
+                        return None;
+                    };
+                    match blocks.get(index)? {
+                        GuidedBlock::Text { .. } => Some(("guided:".to_owned(), true)),
+                        GuidedBlock::Code { file, .. } => Some((file.clone(), true)),
+                        GuidedBlock::Diff { file, .. } => Some((file.label.clone(), false)),
+                    }
                 }
                 _ => None,
             })
             .ok_or_else(not_found)?
             .ok_or_else(|| bad_request("unknown comment target"))?;
         input.file = file;
-    }
+        requires_new
+    } else {
+        false
+    };
 
     // Reject line 0, which is not a valid 1-indexed position.
     if input.line == 0 {
@@ -494,7 +540,8 @@ async fn comment_route(cx: &Cx, Json(mut input): Json<CommentInput>) -> Result<J
 
     // Determine whether this is targeting a doc/brief/code based on explicit
     // target or content type. All non-diff types require Side::New.
-    let requires_side_new = input.target.as_deref() == Some("brief")
+    let requires_side_new = explicit_requires_new
+        || input.target.as_deref() == Some("brief")
         || input
             .target
             .as_deref()
@@ -651,17 +698,12 @@ pub struct Received {
 pub enum UserEvent {
     /// The overall reply typed into the page's reply box — the verdict on the
     /// whole session, and terminal: there is only ever one.
-    Reply {
-        reply: Reply,
-    },
+    Reply { reply: Reply },
     /// A line comment or a follow-up on one, with its thread context: the line
     /// it is about, the quoted code, and the exchange so far, since an answer is
     /// about the code rather than about the sentence. The message `id` is 0 for
     /// a comment's own text, which is the first thing said in its thread.
-    Comment {
-        thread: Comment,
-        message: Message,
-    },
+    Comment { thread: Comment, message: Message },
 }
 
 /// The text of the lines a comment anchors to, if any exist.
@@ -669,6 +711,7 @@ pub enum UserEvent {
 /// Resolution uses the explicit `target` when present:
 /// - `"brief"` → the guided-review brief sources
 /// - `"doc:<n>"` → the nth docs file (0-indexed)
+/// - `"guided:<n>"` → the nth guided block, with that block's original lines
 ///
 /// Legacy (no target):
 /// - `file == "brief:"` → brief sources
@@ -694,6 +737,26 @@ fn snippet_for(session: &Session, anchor: &Anchor) -> Option<String> {
                     snippet_from_lines_strict(&file.sources, anchor)
                 } else {
                     None
+                }
+            }
+            t if t.starts_with("guided:") => {
+                let idx = guided_block_index(t)?;
+                let Content::Guided { blocks } = content else {
+                    return None;
+                };
+                match blocks.get(idx)? {
+                    GuidedBlock::Text {
+                        source_start,
+                        sources,
+                        ..
+                    } if anchor.side == Side::New => {
+                        snippet_from_lines_at(sources, *source_start, anchor)
+                    }
+                    GuidedBlock::Code { start, sources, .. } if anchor.side == Side::New => {
+                        snippet_from_lines_at(sources, *start, anchor)
+                    }
+                    GuidedBlock::Diff { file, .. } => snippet_from_diff_file(file, anchor),
+                    _ => None,
                 }
             }
             _ => None,
@@ -735,26 +798,30 @@ fn snippet_for(session: &Session, anchor: &Anchor) -> Option<String> {
     let Content::Diff { files } = content else {
         return None;
     };
-    let (file, line, side) = (&anchor.file, anchor.line, anchor.side);
+    let file = files.iter().find(|file| file.label == anchor.file)?;
+    snippet_from_diff_file(file, anchor)
+}
 
-    // A line the reader revealed is not in any hunk, but it is in the file the
-    // session captured — and that file was accepted only because it agreed with
-    // every line the diff shows, so quoting from it is as trustworthy as quoting
-    // from a hunk. Without this, commenting on context you just expanded would be
-    // refused as "no such line".
-    if side == Side::New
-        && let Some(captured) = files
-            .iter()
-            .find(|f| &f.label == file && !f.source.is_empty())
-    {
-        return snippet_from_lines_strict(&captured.source, anchor);
+fn guided_block_index(target: &str) -> Option<usize> {
+    let value = target.strip_prefix("guided:")?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// Looks up a snippet in a diff file, including new-side source revealed after
+/// the initial page load.
+fn snippet_from_diff_file(file: &crate::session::DiffFile, anchor: &Anchor) -> Option<String> {
+    let (line, side) = (anchor.line, anchor.side);
+
+    if side == Side::New && !file.source.is_empty() {
+        return snippet_from_lines_strict(&file.source, anchor);
     }
     let end_line = anchor.last();
-    // Addressable line numbers on this side, paired with their text.
-    let addressable: Vec<(usize, &str)> = files
+    let addressable: Vec<(usize, &str)> = file
+        .hunks
         .iter()
-        .filter(|f| &f.label == file)
-        .flat_map(|f| &f.hunks)
         .flat_map(|h| &h.lines)
         .filter(|l| crate::session::side_of(l.kind) == side)
         .filter_map(|l| {
@@ -810,6 +877,21 @@ fn snippet_from_lines_strict(sources: &[String], anchor: &Anchor) -> Option<Stri
         return None;
     }
     Some(sources[first..last].join("\n"))
+}
+
+/// Strict source lookup where `sources[0]` has the supplied original line
+/// number, as guided text and code excerpts do.
+fn snippet_from_lines_at(
+    sources: &[String],
+    source_start: usize,
+    anchor: &Anchor,
+) -> Option<String> {
+    let first = anchor.line.checked_sub(source_start)?;
+    let last = anchor.last().checked_sub(source_start)?;
+    if first > last || last >= sources.len() {
+        return None;
+    }
+    Some(sources[first..=last].join("\n"))
 }
 
 /// One session's reply, as reported by `wdyt inbox`.
@@ -874,13 +956,30 @@ fn request_port(cx: &Cx) -> u16 {
 
 /// Reads one query parameter.
 fn query_param(cx: &Cx, name: &str) -> Option<String> {
-    topcoat::router::uri(cx).query().and_then(|query| {
-        query
-            .split('&')
-            .filter_map(|pair| pair.split_once('='))
-            .find(|(key, _)| *key == name)
-            .map(|(_, value)| value.to_owned())
-    })
+    query_params(cx, name).into_iter().next()
+}
+
+/// Reads every value for a repeated query parameter in request order.
+fn query_params(cx: &Cx, name: &str) -> Vec<String> {
+    let Some(query) = topcoat::router::uri(cx).query() else {
+        return Vec::new();
+    };
+    query
+        .split('&')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let key = percent_encoding::percent_decode_str(key)
+                .decode_utf8()
+                .ok()?;
+            if key != name {
+                return None;
+            }
+            percent_encoding::percent_decode_str(&value.replace('+', " "))
+                .decode_utf8()
+                .ok()
+                .map(|value| value.into_owned())
+        })
+        .collect()
 }
 
 /// Serves until the process is signalled.
@@ -944,39 +1043,171 @@ fn store_error(error: StoreError) -> topcoat::Error {
 
 // --- Pages ------------------------------------------------------------------
 
+const MAX_GROUPED_SESSIONS: usize = 12;
+
 /// Lists live sessions. Handy when a link has scrolled out of Slack.
 #[page("/")]
 async fn index_page(cx: &Cx) -> Result {
     let state = state(cx);
+
+    let selected = query_params(cx, "s");
+    if !selected.is_empty() {
+        let mut ids = Vec::new();
+        for id in selected {
+            if id.is_empty() {
+                return Err(bad_request("session selection contains an empty id").into());
+            }
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        if ids.len() > MAX_GROUPED_SESSIONS {
+            return Err(bad_request(format!(
+                "a grouped review supports at most {MAX_GROUPED_SESSIONS} tabs"
+            ))
+            .into());
+        }
+
+        let mut tabs = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let tab = state
+                .store
+                .with(id, |session| {
+                    (session.title.clone(), session.content.kind().to_owned())
+                })
+                .ok_or_else(|| bad_request(format!("unknown session id: {id}")))?;
+            tabs.push((id.clone(), tab.0, tab.1));
+        }
+
+        let first = state
+            .store
+            .with(&ids[0], Clone::clone)
+            .expect("validated grouped session");
+        let selected_tab = query_param(cx, "tab")
+            .and_then(|id| ids.iter().position(|candidate| candidate == &id))
+            .unwrap_or(0);
+        let own_colors = first
+            .theme
+            .as_deref()
+            .filter(|name| *name != state.theme)
+            .map(|name| theme_colors(theme(name)));
+        let colors = own_colors.as_ref().unwrap_or(&state.colors);
+        let count = tabs.len();
+        let body = view! { cx =>
+            <div class="tabbed-review" data-tabbed-review="1">
+                <div class="review-tabs" role="tablist" aria-label="Review sessions">
+                    for (index, (id, title, kind)) in tabs.iter().enumerate() {
+                        <button
+                            type="button"
+                            role="tab"
+                            id=(format!("review-tab-{index}"))
+                            aria-controls=(format!("review-panel-{index}"))
+                            aria-selected=(if index == selected_tab { "true" } else { "false" })
+                            tabindex=(if index == selected_tab { "0" } else { "-1" })
+                            data-session=(id)
+                        >
+                            <span class="tab-title">(title)</span>
+                            <span class="kind">(kind)</span>
+                        </button>
+                    }
+                </div>
+                for (index, (id, title, _)) in tabs.iter().enumerate() {
+                    if index == selected_tab {
+                        <section
+                            class="review-panel"
+                            role="tabpanel"
+                            id=(format!("review-panel-{index}"))
+                            aria-labelledby=(format!("review-tab-{index}"))
+                        >
+                            <iframe
+                                class="review-frame"
+                                src=(format!("/s/{id}?embed=1"))
+                                data-src=(format!("/s/{id}?embed=1"))
+                                title=(format!("Review: {title}"))
+                            ></iframe>
+                        </section>
+                    } else {
+                        <section
+                            class="review-panel"
+                            role="tabpanel"
+                            id=(format!("review-panel-{index}"))
+                            aria-labelledby=(format!("review-tab-{index}"))
+                            hidden="hidden"
+                        >
+                            <iframe
+                                class="review-frame"
+                                data-src=(format!("/s/{id}?embed=1"))
+                                title=(format!("Review: {title}"))
+                                loading="lazy"
+                            ></iframe>
+                        </section>
+                    }
+                }
+            </div>
+            <script>(Raw(crate::ui::TABS_JS))</script>
+        }?;
+        let page = crate::ui::Page {
+            title: if count == 1 {
+                first.title.clone()
+            } else {
+                format!("{count} sessions")
+            },
+            note: None,
+            kind: "review".to_owned(),
+            session_id: first.id,
+            reply: first.reply,
+            body_class: Some("grouped".to_owned()),
+            hideable: false,
+            commentable: false,
+            embedded: false,
+            origin: first.origin,
+        };
+        return view! { cx =>
+            shell(
+                page: page,
+                colors: colors,
+                subheader: None,
+                child: body,
+            )
+        };
+    }
+
     let sessions = state.store.summaries();
     let colors = &state.colors;
 
     let body = view! { cx =>
-        <div class="wrap">
+        <div class="wrap session-picker">
             if sessions.is_empty() {
                 <p style="color: var(--muted)">
                     "No sessions yet. An agent creates one with "
-                    <code>"wdyt code …"</code>
-                    ", "
-                    <code>"wdyt docs …"</code>
-                    ", "
-                    <code>"wdyt dir …"</code>
-                    ", or "
-                    <code>"wdyt demo …"</code>
+                    <code>"wdyt create …"</code>
                     "."
                 </p>
             } else {
-                <ul style="list-style: none; padding: 0; margin: 0">
-                    for (id, title, kind, replied) in sessions {
-                        <li style="padding: 12px 0; border-bottom: 1px solid var(--border)">
-                            <a href=(format!("/s/{id}")) style="font-weight: 600">(title)</a>
-                            <span class="kind" style="margin-left: 10px">(kind)</span>
-                            if replied {
-                                <span style="color: var(--muted); margin-left: 10px">"· replied"</span>
-                            }
-                        </li>
-                    }
-                </ul>
+                <form id="session-picker" action="/" method="get">
+                    <ul class="session-list">
+                        for (id, title, kind, replied) in sessions {
+                            <li>
+                                <input
+                                    type="checkbox"
+                                    name="s"
+                                    value=(&id)
+                                    id=(format!("pick-{id}"))
+                                >
+                                <label for=(format!("pick-{id}"))>(title)</label>
+                                <span class="kind">(kind)</span>
+                                <a class="direct" href=(format!("/s/{id}"))>"Open"</a>
+                                if replied {
+                                    <span style="color: var(--muted); grid-column: 2">"replied"</span>
+                                }
+                            </li>
+                        }
+                    </ul>
+                    <div class="picker-actions">
+                        <button type="submit" disabled="disabled">"Open selected tabs"</button>
+                    </div>
+                </form>
+                <script>(Raw(crate::ui::SESSION_PICKER_JS))</script>
             }
         </div>
     }?;
@@ -998,6 +1229,7 @@ async fn index_page(cx: &Cx) -> Result {
 async fn session_page(cx: &Cx) -> Result {
     let id = path_param::<SessionId>(cx)?;
     let state = state(cx);
+    let embedded = query_param(cx, "embed").is_some_and(|value| value == "1" || value == "true");
 
     let session = state
         .store
@@ -1041,13 +1273,20 @@ async fn session_page(cx: &Cx) -> Result {
 
     // Framed content needs `<main>` to fill the viewport with no page scrolling
     // of its own, so the iframe can own the space below the chrome.
-    let body_class = content.is_framed().then_some("framed");
+    let mut body_classes = Vec::new();
+    if content.is_framed() {
+        body_classes.push("framed");
+    }
+    if embedded {
+        body_classes.push("embedded");
+    }
+    let body_class = (!body_classes.is_empty()).then(|| body_classes.join(" "));
 
     // The bar can be collapsed anywhere it competes with the content: over a
     // framed app it is someone else's screen space, and over a long diff it is
     // a sticky strip in the way of the code. Not on the index, which is nothing
     // but chrome.
-    let hideable = true;
+    let hideable = !embedded;
 
     // The agent's own tour of the work, above everything: what changed, why, and
     // what to look at first. Rendered even in the framed modes, where it is the
@@ -1177,6 +1416,8 @@ async fn session_page(cx: &Cx) -> Result {
                                     file: &file.label,
                                     highlighted: &file.highlighted,
                                     comments: &comments,
+                                    start: 1,
+                                    target: None,
                                 )
                             }
                         </div>
@@ -1207,8 +1448,11 @@ async fn session_page(cx: &Cx) -> Result {
                                     index: block.index,
                                     hunk: at.hunk,
                                     comments: &comments,
-                                    gap_before: at.before,
-                                    gap_after: at.after,
+                                    context: crate::ui::DiffHunkContext {
+                                        before: at.before,
+                                        after: at.after,
+                                        target: None,
+                                    },
                                 )
                             }
                         </div>
@@ -1258,6 +1502,124 @@ async fn session_page(cx: &Cx) -> Result {
             }?
         }
 
+        Content::Guided { blocks } => {
+            let mut rendered = Vec::with_capacity(blocks.len());
+            for (index, block) in blocks.iter().enumerate() {
+                let target = format!("guided:{index}");
+                let section = match block {
+                    GuidedBlock::Text {
+                        html, source_start, ..
+                    } => view! { cx =>
+                        <section
+                            class="doc"
+                            id=(format!("guided-block-{index}"))
+                            data-doc-file="guided:"
+                            data-doc-target=(&target)
+                            data-doc-line-offset=(source_start.saturating_sub(1))
+                            data-session=(id)
+                        >
+                            (Raw(html.clone()))
+                        </section>
+                    }?,
+                    GuidedBlock::Code {
+                        file,
+                        language,
+                        start,
+                        end,
+                        highlighted,
+                        ..
+                    } => view! { cx =>
+                        <section class="file" id=(format!("guided-block-{index}"))>
+                            <div class="filename">
+                                <span>(file)</span>
+                                <span class="guided-range">
+                                    (language) " · L" (start) "–L" (end)
+                                </span>
+                            </div>
+                            <div class="codebox">
+                                code_file(
+                                    file: file,
+                                    highlighted: highlighted,
+                                    comments: &comments,
+                                    start: *start,
+                                    target: Some(target.as_str()),
+                                )
+                            </div>
+                        </section>
+                    }?,
+                    GuidedBlock::Diff {
+                        file,
+                        side,
+                        start,
+                        end,
+                        selected_hunks,
+                    } => {
+                        let mut excerpt = file.clone();
+                        excerpt.hunks = selected_hunks.clone();
+                        let gaps = crate::diff::gaps(&excerpt);
+                        let last = selected_hunks.len().saturating_sub(1);
+                        let hunks: Vec<_> = selected_hunks
+                            .iter()
+                            .enumerate()
+                            .map(|(at, hunk)| {
+                                (
+                                    hunk,
+                                    gaps.before.get(at).copied().flatten(),
+                                    (at == last).then_some(gaps.after).flatten(),
+                                )
+                            })
+                            .collect();
+                        view! { cx =>
+                            <section class="file" id=(format!("guided-block-{index}"))>
+                                <div class="filename">
+                                    <span>(&file.label)</span>
+                                    <span class="guided-range">
+                                        (side.as_str()) " · L" (start) "–L" (end)
+                                    </span>
+                                </div>
+                                <div class="codebox">
+                                    for (hunk, before, after) in hunks {
+                                        diff_hunk(
+                                            file: &file.label,
+                                            index: index,
+                                            hunk: hunk,
+                                            comments: &comments,
+                                            context: crate::ui::DiffHunkContext {
+                                                before,
+                                                after,
+                                                target: Some(target.as_str()),
+                                            },
+                                        )
+                                    }
+                                </div>
+                            </section>
+                        }?
+                    }
+                };
+                rendered.push(section);
+            }
+            view! { cx =>
+                <div class="wrap guided-review" data-comments="1" data-session=(id)>
+                    for block in rendered {
+                        (block)
+                    }
+                </div>
+                <div id="wdyt-doc-comments" hidden="hidden">
+                    for comment in &comments {
+                        <div class="wdyt-comment-data"
+                            data-comment-id=(comment.id)
+                            data-comment-target=(comment.target.as_deref().unwrap_or(""))
+                            data-comment-file=(&comment.file)
+                            data-comment-line=(comment.line)
+                            data-comment-end-line=(comment.end_line.map_or(String::new(), |e| e.to_string()))
+                            data-comment-side=(comment.side.as_str())
+                            data-comment-snippet=(&comment.snippet)
+                        >(&comment.text)</div>
+                    }
+                </div>
+            }?
+        }
+
         Content::Static { entry, .. } => {
             // Served through /s/{id}/assets/ so relative links inside the
             // directory resolve. The sandbox attribute prevents the framed
@@ -1290,9 +1652,10 @@ async fn session_page(cx: &Cx) -> Result {
         kind: kind.to_owned(),
         session_id: id.to_owned(),
         reply: existing_reply,
-        body_class: body_class.map(str::to_owned),
+        body_class,
         hideable,
         commentable: content.is_commentable() || brief_commentable,
+        embedded,
         origin,
     };
 
@@ -1442,6 +1805,37 @@ async fn raw_route(cx: &Cx) -> Result<topcoat::router::Response> {
         Content::Docs { files } => {
             html_response(files.iter().map(|f| f.html.clone()).collect::<String>())?
         }
+        Content::Guided { blocks } => {
+            let mut out = String::new();
+            for block in blocks {
+                match block {
+                    GuidedBlock::Text { html, .. } => out.push_str(&html),
+                    GuidedBlock::Code { highlighted, .. } => {
+                        out.push_str("<pre><code>");
+                        out.push_str(&highlighted.join("\n"));
+                        out.push_str("</code></pre>");
+                    }
+                    GuidedBlock::Diff { selected_hunks, .. } => {
+                        out.push_str("<pre><code>");
+                        for hunk in selected_hunks {
+                            out.push_str(&escape_html(&hunk.header));
+                            out.push('\n');
+                            for line in hunk.lines {
+                                out.push_str(match line.kind {
+                                    crate::session::LineKind::Added => "+",
+                                    crate::session::LineKind::Removed => "-",
+                                    crate::session::LineKind::Context => " ",
+                                });
+                                out.push_str(&escape_html(&line.text));
+                                out.push('\n');
+                            }
+                        }
+                        out.push_str("</code></pre>");
+                    }
+                }
+            }
+            html_response(out)?
+        }
     };
     Ok(response)
 }
@@ -1526,7 +1920,7 @@ pub const HEALTH_MARKER: &str = "wdyt-daemon";
 /// a daemon with a lower (or absent) protocol version will skip it and start a
 /// compatible one. Old clients that only check `HEALTH_MARKER` will still
 /// recognize a new daemon (the marker is unchanged).
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[route(GET "/health")]
 async fn health_route(cx: &Cx) -> Result<Json<serde_json::Value>> {

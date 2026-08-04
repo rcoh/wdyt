@@ -10,7 +10,6 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use wdyt::config::Config;
 use wdyt::render::theme;
 use wdyt::session::{Content, Store};
@@ -114,7 +113,45 @@ fn wdyt_bin() -> std::path::PathBuf {
     path
 }
 
+fn creation_url(stdout: &[u8]) -> String {
+    let json: serde_json::Value = serde_json::from_slice(stdout).expect("creation JSON");
+    json["url"].as_str().expect("creation URL").to_owned()
+}
+
 // ---------- Help output tests ----------
+
+#[test]
+fn skill_installs_all_three_skills_for_supported_agents() {
+    let project = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(wdyt_bin())
+        .arg("skill")
+        .current_dir(project.path())
+        .output()
+        .expect("failed to run wdyt skill");
+    assert!(
+        output.status.success(),
+        "wdyt skill failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for root in [
+        ".kiro/skills",
+        ".claude/skills",
+        ".codex/skills",
+        ".agents/skills",
+    ] {
+        for name in ["wdyt", "presenting-code-changes", "presenting-designs"] {
+            let path = project.path().join(root).join(name).join("SKILL.md");
+            let contents = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+            assert!(
+                contents.starts_with("---"),
+                "invalid skill: {}",
+                path.display()
+            );
+        }
+    }
+}
 
 #[test]
 fn root_help_contains_workflow_section() {
@@ -150,28 +187,28 @@ fn root_help_contains_workflow_section() {
 }
 
 #[test]
-fn code_help_mentions_wait_behavior() {
+fn create_code_help_has_creation_options_only() {
     let output = std::process::Command::new(wdyt_bin())
-        .args(["code", "--help"])
+        .args(["create", "code", "--help"])
         .output()
-        .expect("failed to run wdyt code --help");
+        .expect("failed to run wdyt create code --help");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Waits for a reply by default"),
-        "code --help should explain wait default:\n{stdout}"
+        stdout.contains("--title"),
+        "create code --help should show session metadata:\n{stdout}"
     );
     assert!(
-        stdout.contains("--no-wait"),
-        "code --help should show --no-wait:\n{stdout}"
+        !stdout.contains("--no-wait") && !stdout.contains("--no-notify"),
+        "create code must not expose presentation flags:\n{stdout}"
     );
 }
 
 #[test]
 fn diff_help_mentions_stdin_caveat() {
     let output = std::process::Command::new(wdyt_bin())
-        .args(["diff", "--help"])
+        .args(["create", "diff", "--help"])
         .output()
-        .expect("failed to run wdyt diff --help");
+        .expect("failed to run wdyt create diff --help");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("--brief-file"),
@@ -220,9 +257,9 @@ fn ack_help_mentions_receipt() {
 #[test]
 fn brief_arg_help_shows_anchor_examples() {
     let output = std::process::Command::new(wdyt_bin())
-        .args(["code", "--help"])
+        .args(["create", "code", "--help"])
         .output()
-        .expect("failed to run wdyt code --help");
+        .expect("failed to run wdyt create code --help");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("#f-"),
@@ -286,12 +323,7 @@ async fn code_session_prints_anchors_to_stderr() {
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
-            .args([
-                "code",
-                tmp.path().to_str().unwrap(),
-                "--no-wait",
-                "--no-notify",
-            ])
+            .args(["create", "code", tmp.path().to_str().unwrap()])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -317,12 +349,10 @@ async fn code_session_prints_anchors_to_stderr() {
         "stderr should contain anchor {expected_anchor}: {stderr}"
     );
 
-    // stdout should ONLY contain the URL, no coaching.
+    // stdout should contain only the creation result, no coaching.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.trim().starts_with("http://"),
-        "stdout should only contain URL: {stdout}"
-    );
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(json["kind"], "code");
     assert!(
         !stdout.contains("anchor"),
         "stdout must not contain coaching: {stdout}"
@@ -340,12 +370,7 @@ async fn diff_session_prints_anchors_to_stderr() {
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
-            .args([
-                "diff",
-                tmp.path().to_str().unwrap(),
-                "--no-wait",
-                "--no-notify",
-            ])
+            .args(["create", "diff", tmp.path().to_str().unwrap()])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -379,12 +404,7 @@ async fn docs_session_prints_anchors_to_stderr() {
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
-            .args([
-                "docs",
-                tmp.path().to_str().unwrap(),
-                "--no-wait",
-                "--no-notify",
-            ])
+            .args(["create", "docs", tmp.path().to_str().unwrap()])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -405,171 +425,6 @@ async fn docs_session_prints_anchors_to_stderr() {
     assert!(
         stderr.contains("file anchors"),
         "stderr should mention file anchors for docs: {stderr}"
-    );
-}
-
-#[tokio::test]
-async fn no_wait_stderr_shows_collect_guidance() {
-    let daemon = TestDaemon::start().await;
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), "fn main() {}\n").unwrap();
-
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::process::Command::new(wdyt_bin())
-            .args([
-                "code",
-                tmp.path().to_str().unwrap(),
-                "--no-wait",
-                "--no-notify",
-            ])
-            .env("WDYT_PORTS", daemon.port_env())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .expect("timed out")
-    .expect("failed to run wdyt");
-
-    assert!(output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // --no-wait guidance should mention collect but NOT ack (no reply yet).
-    assert!(
-        stderr.contains("wdyt collect"),
-        "no-wait stderr should mention collect: {stderr}"
-    );
-    assert!(
-        !stderr.contains("wdyt ack"),
-        "no-wait stderr must NOT mention ack (no reply yet): {stderr}"
-    );
-    assert!(
-        stderr.contains("created"),
-        "no-wait stderr should say 'created': {stderr}"
-    );
-    assert!(
-        !stderr.contains("sent"),
-        "no-wait stderr should not say 'sent': {stderr}"
-    );
-}
-
-#[tokio::test]
-async fn timeout_stderr_shows_collect_guidance() {
-    let daemon = TestDaemon::start().await;
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), "fn main() {}\n").unwrap();
-
-    let output = tokio::time::timeout(
-        Duration::from_secs(15),
-        tokio::process::Command::new(wdyt_bin())
-            .args([
-                "code",
-                tmp.path().to_str().unwrap(),
-                "--timeout",
-                "1",
-                "--no-notify",
-            ])
-            .env("WDYT_PORTS", daemon.port_env())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .expect("timed out waiting for test")
-    .expect("failed to run wdyt");
-
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // Timeout guidance should mention collect and inbox.
-    assert!(
-        stderr.contains("wdyt collect"),
-        "timeout stderr should mention collect: {stderr}"
-    );
-    assert!(
-        stderr.contains("wdyt inbox"),
-        "timeout stderr should mention inbox: {stderr}"
-    );
-}
-
-#[tokio::test]
-async fn reply_received_stderr_shows_ack_guidance() {
-    let daemon = TestDaemon::start().await;
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), "fn main() {}\n").unwrap();
-
-    let mut child = tokio::process::Command::new(wdyt_bin())
-        .args([
-            "code",
-            tmp.path().to_str().unwrap(),
-            "--timeout",
-            "30",
-            "--no-notify",
-        ])
-        .env("WDYT_PORTS", daemon.port_env())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("failed to run wdyt");
-
-    // Read the URL line from stdout.
-    let stdout_pipe = child.stdout.take().unwrap();
-    let mut reader = tokio::io::BufReader::new(stdout_pipe);
-    let mut url_line = String::new();
-    tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut url_line))
-        .await
-        .expect("URL line not printed within 10s")
-        .expect("IO error reading URL line");
-
-    let session_id = url_line.trim().rsplit('/').next().unwrap();
-    daemon.reply(session_id, "looks good");
-
-    // Read remaining stdout.
-    let mut remaining = String::new();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        reader.read_to_string(&mut remaining),
-    )
-    .await
-    .expect("remaining stdout not read in time")
-    .expect("IO error");
-
-    let stderr_pipe = child.stderr.take().unwrap();
-    let mut stderr_reader = tokio::io::BufReader::new(stderr_pipe);
-    let mut stderr_content = String::new();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        stderr_reader.read_to_string(&mut stderr_content),
-    )
-    .await
-    .expect("stderr not read in time")
-    .expect("IO error");
-
-    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
-        .await
-        .expect("child did not exit")
-        .expect("IO error");
-
-    assert!(status.success());
-    // stderr after receiving reply should guide to collect then ack.
-    assert!(
-        stderr_content.contains("wdyt collect"),
-        "reply stderr should mention collect for comments: {stderr_content}"
-    );
-    assert!(
-        stderr_content.contains("wdyt ack"),
-        "reply stderr should mention ack: {stderr_content}"
-    );
-    // stdout should have the JSON reply, no coaching.
-    assert!(
-        remaining.contains("looks good"),
-        "stdout should contain reply JSON: {remaining}"
-    );
-    assert!(
-        !remaining.contains("wdyt ack"),
-        "stdout must not contain coaching: {remaining}"
     );
 }
 
@@ -611,7 +466,7 @@ async fn collect_stderr_shows_ack_guidance() {
 
 #[tokio::test]
 async fn stdout_never_contains_coaching_text() {
-    // Verify the strong contract: stdout is URL + optional JSON, nothing else.
+    // Verify the strong contract: stdout is one machine-readable JSON object.
     let daemon = TestDaemon::start().await;
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), "fn main() {}\n").unwrap();
@@ -619,12 +474,7 @@ async fn stdout_never_contains_coaching_text() {
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
-            .args([
-                "code",
-                tmp.path().to_str().unwrap(),
-                "--no-wait",
-                "--no-notify",
-            ])
+            .args(["create", "code", tmp.path().to_str().unwrap()])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -637,16 +487,14 @@ async fn stdout_never_contains_coaching_text() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
-    // The only line should be the URL.
+    // The only line should be the creation result.
     assert_eq!(
         lines.len(),
         1,
         "stdout should have exactly 1 line: {stdout}"
     );
-    assert!(
-        lines[0].starts_with("http://"),
-        "stdout line should be URL: {stdout}"
-    );
+    let json: serde_json::Value = serde_json::from_str(lines[0]).expect("creation JSON");
+    assert_eq!(json["kind"], "code");
     // Negative checks: no coaching words.
     for word in ["anchor", "collect", "ack", "brief", "wait"] {
         assert!(
@@ -675,11 +523,10 @@ async fn code_collision_labels_fail_before_session_creation() {
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
             .args([
+                "create",
                 "code",
                 file1.to_str().unwrap(),
                 file2.to_str().unwrap(),
-                "--no-wait",
-                "--no-notify",
             ])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
@@ -723,12 +570,7 @@ async fn diff_collision_labels_fail_before_session_creation() {
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
-            .args([
-                "diff",
-                tmp.path().to_str().unwrap(),
-                "--no-wait",
-                "--no-notify",
-            ])
+            .args(["create", "diff", tmp.path().to_str().unwrap()])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -768,11 +610,10 @@ async fn docs_collision_labels_fail_before_session_creation() {
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
             .args([
+                "create",
                 "docs",
                 file1.to_str().unwrap(),
                 file2.to_str().unwrap(),
-                "--no-wait",
-                "--no-notify",
             ])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
@@ -810,11 +651,10 @@ async fn code_session_page_anchors_match_stderr_output() {
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
             .args([
+                "create",
                 "code",
                 file1.to_str().unwrap(),
                 file2.to_str().unwrap(),
-                "--no-wait",
-                "--no-notify",
             ])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
@@ -827,12 +667,11 @@ async fn code_session_page_anchors_match_stderr_output() {
     .expect("failed to run wdyt");
 
     assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     // Extract the URL and fetch the page.
-    let url = stdout.trim();
-    let page_html = reqwest::get(url)
+    let url = creation_url(&output.stdout);
+    let page_html = reqwest::get(&url)
         .await
         .expect("fetch page")
         .text()
@@ -882,12 +721,7 @@ async fn diff_session_page_anchors_match_stderr_output() {
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
-            .args([
-                "diff",
-                tmp.path().to_str().unwrap(),
-                "--no-wait",
-                "--no-notify",
-            ])
+            .args(["create", "diff", tmp.path().to_str().unwrap()])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -903,11 +737,10 @@ async fn diff_session_page_anchors_match_stderr_output() {
         "failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let url = stdout.trim();
+    let url = creation_url(&output.stdout);
 
-    let page_html = reqwest::get(url)
+    let page_html = reqwest::get(&url)
         .await
         .expect("fetch page")
         .text()
@@ -945,11 +778,10 @@ async fn docs_session_page_anchors_match_stderr_output() {
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
             .args([
+                "create",
                 "docs",
                 file1.to_str().unwrap(),
                 file2.to_str().unwrap(),
-                "--no-wait",
-                "--no-notify",
             ])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
@@ -966,11 +798,10 @@ async fn docs_session_page_anchors_match_stderr_output() {
         "failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let url = stdout.trim();
+    let url = creation_url(&output.stdout);
 
-    let page_html = reqwest::get(url)
+    let page_html = reqwest::get(&url)
         .await
         .expect("fetch page")
         .text()
@@ -1097,60 +928,6 @@ async fn standalone_recv_success_prints_collect_and_ack_guidance() {
 }
 
 #[tokio::test]
-async fn no_notify_wording_is_consistent() {
-    let daemon = TestDaemon::start().await;
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(tmp.path(), "fn main() {}\n").unwrap();
-
-    // --no-notify should say "ready" (not "sent" or contradictory messages).
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::process::Command::new(wdyt_bin())
-            .args([
-                "code",
-                tmp.path().to_str().unwrap(),
-                "--no-wait",
-                "--no-notify",
-            ])
-            .env("WDYT_PORTS", daemon.port_env())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .expect("timed out")
-    .expect("failed to run wdyt");
-
-    assert!(output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // Should use "ready" for the no-webhook message.
-    assert!(
-        stderr.contains("ready"),
-        "no-notify stderr should say 'ready': {stderr}"
-    );
-    // Should never say "notification sent" (which contradicts "no notification").
-    assert!(
-        !stderr.contains("notification sent"),
-        "must not say 'notification sent': {stderr}"
-    );
-    // --no-notify must say "notification skipped", not "no webhook configured".
-    assert!(
-        stderr.contains("notification skipped"),
-        "no-notify stderr should say 'notification skipped': {stderr}"
-    );
-    assert!(
-        !stderr.contains("no webhook configured"),
-        "--no-notify case must not say 'no webhook configured': {stderr}"
-    );
-    // Should use "created" for the session status, not "sent".
-    assert!(
-        stderr.contains("created"),
-        "session status should say 'created': {stderr}"
-    );
-}
-
-#[tokio::test]
 async fn ordinary_non_colliding_code_session_preserves_anchors() {
     // Ensure non-colliding labels pass through fine and anchors are printed normally.
     let daemon = TestDaemon::start().await;
@@ -1165,11 +942,10 @@ async fn ordinary_non_colliding_code_session_preserves_anchors() {
         Duration::from_secs(10),
         tokio::process::Command::new(wdyt_bin())
             .args([
+                "create",
                 "code",
                 file1.to_str().unwrap(),
                 file2.to_str().unwrap(),
-                "--no-wait",
-                "--no-notify",
             ])
             .env("WDYT_PORTS", daemon.port_env())
             .stdout(Stdio::piped())
@@ -1194,9 +970,7 @@ async fn ordinary_non_colliding_code_session_preserves_anchors() {
         stderr.contains(&a2),
         "should contain anchor for lib.rs: {stderr}"
     );
-    // URL printed on stdout.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.trim().starts_with("http://"));
+    assert!(creation_url(&output.stdout).starts_with("http://"));
 }
 
 // ---------- Finding 9: Help/docs ----------
