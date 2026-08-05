@@ -1,0 +1,70 @@
+# release-plz: automated releases to crates.io (https://release-plz.dev/docs)
+# Setup:
+# 1. Configure trusted publishing on crates.io
+#    https://crates.io/docs/trusted-publishing
+# 2. In repo Settings → Actions → General, enable
+#    "Allow GitHub Actions to create and approve pull requests"
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-plz-release:
+    if: ${{ github.repository_owner == 'rcoh' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    outputs:
+      releases: ${{ steps.release-plz.outputs.releases }}
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - id: release-plz
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-plz-pr:
+    if: ${{ !failure() && github.repository_owner == 'rcoh' }}
+    needs: release-plz-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-binaries:
+    if: ${{ needs.release-plz-release.outputs.releases_created == 'true' }}
+    needs: release-plz-release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      tag: ${{ fromJSON(needs.release-plz-release.outputs.releases)[0].tag }}

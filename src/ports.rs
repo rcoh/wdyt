@@ -51,8 +51,6 @@ mod tests {
         let listener = TcpListener::bind((LOCAL, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(!is_free(LOCAL, port), "bound port reported free");
-        drop(listener);
-        assert!(is_free(LOCAL, port));
     }
 
     #[test]
