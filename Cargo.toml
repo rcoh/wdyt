@@ -60,7 +60,7 @@ name = "wdyt"
 path = "src/main.rs"
 
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-{ target }-v{ version }{ archive-suffix }"
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }{ archive-suffix }"
 
 [dev-dependencies]
 tempfile = "3.27.0"
