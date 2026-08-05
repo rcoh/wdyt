@@ -1,9 +1,13 @@
 ---
 name: presenting-designs
-description: Writes and presents feature designs using the Smithy-RS RFC three-part structure. Use when drafting or reviewing an RFC, design document, architecture proposal, implementation plan, or substantial code change.
+description: Writes and presents feature designs using the Smithy-RS RFC three-part structure. Use alongside wdyt when drafting or reviewing an RFC, design document, architecture proposal, implementation plan, or substantial code change.
 ---
 
 # Presenting Designs
+
+`wdyt` owns the create, present, and feedback mechanics; this skill owns the
+document structure. Also apply `presenting-code-changes` when implementation
+changes accompany the design.
 
 Write designs in three parts, in this order:
 
@@ -23,24 +27,9 @@ This three-phase structure is also useful for many code changes: desired
 behavior first, technical reference second, and an auditable implementation
 checklist last.
 
-Present the rendered design as the primary tab:
-
-```sh
-design_id=$(wdyt create docs DESIGN.md --title "grouped reviews RFC" | jq -r '.id')
-wdyt present "$design_id" --title "grouped reviews RFC"
-```
-
-If implementation changes accompany the design, make a guided diff the default
-code view and add the design as a supporting tab:
-
-```sh
-guide_id=$(
-  git diff | wdyt create guided-diff REVIEW.md --title "implementation" |
-    jq -r '.id'
-)
-design_id=$(wdyt create docs DESIGN.md --title "RFC" | jq -r '.id')
-wdyt present "$guide_id" "$design_id" --title "feature design and implementation"
-```
+Present the rendered design as the primary `wdyt` tab. If implementation
+changes accompany it, put the guided diff first and the design in a supporting
+tab.
 
 When the design changes UI, include desktop and mobile screenshots in another
 tab so the claimed user-facing behavior can be inspected.

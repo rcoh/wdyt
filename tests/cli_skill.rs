@@ -134,19 +134,31 @@ fn skill_installs_all_three_skills_for_supported_agents() {
         String::from_utf8_lossy(&output.stderr)
     );
 
+    let expected = [
+        ("wdyt", include_str!("../skill/SKILL.md")),
+        (
+            "presenting-code-changes",
+            include_str!("../skill/presenting-code-changes/SKILL.md"),
+        ),
+        (
+            "presenting-designs",
+            include_str!("../skill/presenting-designs/SKILL.md"),
+        ),
+    ];
     for root in [
         ".kiro/skills",
         ".claude/skills",
         ".codex/skills",
         ".agents/skills",
     ] {
-        for name in ["wdyt", "presenting-code-changes", "presenting-designs"] {
+        for (name, expected_contents) in expected {
             let path = project.path().join(root).join(name).join("SKILL.md");
             let contents = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
-            assert!(
-                contents.starts_with("---"),
-                "invalid skill: {}",
+            assert_eq!(
+                contents,
+                expected_contents,
+                "installed skill drifted from {}",
                 path.display()
             );
         }
@@ -183,6 +195,10 @@ fn root_help_contains_workflow_section() {
     assert!(
         stdout.contains("--brief-file"),
         "root --help should mention --brief-file stdin caveat:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("create guided-diff") && stdout.contains("Do not substitute"),
+        "root --help should distinguish guided diff from a brief:\n{stdout}"
     );
 }
 

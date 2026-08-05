@@ -22,13 +22,17 @@ use wdyt::session::{Content, Store};
     after_help = "\
 WORKFLOW (for coding agents):
 
-  1. Create one or more sessions, then present them together:
-       wdyt create code src/lib.rs --title \"public API\"
-       wdyt create docs DESIGN.md --title \"design\"
-       wdyt create guided-diff REVIEW.md --patch changes.patch
-       wdyt present <code-id> <design-id>
+  1. For code changes, create a guided diff and any supporting tabs, then
+     present their IDs together:
+       guide=$(git diff | wdyt create guided-diff REVIEW.md | jq -r .id)
+       design=$(wdyt create docs DESIGN.md --title \"design\" | jq -r .id)
+       wdyt present \"$guide\" \"$design\"
 
-  2. In a guided review brief (--brief / --brief-file), link to files with
+     `create guided-diff` interleaves Markdown prose with focused wdyt-diff and
+     wdyt-code excerpts. Do not substitute `create diff --brief`: a brief is one
+     introduction above a complete raw patch.
+
+  2. In an introductory brief (--brief / --brief-file), link to files with
      #f-<path> where non-alphanumerics become dashes:
        src/main.rs  → #f-src-main-rs
        a-b/c-d.rs   → #f-a-b-c-d-rs
@@ -221,7 +225,8 @@ enum Command {
     /// Installs wdyt mechanics plus code-change and design presentation skills
     /// for Kiro, Claude Code, Codex, and agents using the shared skills path.
     /// By default writes beneath the current project; pass --global to write
-    /// beneath the user's home directory instead.
+    /// beneath the user's home directory instead. Installed files are snapshots
+    /// embedded in the binary; rerun this command after upgrading wdyt.
     ///
     /// Example: wdyt skill --global
     Skill {
@@ -311,7 +316,7 @@ struct SessionArgs {
     #[arg(long)]
     theme: Option<String>,
 
-    /// A guided review, as markdown, shown above the content.
+    /// An introductory brief, as markdown, shown above the content.
     ///
     /// Explain what changed and what to look at first. A link to `#f-<path>`
     /// jumps to that file, with non-alphanumerics replaced by dashes: `src/a.rs`
@@ -321,7 +326,7 @@ struct SessionArgs {
     #[arg(long, short = 'b')]
     brief: Option<String>,
 
-    /// Read the guided review from a markdown file.
+    /// Read the introductory brief from a markdown file.
     #[arg(long, conflicts_with = "brief")]
     brief_file: Option<PathBuf>,
 }
@@ -377,7 +382,7 @@ impl SessionArgs {
         Ok(name)
     }
 
-    /// The guided review, rendered to HTML.
+    /// The introductory brief, rendered to HTML.
     ///
     /// Rendered here rather than in the daemon because this is where the syntax
     /// theme for fenced code blocks is known.
@@ -1266,8 +1271,34 @@ mod tests {
         assert!(
             SKILLS[1]
                 .1
-                .contains("Present changes in this order: Carefully explain")
+                .contains("Present changes in this order: carefully explain")
         );
+        assert!(
+            SKILLS[0]
+                .1
+                .contains("only `create guided-diff` intersperses")
+        );
+        assert!(SKILLS[0].1.contains("`presenting-code-changes`"));
+        assert!(SKILLS[0].1.contains("`presenting-designs`"));
+        assert!(SKILLS[1].1.contains("`wdyt` owns"));
+        assert!(SKILLS[1].1.contains("`presenting-designs`"));
+        assert!(SKILLS[2].1.contains("`wdyt` owns"));
+        assert!(SKILLS[2].1.contains("`presenting-code-changes`"));
+        assert!(SKILLS[0].1.contains("wdyt collect <first-session-id>"));
+        assert!(!SKILLS[1].1.contains("wdyt create"));
+        assert!(!SKILLS[2].1.contains("wdyt create"));
+        for (_, contents) in SKILLS {
+            for stale in [
+                "wdyt code ",
+                "wdyt diff ",
+                "wdyt docs ",
+                "wdyt dir ",
+                "wdyt demo ",
+                "wdyt watch ",
+            ] {
+                assert!(!contents.contains(stale), "stale skill command: {stale}");
+            }
+        }
     }
 
     #[test]

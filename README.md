@@ -125,7 +125,7 @@ The CLI's stdout is strictly machine-readable: `create` emits one JSON object;
 coaching goes to stderr, so piping stdout never captures noise.
 
 After creating a code, diff, or docs session, stderr prints the available file
-anchors for use in `--brief` guided reviews:
+anchors for use in `--brief` introductions:
 
 ```
 wdyt: file anchors for --brief links:
@@ -148,7 +148,13 @@ Presentation stderr guidance varies by outcome:
 | Timeout (exit 2) | Session still open; shows `collect` and `inbox` |
 
 The `--help` for the root command and each subcommand is written as a concise
-skill reference for agents, including examples and the stdin caveat for `--brief`.
+skill reference for agents, including guided-diff examples and the stdin caveat
+for `--brief`.
+
+Install the bundled mechanics and presentation skills into the current project
+with `wdyt skill`. Use `wdyt skill --global` for the user-level agent
+directories. Installed skills are snapshots embedded in the binary, so rerun
+the same command after upgrading `wdyt`.
 
 ## Did the agent actually read it?
 
@@ -303,6 +309,10 @@ for the same measured reason. A thread holds at most 100 messages.
 Guided diff is the default way to present code changes. It is a Markdown
 narrative that interleaves prose, selected patch ranges, and selected current
 code ranges in one ordered view:
+
+Do not substitute `wdyt create diff --brief` when the review needs this
+interleaving. A brief is a single introduction above a complete raw diff;
+`create guided-diff` is the interspersed narrative mode.
 
 ````markdown
 ## Public API
