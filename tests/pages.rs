@@ -286,6 +286,37 @@ async fn the_index_has_no_reply_widget() {
 }
 
 #[tokio::test]
+async fn pages_link_the_embedded_stylesheet_asset() {
+    let daemon = Daemon::start().await;
+    let (status, page) = daemon.get("/").await;
+    assert_eq!(status, 200, "{page}");
+    assert!(
+        page.contains(r#"<link rel="stylesheet" href="/assets/wdyt.css">"#),
+        "{page}"
+    );
+    assert!(
+        !page.contains("<style>"),
+        "the static stylesheet was still rendered inline: {page}"
+    );
+
+    let response = reqwest::get(format!("{}/assets/wdyt.css", daemon.base))
+        .await
+        .expect("stylesheet request sent");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/css; charset=utf-8")
+    );
+    assert_eq!(
+        response.text().await.expect("stylesheet body"),
+        wdyt::ui::stylesheet_asset_for_test()
+    );
+}
+
+#[tokio::test]
 async fn a_session_links_home_and_can_be_archived_and_restored() {
     let daemon = Daemon::start().await;
     let id = titled_code_session(&daemon, "finished change");
@@ -669,7 +700,10 @@ async fn a_session_page_offers_a_reply_form() {
     );
     assert!(body.contains("<textarea"), "{body}");
     // The overlay must be fixed so it cannot reflow what is being reviewed.
-    assert!(body.contains("position: fixed"), "{body}");
+    assert!(
+        wdyt::ui::stylesheet_asset_for_test().contains("position: fixed"),
+        "reply overlay is not fixed"
+    );
 }
 
 #[tokio::test]
@@ -707,8 +741,8 @@ async fn framed_modes_keep_the_header_visible() {
     // its positioned ancestor it paints over the header.
     assert!(body.contains("class=\"framed\""), "{body}");
     assert!(
-        body.contains("body.framed main { position: relative; }"),
-        "{body}"
+        wdyt::ui::stylesheet_asset_for_test().contains("body.framed main { position: relative; }"),
+        "framed main is not a positioned ancestor"
     );
 }
 
@@ -817,7 +851,10 @@ async fn markdown_alerts_and_code_are_styled() {
     let (_, body) = daemon.get(&format!("/s/{id}")).await;
     // comrak emits the class; unstyled the callout reads as a stray heading.
     assert!(body.contains("markdown-alert"), "{body}");
-    assert!(body.contains(".markdown-alert-title"), "no styling: {body}");
+    assert!(
+        wdyt::ui::stylesheet_asset_for_test().contains(".markdown-alert-title"),
+        "no alert styling"
+    );
 }
 
 #[tokio::test]
@@ -1556,15 +1593,15 @@ async fn deep_link_highlight_styles_are_present() {
     let daemon = Daemon::start().await;
     let id = code_session(&daemon);
 
-    let (_, body) = daemon.get(&format!("/s/{id}")).await;
-    // CSS for the highlight class must be in the page.
+    let _ = daemon.get(&format!("/s/{id}")).await;
+    let css = wdyt::ui::stylesheet_asset_for_test();
     assert!(
-        body.contains("tr.sel-highlight td"),
-        "no highlight style: {body}"
+        css.contains("tr.sel-highlight td"),
+        "no highlight style: {css}"
     );
     assert!(
-        body.contains("wdyt-flash"),
-        "no flash animation for comments: {body}"
+        css.contains("wdyt-flash"),
+        "no flash animation for comments: {css}"
     );
 }
 
@@ -1620,8 +1657,8 @@ async fn the_file_sidebar_preserves_the_useful_end_of_long_paths() {
         );
     }
     assert!(
-        body.contains("direction: rtl; text-align: left"),
-        "sidebar does not truncate paths from the left: {body}"
+        wdyt::ui::stylesheet_asset_for_test().contains("direction: rtl; text-align: left"),
+        "sidebar does not truncate paths from the left"
     );
 }
 
@@ -3436,7 +3473,10 @@ async fn hide_chrome_still_works_with_new_nav() {
     assert!(body.contains("chrome-toggle"), "chrome toggle missing");
     assert!(body.contains("chrome-show"), "chrome show button missing");
     // The nochrome rules are in the CSS.
-    assert!(body.contains("body.nochrome"), "nochrome CSS rules missing");
+    assert!(
+        wdyt::ui::stylesheet_asset_for_test().contains("body.nochrome"),
+        "nochrome CSS rules missing"
+    );
     // Dot-key binding still works.
     assert!(body.contains("key !== '.'"), "dot-key toggle missing");
 }

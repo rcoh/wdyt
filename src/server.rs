@@ -8,7 +8,7 @@ use topcoat::Result;
 use topcoat::context::{Cx, app_context};
 use topcoat::router::content::Json;
 use topcoat::router::error::{bad_request, internal_server_error, not_found};
-use topcoat::router::{Router, page, path_param, route};
+use topcoat::router::{Router, path_param};
 use topcoat::view::view;
 
 use crate::config::Config;
@@ -17,6 +17,11 @@ use crate::session::{
     Anchor, Author, Comment, Content, GuidedBlock, Message, Reply, Session, Side, Store, StoreError,
 };
 use crate::ui::{Raw, code_file, diff_hunk, shell};
+
+mod app;
+
+use app::s::session_id::SessionId;
+use app::s::session_id::comments::comment_id::CommentId;
 
 /// Values shared by every request.
 struct State {
@@ -77,44 +82,14 @@ impl State {
     }
 }
 
-#[path_param(error = not_found)]
-struct SessionId(String);
-
-#[path_param(error = not_found)]
-struct CommentId(u64);
-
 /// Builds the router.
 fn router(store: Store, colors: ThemeColors, theme: String) -> Router {
-    Router::builder()
-        .app_context(State {
-            store,
-            colors,
-            theme,
-            highlighted: std::sync::Mutex::new(Vec::new()),
-        })
-        .page(session_page)
-        .page(index_page)
-        .route(reply_route)
-        .route(archive_route)
-        .route(restore_route)
-        .route(raw_route)
-        .route(asset_route)
-        .route(health_route)
-        .route(create_route)
-        .route(await_reply_route)
-        .route(status_route)
-        .route(list_comments_route)
-        .route(comment_route)
-        .route(context_route)
-        .route(thread_message_route)
-        .route(agent_message_route)
-        .route(threads_route)
-        .route(agent_threads_route)
-        .route(recv_route)
-        .route(inbox_route)
-        .route(collect_route)
-        .route(ack_route)
-        .build()
+    app::router(State {
+        store,
+        colors,
+        theme,
+        highlighted: std::sync::Mutex::new(Vec::new()),
+    })
 }
 
 /// The control API the CLI uses to create a session in the running daemon.
@@ -160,7 +135,6 @@ pub struct CreatedSession {
     pub id: String,
 }
 
-#[route(POST "/api/sessions")]
 async fn create_route(cx: &Cx, Json(input): Json<CreateSession>) -> Result<Json<CreatedSession>> {
     // Reject sessions with colliding file anchors. Two files that normalize to
     // the same #f- anchor would break page navigation and guided-review links.
@@ -223,7 +197,6 @@ async fn wait_for<T>(
 /// blocks until a reply lands. The response says whether a reply actually
 /// arrived. Receiving it marks it *delivered* and nothing more: whether
 /// anything read it is for the agent to say by acking.
-#[route(GET "/api/sessions/{session_id}/reply")]
 async fn await_reply_route(cx: &Cx) -> Result<Json<AwaitedReply>> {
     let id = path_param::<SessionId>(cx)?;
     let timeout = query_param(cx, "timeout_secs").and_then(|value| value.parse::<u64>().ok());
@@ -250,7 +223,6 @@ async fn await_reply_route(cx: &Cx) -> Result<Json<AwaitedReply>> {
 ///
 /// The long-poll route is for an agent that is still waiting. This one is for an
 /// agent that has come back later and found the reply in its inbox.
-#[route(POST "/api/sessions/{session_id}/collect")]
 async fn collect_route(cx: &Cx) -> Result<Json<AwaitedReply>> {
     let id = path_param::<SessionId>(cx)?;
     let reply = state(cx).store.mark_delivered(id).map_err(store_error)?;
@@ -273,7 +245,6 @@ pub struct AckInput {
 /// this is a live model saying something about them. An agent that fetches a
 /// reply and then dies — needing credentials, say — will have collected and never
 /// acked, and the page has to be able to show that difference.
-#[route(POST "/api/sessions/{session_id}/ack")]
 async fn ack_route(cx: &Cx, Json(input): Json<AckInput>) -> Result<Json<Acked>> {
     let id = path_param::<SessionId>(cx)?;
     let note = input.note.trim();
@@ -312,7 +283,6 @@ pub struct ReplyStatus {
     pub comments: usize,
 }
 
-#[route(GET "/api/sessions/{session_id}/status")]
 async fn status_route(cx: &Cx) -> Result<Json<ReplyStatus>> {
     let id = path_param::<SessionId>(cx)?;
     state(cx)
@@ -337,7 +307,6 @@ pub struct Comments {
     pub comments: Vec<Comment>,
 }
 
-#[route(GET "/api/sessions/{session_id}/comments")]
 async fn list_comments_route(cx: &Cx) -> Result<Json<Comments>> {
     let id = path_param::<SessionId>(cx)?;
     let comments = state(cx).store.comments(id).map_err(|_| not_found())?;
@@ -396,7 +365,6 @@ const MAX_CONTEXT_LINES: usize = 2000;
 /// The file is named by its index in the session's diff rather than by its label:
 /// the index cannot be ambiguous between two files with the same label, and it
 /// needs no escaping in a query string.
-#[route(GET "/s/{session_id}/context")]
 async fn context_route(cx: &Cx) -> Result<Json<ContextLines>> {
     let id = path_param::<SessionId>(cx)?;
     let number = |name: &str| {
@@ -484,7 +452,6 @@ async fn context_route(cx: &Cx) -> Result<Json<ContextLines>> {
 /// The quoted snippet is looked up from the session's own diff rather than taken
 /// from the request: the page should not have to be trusted to say what a line
 /// said, and an anchor that matches no line is a bug worth reporting as one.
-#[route(POST "/s/{session_id}/comments")]
 async fn comment_route(cx: &Cx, Json(mut input): Json<CommentInput>) -> Result<Json<Comment>> {
     let id = path_param::<SessionId>(cx)?;
     let text = input.text.trim().to_owned();
@@ -588,13 +555,11 @@ async fn comment_route(cx: &Cx, Json(mut input): Json<CommentInput>) -> Result<J
 ///
 /// The page's route, so the author is the user: an agent's answers arrive on
 /// `/api/sessions/…` instead, and nothing in a request body can change that.
-#[route(POST "/s/{session_id}/comments/{comment_id}/messages")]
 async fn thread_message_route(cx: &Cx, Json(input): Json<MessageInput>) -> Result<Json<Message>> {
     post_message(cx, Author::User, input).await
 }
 
 /// Adds the agent's answer to a thread. The agent's side of `wdyt say`.
-#[route(POST "/api/sessions/{session_id}/comments/{comment_id}/messages")]
 async fn agent_message_route(cx: &Cx, Json(input): Json<MessageInput>) -> Result<Json<Message>> {
     post_message(cx, Author::Agent, input).await
 }
@@ -625,14 +590,12 @@ async fn post_message(cx: &Cx, from: Author, input: MessageInput) -> Result<Json
 ///
 /// Read-only on purpose, like the reply's status route: a reader looking at their
 /// own page must not be able to mark their own question as picked up.
-#[route(GET "/s/{session_id}/threads")]
 async fn threads_route(cx: &Cx) -> Result<Json<Threads>> {
     threads(cx)
 }
 
 /// The same, for an agent catching up on a discussion. Also read-only: taking a
 /// question is what `/recv` is for.
-#[route(GET "/api/sessions/{session_id}/threads")]
 async fn agent_threads_route(cx: &Cx) -> Result<Json<Threads>> {
     threads(cx)
 }
@@ -654,7 +617,6 @@ pub struct Threads {
 /// either kind — the overall reply, or a line comment/follow-up — and can be
 /// called again for the one after. Line comments come first, oldest first; the
 /// reply, which is terminal, surfaces once the comments are drained.
-#[route(GET "/api/sessions/{session_id}/recv")]
 async fn recv_route(cx: &Cx) -> Result<Json<Received>> {
     let id = path_param::<SessionId>(cx)?;
     let timeout = query_param(cx, "timeout_secs").and_then(|value| value.parse::<u64>().ok());
@@ -922,7 +884,6 @@ pub struct Inbox {
 /// `?unread=1` filters on the *ack*, not on delivery: a reply that was collected
 /// by a process that then died is precisely the one still needing attention, and
 /// filtering on delivery would hide it.
-#[route(GET "/api/inbox")]
 async fn inbox_route(cx: &Cx) -> Result<Json<Inbox>> {
     let unread_only = query_param(cx, "unread").is_some_and(|v| v != "false" && v != "0");
     let host = public_host(cx);
@@ -1043,16 +1004,139 @@ fn store_error(error: StoreError) -> topcoat::Error {
     }
 }
 
+/// Derives the document shell from the matched page request.
+///
+/// The root Topcoat layout owns the HTML document. Pages only render their
+/// subheader and main content, while this helper supplies request-specific
+/// chrome and syntax-theme variables to that layout.
+fn page_shell(cx: &Cx) -> Result<(crate::ui::Page, ThemeColors)> {
+    let state = state(cx);
+    if topcoat::router::uri(cx).path() == "/" {
+        let selected = query_params(cx, "s");
+        if selected.is_empty() {
+            return Ok((crate::ui::Page::index(), state.colors.clone()));
+        }
+
+        let mut ids = Vec::new();
+        for id in selected {
+            if id.is_empty() {
+                return Err(bad_request("session selection contains an empty id").into());
+            }
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        if ids.len() > MAX_GROUPED_SESSIONS {
+            return Err(bad_request(format!(
+                "a grouped review supports at most {MAX_GROUPED_SESSIONS} tabs"
+            ))
+            .into());
+        }
+
+        let first = state
+            .store
+            .with(&ids[0], Clone::clone)
+            .ok_or_else(|| bad_request(format!("unknown session id: {}", ids[0])))?;
+        let colors = first
+            .theme
+            .as_deref()
+            .filter(|name| *name != state.theme)
+            .map(|name| theme_colors(theme(name)))
+            .unwrap_or_else(|| state.colors.clone());
+        let count = ids.len();
+        return Ok((
+            crate::ui::Page {
+                title: if count == 1 {
+                    first.title.clone()
+                } else {
+                    format!("{count} sessions")
+                },
+                note: None,
+                kind: "review".to_owned(),
+                session_id: first.id,
+                reply: first.reply,
+                body_class: Some("grouped".to_owned()),
+                hideable: false,
+                commentable: false,
+                embedded: false,
+                origin: first.origin,
+                archive_control: false,
+                archived: false,
+            },
+            colors,
+        ));
+    }
+
+    let id = path_param::<SessionId>(cx)?;
+    let embedded = query_param(cx, "embed").is_some_and(|value| value == "1" || value == "true");
+    let session = state
+        .store
+        .with(id, |session| {
+            (
+                session.title.clone(),
+                session.note.clone(),
+                session.content.kind().to_owned(),
+                session.reply.clone(),
+                session.content.is_framed(),
+                session.content.is_commentable() || !session.brief_sources.is_empty(),
+                session.origin.clone(),
+                session.theme.clone(),
+                session.archived,
+            )
+        })
+        .ok_or_else(not_found)?;
+    let (title, note, kind, reply, framed, commentable, origin, session_theme, archived) = session;
+    let mut body_classes = Vec::new();
+    if framed {
+        body_classes.push("framed");
+    }
+    if embedded {
+        body_classes.push("embedded");
+    }
+    let body_class = (!body_classes.is_empty()).then(|| body_classes.join(" "));
+    let colors = session_theme
+        .as_deref()
+        .filter(|name| *name != state.theme)
+        .map(|name| theme_colors(theme(name)))
+        .unwrap_or_else(|| state.colors.clone());
+
+    Ok((
+        crate::ui::Page {
+            title,
+            note,
+            kind,
+            session_id: id.to_owned(),
+            reply,
+            body_class,
+            hideable: !embedded,
+            commentable,
+            embedded,
+            origin,
+            archive_control: !embedded,
+            archived,
+        },
+        colors,
+    ))
+}
+
+/// Serves the application stylesheet embedded in the executable.
+fn stylesheet_route() -> Result<topcoat::router::Response> {
+    use topcoat::router::{Body, Response};
+
+    Ok(Response::builder()
+        .header(http::header::CONTENT_TYPE, "text/css; charset=utf-8")
+        .header(http::header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(crate::ui::STYLESHEET))?)
+}
+
 // --- Pages ------------------------------------------------------------------
 
 const MAX_GROUPED_SESSIONS: usize = 12;
 
-#[route(POST "/s/{session_id}/archive")]
 async fn archive_route(cx: &Cx) -> Result<topcoat::router::Response> {
     set_archived(cx, true)
 }
 
-#[route(POST "/s/{session_id}/restore")]
 async fn restore_route(cx: &Cx) -> Result<topcoat::router::Response> {
     set_archived(cx, false)
 }
@@ -1071,7 +1155,6 @@ fn set_archived(cx: &Cx, archived: bool) -> Result<topcoat::router::Response> {
 }
 
 /// Lists live sessions. Handy when a link has scrolled out of Slack.
-#[page("/")]
 async fn index_page(cx: &Cx) -> Result {
     let state = state(cx);
 
@@ -1104,20 +1187,9 @@ async fn index_page(cx: &Cx) -> Result {
             tabs.push((id.clone(), tab.0, tab.1));
         }
 
-        let first = state
-            .store
-            .with(&ids[0], Clone::clone)
-            .expect("validated grouped session");
         let selected_tab = query_param(cx, "tab")
             .and_then(|id| ids.iter().position(|candidate| candidate == &id))
             .unwrap_or(0);
-        let own_colors = first
-            .theme
-            .as_deref()
-            .filter(|name| *name != state.theme)
-            .map(|name| theme_colors(theme(name)));
-        let colors = own_colors.as_ref().unwrap_or(&state.colors);
-        let count = tabs.len();
         let body = view! { cx =>
             <div class="tabbed-review" data-tabbed-review="1">
                 <div class="review-tabs" role="tablist" aria-label="Review sessions">
@@ -1181,32 +1253,7 @@ async fn index_page(cx: &Cx) -> Result {
             </div>
             <script>(Raw(crate::ui::TABS_JS))</script>
         }?;
-        let page = crate::ui::Page {
-            title: if count == 1 {
-                first.title.clone()
-            } else {
-                format!("{count} sessions")
-            },
-            note: None,
-            kind: "review".to_owned(),
-            session_id: first.id,
-            reply: first.reply,
-            body_class: Some("grouped".to_owned()),
-            hideable: false,
-            commentable: false,
-            embedded: false,
-            origin: first.origin,
-            archive_control: false,
-            archived: false,
-        };
-        return view! { cx =>
-            shell(
-                page: page,
-                colors: colors,
-                subheader: None,
-                child: body,
-            )
-        };
+        return view! { cx => <main>(body)</main> };
     }
 
     let (archived_sessions, sessions): (Vec<_>, Vec<_>) = state
@@ -1215,8 +1262,6 @@ async fn index_page(cx: &Cx) -> Result {
         .into_iter()
         .partition(|session| session.4);
     let archived_count = archived_sessions.len();
-    let colors = &state.colors;
-
     let body = view! { cx =>
         <div class="wrap session-picker">
             if sessions.is_empty() && archived_sessions.is_empty() {
@@ -1282,83 +1327,26 @@ async fn index_page(cx: &Cx) -> Result {
         </div>
     }?;
 
-    view! { cx =>
-        // `Page::index` says the rest: no session, so no reply box, and no single
-        // agent it belongs to.
-        shell(
-            page: crate::ui::Page::index(),
-            colors: colors,
-            subheader: None,
-            child: body,
-        )
-    }
+    view! { cx => <main>(body)</main> }
 }
 
 /// A session.
-#[page("/s/{session_id}")]
 async fn session_page(cx: &Cx) -> Result {
     let id = path_param::<SessionId>(cx)?;
     let state = state(cx);
-    let embedded = query_param(cx, "embed").is_some_and(|value| value == "1" || value == "true");
 
     let session = state
         .store
         .with(id, |session| {
             (
-                session.title.clone(),
-                session.note.clone(),
                 session.content.clone(),
-                session.reply.clone(),
-                session.content.kind(),
                 session.comments.clone(),
-                session.origin.clone(),
-                session.theme.clone(),
                 session.brief.clone(),
                 session.brief_sources.clone(),
-                session.archived,
             )
         })
         .ok_or_else(not_found)?;
-    let (
-        title,
-        note,
-        content,
-        existing_reply,
-        kind,
-        comments,
-        origin,
-        session_theme,
-        brief,
-        brief_sources,
-        archived,
-    ) = session;
-
-    // A session highlighted with its own theme needs the page's colours to match
-    // it: the card's background comes from here, and a mismatch puts light code
-    // on a dark card. Recomputed per request only when it differs, since
-    // `theme()` hands back a `&'static` and this is a handful of colour lookups.
-    let own_colors = session_theme
-        .as_deref()
-        .filter(|name| *name != state.theme)
-        .map(|name| theme_colors(theme(name)));
-    let colors = own_colors.as_ref().unwrap_or(&state.colors);
-
-    // Framed content needs `<main>` to fill the viewport with no page scrolling
-    // of its own, so the iframe can own the space below the chrome.
-    let mut body_classes = Vec::new();
-    if content.is_framed() {
-        body_classes.push("framed");
-    }
-    if embedded {
-        body_classes.push("embedded");
-    }
-    let body_class = (!body_classes.is_empty()).then(|| body_classes.join(" "));
-
-    // The bar can be collapsed anywhere it competes with the content: over a
-    // framed app it is someone else's screen space, and over a long diff it is
-    // a sticky strip in the way of the code. Not on the index, which is nothing
-    // but chrome.
-    let hideable = !embedded;
+    let (content, comments, brief, brief_sources) = session;
 
     // The agent's own tour of the work, above everything: what changed, why, and
     // what to look at first. Rendered even in the framed modes, where it is the
@@ -1732,28 +1720,11 @@ async fn session_page(cx: &Cx) -> Result {
         }
     };
 
-    let page = crate::ui::Page {
-        title,
-        note,
-        kind: kind.to_owned(),
-        session_id: id.to_owned(),
-        reply: existing_reply,
-        body_class,
-        hideable,
-        commentable: content.is_commentable() || brief_commentable,
-        embedded,
-        origin,
-        archive_control: !embedded,
-        archived,
-    };
-
     view! { cx =>
-        shell(
-            page: page,
-            colors: colors,
-            subheader: subheader,
-            child: body,
-        )
+        if let Some(subheader) = subheader {
+            (subheader)
+        }
+        <main>(body)</main>
     }
 }
 
@@ -1802,7 +1773,6 @@ const MAX_REPLY_BYTES: usize = 16 * 1024;
 /// intention, and the snippet is stored in full.
 const MAX_COMMENT_LINES: usize = 500;
 
-#[route(POST "/s/{session_id}/reply")]
 async fn reply_route(cx: &Cx, Json(input): Json<ReplyInput>) -> Result<Json<ReplyOutput>> {
     let id = path_param::<SessionId>(cx)?;
     let text = input.text.trim().to_owned();
@@ -1835,7 +1805,6 @@ async fn reply_route(cx: &Cx, Json(input): Json<ReplyInput>) -> Result<Json<Repl
 
 /// The unwrapped content, for when the chrome is in the way. For a demo this
 /// redirects to the demo's own origin.
-#[route(GET "/s/{session_id}/raw")]
 async fn raw_route(cx: &Cx) -> Result<topcoat::router::Response> {
     use topcoat::router::{Body, Response};
 
@@ -1958,7 +1927,6 @@ fn escape_json_for_script(json: &str) -> String {
 ///
 /// Paths are resolved against the session root by `tower_http`'s `ServeDir`,
 /// which rejects traversal outside it.
-#[route(GET "/s/{session_id}/assets/{*asset_path}")]
 async fn asset_route(cx: &Cx) -> Result<topcoat::router::Response> {
     use tower::ServiceExt as _;
     use tower_http::services::ServeDir;
@@ -2010,7 +1978,6 @@ pub const HEALTH_MARKER: &str = "wdyt-daemon";
 /// recognize a new daemon (the marker is unchanged).
 pub const PROTOCOL_VERSION: u32 = 3;
 
-#[route(GET "/health")]
 async fn health_route(cx: &Cx) -> Result<Json<serde_json::Value>> {
     Ok(Json(serde_json::json!({
         "ok": true,

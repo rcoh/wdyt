@@ -12,8 +12,9 @@ categories = ["command-line-utilities", "development-tools"]
 # Web framework. Default features are off deliberately: the `asset` and
 # `runtime` features serve their browser scripts out of a bundle directory
 # produced by the `topcoat` CLI, which would make `cargo install wdyt`
-# insufficient to run. Everything here is plain server-rendered HTML plus a
-# little hand-written JS, so the binary stays self-contained.
+# insufficient to run. Topcoat UI similarly brings Tailwind and that asset
+# pipeline. The app uses server-rendered views plus purpose-built browser JS
+# instead, so the binary stays self-contained.
 topcoat = { version = "0.5", default-features = false, features = [
     "router",
     "view",
