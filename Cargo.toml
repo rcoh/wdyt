@@ -1,6 +1,6 @@
 [package]
 name = "wdyt"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "Let coding agents show you their work: a link in Slack, a reply box on the page."
 license = "MIT OR Apache-2.0"
