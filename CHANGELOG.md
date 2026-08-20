@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/rcoh/wdyt/compare/v0.3.0...v0.3.1) - 2026-08-20
+
+### Other
+
+- Bump actions/checkout from 6.1.0 to 7.0.1 ([#2](https://github.com/rcoh/wdyt/pull/2))
+- Bump softprops/action-gh-release from 2.6.2 to 3.0.2 ([#3](https://github.com/rcoh/wdyt/pull/3))
+- Bump taiki-e/install-action from 2.85.8 to 2.86.1 ([#7](https://github.com/rcoh/wdyt/pull/7))
+
 ## [0.3.0](https://github.com/rcoh/wdyt/compare/v0.2.1...v0.3.0) - 2026-08-06
 
 ### Other
